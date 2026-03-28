@@ -129,6 +129,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "optix"
+version = "0.1.0"
+dependencies = [
+ "bitflags",
+ "optix-sys",
+]
+
+[[package]]
 name = "optix-sys"
 version = "0.1.0"
 dependencies = [

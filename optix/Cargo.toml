@@ -1,0 +1,10 @@
+[package]
+name = "optix"
+version = "0.1.0"
+edition = "2021"
+description = "Safe Rust wrapper for NVIDIA OptiX 9.0.0 ray tracing SDK"
+license = "MIT"
+
+[dependencies]
+optix-sys = { path = "../optix-sys" }
+bitflags = "2"

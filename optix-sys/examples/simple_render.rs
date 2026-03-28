@@ -85,8 +85,15 @@ fn main() {
         ));
 
         // --- Load PTX module ---
-        let ptx = include_str!(concat!(env!("OUT_DIR"), "/devicecode.ptx"));
-        let ptx_cstr = std::ffi::CString::new(ptx).unwrap();
+        let ptx_path = std::path::Path::new(file!()).parent().unwrap().join("devicecode.ptx");
+        let ptx = std::fs::read_to_string(&ptx_path)
+            .unwrap_or_else(|_| panic!(
+                "Failed to load {}. Compile it first:\n  \
+                 nvcc -ptx examples/devicecode.cu -o examples/devicecode.ptx \
+                 -I\"<OptiX SDK>/include\" -Iexamples --use_fast_math",
+                ptx_path.display()
+            ));
+        let ptx_cstr = std::ffi::CString::new(ptx.as_str()).unwrap();
 
         let module_options = OptixModuleCompileOptions {
             maxRegisterCount: OPTIX_COMPILE_DEFAULT_MAX_REGISTER_COUNT as i32,
