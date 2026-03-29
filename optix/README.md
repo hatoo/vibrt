@@ -23,7 +23,7 @@ Same as `optix-sys`:
 ```toml
 [dependencies]
 optix = { path = "optix" }
-optix-sys = { path = "optix-sys" }  # for CUdeviceptr, CUstream, etc.
+cudarc = { version = "0.19", default-features = false, features = ["driver", "dynamic-loading", "cuda-version-from-build-system"] }
 ```
 
 ### Minimal workflow
@@ -105,6 +105,6 @@ This renders a barycentric-colored triangle on a dark blue background and saves 
 
 ## Design notes
 
-- **No CUDA memory ownership** -- the wrapper never allocates or frees GPU memory. You manage `CUdeviceptr` yourself using CUDA APIs.
+- **No CUDA memory ownership** -- the wrapper never allocates or frees GPU memory. Use [cudarc](https://crates.io/crates/cudarc) for CUDA memory management.
 - **No lifetime parameters on resource types** -- `Module`, `Pipeline`, etc. hold an `Arc<FunctionTable>` internally. This lets you store them freely in structs without infectious lifetimes.
-- **Drop ordering matters** -- destroy OptiX resources before the CUDA context. Use explicit `drop()` if needed.
+- **Natural drop ordering** -- declare the CUDA context before OptiX resources and Rust's reverse drop order handles cleanup automatically.

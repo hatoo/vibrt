@@ -7,7 +7,6 @@ Raw FFI bindings to the [NVIDIA OptiX 9.0.0](https://developer.nvidia.com/rtx/ra
 - All OptiX types, enums, and structs from `optix_types.h`
 - The `OptixFunctionTable` with all 40+ function pointers from `optix_function_table.h`
 - Dynamic library loading (`optix_init`) that mirrors the C `optix_stubs.h` behavior
-- Minimal CUDA Driver API bindings (`cuda` module) for device memory management
 - Constants for alignment requirements, SBT record sizes, ABI version, etc.
 
 ## Requirements
