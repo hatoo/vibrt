@@ -89,15 +89,10 @@ fn main() {
         ));
 
         // --- Module ---
-        let ptx_path = std::path::Path::new(file!()).parent().unwrap().join("devicecode.ptx");
-        let ptx = std::fs::read_to_string(&ptx_path).unwrap_or_else(|_| {
-            panic!(
-                "Failed to load {}. Compile it first:\n  \
-                 nvcc -ptx examples/devicecode.cu -o examples/devicecode.ptx \
-                 -I\"<OptiX SDK>/include\" -Iexamples --use_fast_math",
-                ptx_path.display()
-            )
-        });
+        let ptx = compile_cu(
+            std::path::Path::new(file!()).parent().unwrap(),
+            "devicecode.cu",
+        );
         let ptx_cstr = std::ffi::CString::new(ptx.as_str()).unwrap();
 
         let module_options = OptixModuleCompileOptions {
@@ -312,6 +307,46 @@ fn main() {
         (optix.optixModuleDestroy.unwrap())(module);
         (optix.optixDeviceContextDestroy.unwrap())(ctx);
     }
+}
+
+fn compile_cu(dir: &std::path::Path, filename: &str) -> String {
+    let cu_path = dir.join(filename);
+    let src = std::fs::read_to_string(&cu_path)
+        .unwrap_or_else(|_| panic!("Failed to read {}", cu_path.display()));
+
+    let optix_include = find_optix_include();
+
+    let opts = cudarc::nvrtc::CompileOptions {
+        include_paths: vec![optix_include, dir.to_string_lossy().into_owned()],
+        use_fast_math: Some(true),
+        ..Default::default()
+    };
+
+    println!("Compiling {} with NVRTC...", cu_path.display());
+    let ptx = cudarc::nvrtc::compile_ptx_with_opts(&src, opts)
+        .unwrap_or_else(|e| panic!("NVRTC compilation failed:\n{e:?}"));
+    ptx.to_src()
+}
+
+fn find_optix_include() -> String {
+    if let Ok(root) = std::env::var("OPTIX_ROOT") {
+        return format!("{root}/include");
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let default = r"C:\ProgramData\NVIDIA Corporation\OptiX SDK 9.0.0\include";
+        if std::path::Path::new(default).exists() {
+            return default.to_string();
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let default = "/usr/local/NVIDIA-OptiX-SDK-9.0.0/include";
+        if std::path::Path::new(default).exists() {
+            return default.to_string();
+        }
+    }
+    panic!("OptiX SDK not found. Set OPTIX_ROOT environment variable.");
 }
 
 fn save_ppm(path: &str, width: u32, height: u32, pixels: &[u32]) {
