@@ -1,9 +1,38 @@
+use clap::Parser;
 use cudarc::driver::{CudaContext, CudaSlice, DevicePtr};
 use optix::*;
 use optix::accel::{self, AccelBuildOptions, BuildInput, TriangleArrayInput};
 use pbrt_parser::{self, Directive, ParamType, ParamValue};
 use std::mem;
 use std::sync::Arc;
+
+#[derive(Parser)]
+#[command(name = "renderer", about = "OptiX path tracing renderer for PBRTv4 scenes")]
+struct Args {
+    /// Input .pbrt scene file
+    #[arg(default_value = "test.pbrt")]
+    input: String,
+
+    /// Output image file (.ppm)
+    #[arg(short, long)]
+    output: Option<String>,
+
+    /// Override samples per pixel
+    #[arg(short, long)]
+    spp: Option<u32>,
+
+    /// Override max ray depth
+    #[arg(short, long)]
+    depth: Option<u32>,
+
+    /// Override image width
+    #[arg(long)]
+    width: Option<u32>,
+
+    /// Override image height
+    #[arg(long)]
+    height: Option<u32>,
+}
 
 // Must match devicecode.h
 const MAT_DIFFUSE: i32 = 0;
@@ -434,12 +463,20 @@ impl Clone for SceneMaterial {
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    let pbrt_file = args.get(1).map(|s| s.as_str()).unwrap_or("test.pbrt");
-    let input = std::fs::read_to_string(pbrt_file)
-        .unwrap_or_else(|e| { eprintln!("Failed to read {pbrt_file}: {e}"); std::process::exit(1); });
+    let cli = Args::parse();
 
-    let scene = parse_scene(&input);
+    let input = std::fs::read_to_string(&cli.input)
+        .unwrap_or_else(|e| { eprintln!("Failed to read {}: {e}", cli.input); std::process::exit(1); });
+
+    let mut scene = parse_scene(&input);
+
+    // Apply CLI overrides
+    if let Some(spp) = cli.spp { scene.spp = spp; }
+    if let Some(depth) = cli.depth { scene.max_depth = depth; }
+    if let Some(w) = cli.width { scene.width = w; }
+    if let Some(h) = cli.height { scene.height = h; }
+    if let Some(ref o) = cli.output { scene.filename = o.clone(); }
+
     println!("Scene: {}x{}, {} spp, {} objects, {} distant lights",
         scene.width, scene.height, scene.spp, scene.objects.len(), scene.distant_lights.len());
 
