@@ -489,7 +489,7 @@ fn parse_scene(input: &str) -> ParsedScene {
                         let texcoords: Vec<f32> = get_param_floats(params, "uv")
                             .map(|v| v.iter().map(|x| *x as f32).collect())
                             .unwrap_or_default();
-                        let indices = vec![0, 1, 2, 0, 2, 3];
+                        let indices = vec![0, 1, 2, 1, 3, 2];
                         SceneShape::TriangleMesh {
                             vertices: verts,
                             indices,
