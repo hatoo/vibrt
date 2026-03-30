@@ -13,7 +13,6 @@ use std::sync::Arc;
 )]
 struct Args {
     /// Input .pbrt scene file
-    #[arg(default_value = "test.pbrt")]
     input: String,
 
     /// Output image file (.ppm)
