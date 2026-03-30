@@ -686,7 +686,10 @@ fn main() {
     )
     .expect("pipeline")
     .value;
-    pipeline.set_stack_size(2048, 2048, 2048, 2).unwrap();
+    let max_graph_depth = if has_spheres { 2 } else { 1 };
+    pipeline
+        .set_stack_size(2048, 2048, 2048, max_graph_depth)
+        .unwrap();
 
     // --- Build geometry ---
     // Separate GASes for triangles and spheres (OptiX requires same prim type per GAS)
