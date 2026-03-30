@@ -339,7 +339,7 @@ extern "C" __global__ void __closesthit__ch()
         v_coord *= data->checker_scale_v;
         int cu = (int)floorf(u_coord);
         int cv = (int)floorf(v_coord);
-        if ((cu + cv) % 2 == 0)
+        if (((cu ^ cv) & 1) == 0)
             albedo = make_f3(data->checker_color1);
         else
             albedo = make_f3(data->checker_color2);
