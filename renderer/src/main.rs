@@ -111,7 +111,10 @@ fn dptr<T>(slice: &CudaSlice<T>, stream: &cudarc::driver::CudaStream) -> optix_s
     ptr as optix_sys::CUdeviceptr
 }
 
-fn alloc_and_copy<T>(stream: &Arc<cudarc::driver::CudaStream>, val: &T) -> Result<optix_sys::CUdeviceptr> {
+fn alloc_and_copy<T>(
+    stream: &Arc<cudarc::driver::CudaStream>,
+    val: &T,
+) -> Result<optix_sys::CUdeviceptr> {
     let size = mem::size_of_val(val);
     let cu_stream = stream.cu_stream();
     unsafe {
@@ -120,7 +123,8 @@ fn alloc_and_copy<T>(stream: &Arc<cudarc::driver::CudaStream>, val: &T) -> Resul
             dptr,
             std::slice::from_raw_parts(val as *const T as *const u8, size),
             cu_stream,
-        ).cuda()?;
+        )
+        .cuda()?;
         Ok(dptr as optix_sys::CUdeviceptr)
     }
 }
@@ -140,7 +144,8 @@ fn alloc_and_copy_slice<T>(
             dptr,
             std::slice::from_raw_parts(data.as_ptr() as *const u8, size),
             cu_stream,
-        ).cuda()?;
+        )
+        .cuda()?;
         Ok(dptr as optix_sys::CUdeviceptr)
     }
 }
@@ -542,8 +547,8 @@ impl Clone for SceneMaterial {
 fn main() -> Result<()> {
     let cli = Args::parse();
 
-    let input = std::fs::read_to_string(&cli.input)
-        .context(format!("Failed to read {}", cli.input))?;
+    let input =
+        std::fs::read_to_string(&cli.input).context(format!("Failed to read {}", cli.input))?;
 
     let mut scene = parse_scene(&input);
 
@@ -596,9 +601,7 @@ fn main() -> Result<()> {
         use_fast_math: Some(true),
         options: vec![format!(
             "--include-path={}",
-            std::env::current_dir()?
-                .join("renderer/src")
-                .display()
+            std::env::current_dir()?.join("renderer/src").display()
         )],
         ..Default::default()
     };
@@ -693,8 +696,7 @@ fn main() -> Result<()> {
     .context("pipeline")?
     .value;
     let max_graph_depth = if has_spheres { 2 } else { 1 };
-    pipeline
-        .set_stack_size(2048, 2048, 2048, max_graph_depth)?;
+    pipeline.set_stack_size(2048, 2048, 2048, max_graph_depth)?;
 
     // --- Build geometry ---
     // Separate GASes for triangles and spheres (OptiX requires same prim type per GAS)
@@ -774,8 +776,10 @@ fn main() -> Result<()> {
                 };
 
                 let sbt_offset = sphere_hg_records.len() as u32;
-                sphere_hg_records
-                    .push(SbtRecord::new(hitgroup_sphere_pg.as_ref().context("no sphere hitgroup")?, hg_data)?);
+                sphere_hg_records.push(SbtRecord::new(
+                    hitgroup_sphere_pg.as_ref().context("no sphere hitgroup")?,
+                    hg_data,
+                )?);
 
                 gas_entries.push(GasEntry {
                     handle,
@@ -1133,7 +1137,9 @@ fn save_image(path: &str, width: u32, height: u32, pixels: &[u32]) -> Result<()>
         let mut encoder = png::Encoder::new(w, width, height);
         encoder.set_color(png::ColorType::Rgb);
         encoder.set_depth(png::BitDepth::Eight);
-        let mut writer = encoder.write_header().context("Failed to write PNG header")?;
+        let mut writer = encoder
+            .write_header()
+            .context("Failed to write PNG header")?;
         writer
             .write_image_data(&rgb)
             .context("Failed to write PNG data")?;
