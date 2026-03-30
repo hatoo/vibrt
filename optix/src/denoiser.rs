@@ -36,7 +36,7 @@ pub struct Image2D {
 }
 
 impl Image2D {
-    pub(crate) fn to_raw(&self) -> optix_sys::OptixImage2D {
+    pub(crate) fn to_raw(self) -> optix_sys::OptixImage2D {
         optix_sys::OptixImage2D {
             data: self.data,
             width: self.width,

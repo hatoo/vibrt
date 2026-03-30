@@ -1,6 +1,11 @@
 #![allow(non_upper_case_globals)]
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]
+#![allow(clippy::missing_safety_doc)]
+#![allow(clippy::useless_transmute)]
+#![allow(clippy::ptr_offset_with_cast)]
+#![allow(clippy::upper_case_acronyms)]
+#![allow(clippy::type_complexity)]
 
 mod init;
 

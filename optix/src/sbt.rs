@@ -106,13 +106,13 @@ impl ShaderBindingTableBuilder {
     pub fn build(self) -> Result<optix_sys::OptixShaderBindingTable> {
         const ALIGN: u64 = optix_sys::OPTIX_SBT_RECORD_ALIGNMENT as u64;
 
-        if self.raygen_record % ALIGN != 0 {
+        if !self.raygen_record.is_multiple_of(ALIGN) {
             return Err(OptixError::InvalidValue);
         }
-        if self.miss_record_base != 0 && self.miss_record_base % ALIGN != 0 {
+        if self.miss_record_base != 0 && !self.miss_record_base.is_multiple_of(ALIGN) {
             return Err(OptixError::InvalidValue);
         }
-        if self.hitgroup_record_base != 0 && self.hitgroup_record_base % ALIGN != 0 {
+        if self.hitgroup_record_base != 0 && !self.hitgroup_record_base.is_multiple_of(ALIGN) {
             return Err(OptixError::InvalidValue);
         }
 
