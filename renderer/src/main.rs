@@ -603,7 +603,10 @@ fn main() {
     let ptx_src = ptx.to_src();
 
     // --- OptiX pipeline ---
-    let has_spheres = scene.objects.iter().any(|o| matches!(o.shape, SceneShape::Sphere { .. }));
+    let has_spheres = scene
+        .objects
+        .iter()
+        .any(|o| matches!(o.shape, SceneShape::Sphere { .. }));
 
     let mut prim_flags = PrimitiveTypeFlags::TRIANGLE;
     if has_spheres {
@@ -728,9 +731,14 @@ fn main() {
                 let d_output: CudaSlice<u8> = unsafe { stream.alloc(sizes.output_size) }.unwrap();
 
                 let handle = accel::accel_build(
-                    &ctx, cu_stream, &build_options, &bi,
-                    dptr(&d_temp, &stream), sizes.temp_size,
-                    dptr(&d_output, &stream), sizes.output_size,
+                    &ctx,
+                    cu_stream,
+                    &build_options,
+                    &bi,
+                    dptr(&d_temp, &stream),
+                    sizes.temp_size,
+                    dptr(&d_output, &stream),
+                    sizes.output_size,
                 )
                 .expect("sphere accel build");
 
@@ -789,12 +797,17 @@ fn main() {
                 let num_tris = indices.len() as u32 / 3;
 
                 let tri_input = TriangleArrayInput::new(
-                    &vert_ptrs, num_verts, VertexFormat::Float3,
-                    3 * mem::size_of::<f32>() as u32, &flags,
+                    &vert_ptrs,
+                    num_verts,
+                    VertexFormat::Float3,
+                    3 * mem::size_of::<f32>() as u32,
+                    &flags,
                 )
                 .with_indices(
-                    dptr(&d_indices, &stream), num_tris,
-                    IndicesFormat::UnsignedInt3, 3 * mem::size_of::<i32>() as u32,
+                    dptr(&d_indices, &stream),
+                    num_tris,
+                    IndicesFormat::UnsignedInt3,
+                    3 * mem::size_of::<i32>() as u32,
                 );
 
                 let bi = [BuildInput::Triangles(tri_input)];
@@ -804,9 +817,14 @@ fn main() {
                 let d_output: CudaSlice<u8> = unsafe { stream.alloc(sizes.output_size) }.unwrap();
 
                 let handle = accel::accel_build(
-                    &ctx, cu_stream, &build_options, &bi,
-                    dptr(&d_temp, &stream), sizes.temp_size,
-                    dptr(&d_output, &stream), sizes.output_size,
+                    &ctx,
+                    cu_stream,
+                    &build_options,
+                    &bi,
+                    dptr(&d_temp, &stream),
+                    sizes.temp_size,
+                    dptr(&d_output, &stream),
+                    sizes.output_size,
                 )
                 .expect("tri accel build");
 
@@ -886,9 +904,14 @@ fn main() {
         let d_output: CudaSlice<u8> = unsafe { stream.alloc(sizes.output_size) }.unwrap();
 
         let ias_handle = accel::accel_build(
-            &ctx, cu_stream, &build_options, &ias_input,
-            dptr(&d_temp, &stream), sizes.temp_size,
-            dptr(&d_output, &stream), sizes.output_size,
+            &ctx,
+            cu_stream,
+            &build_options,
+            &ias_input,
+            dptr(&d_temp, &stream),
+            sizes.temp_size,
+            dptr(&d_output, &stream),
+            sizes.output_size,
         )
         .expect("IAS build");
         stream.synchronize().unwrap();
@@ -918,15 +941,11 @@ fn main() {
     let mut all_hg_records: Vec<u8> = Vec::new();
     let hg_stride = mem::size_of::<SbtRecord<HitGroupData>>();
     for rec in &tri_hg_records {
-        let bytes = unsafe {
-            std::slice::from_raw_parts(rec as *const _ as *const u8, hg_stride)
-        };
+        let bytes = unsafe { std::slice::from_raw_parts(rec as *const _ as *const u8, hg_stride) };
         all_hg_records.extend_from_slice(bytes);
     }
     for rec in &sphere_hg_records {
-        let bytes = unsafe {
-            std::slice::from_raw_parts(rec as *const _ as *const u8, hg_stride)
-        };
+        let bytes = unsafe { std::slice::from_raw_parts(rec as *const _ as *const u8, hg_stride) };
         all_hg_records.extend_from_slice(bytes);
     }
     let total_hg_count = tri_hg_records.len() + sphere_hg_records.len();
@@ -1052,8 +1071,6 @@ fn transform_vertices(verts: &[f32], t: &[f32; 12]) -> Vec<f32> {
     result
 }
 
-
-
 fn find_optix_include() -> String {
     if let Ok(root) = std::env::var("OPTIX_ROOT") {
         return format!("{root}/include");
@@ -1099,6 +1116,8 @@ fn save_image(path: &str, width: u32, height: u32, pixels: &[u32]) {
         encoder.set_color(png::ColorType::Rgb);
         encoder.set_depth(png::BitDepth::Eight);
         let mut writer = encoder.write_header().expect("Failed to write PNG header");
-        writer.write_image_data(&rgb).expect("Failed to write PNG data");
+        writer
+            .write_image_data(&rgb)
+            .expect("Failed to write PNG data");
     }
 }
