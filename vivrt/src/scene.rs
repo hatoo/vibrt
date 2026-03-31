@@ -174,6 +174,33 @@ fn get_spectrum_avg(params: &[pbrt_parser::Param], name: &str) -> Option<f32> {
         })
 }
 
+/// Warn about unhandled parameters in a directive.
+fn warn_unhandled_params(context: &str, params: &[pbrt_parser::Param], handled: &[&str]) {
+    for p in params {
+        if !handled.contains(&p.name.as_str()) {
+            eprintln!(
+                "  warning: unhandled param \"{} {}\" in {context}",
+                match p.ty {
+                    ParamType::Integer => "integer",
+                    ParamType::Float => "float",
+                    ParamType::Point2 => "point2",
+                    ParamType::Vector2 => "vector2",
+                    ParamType::Point3 => "point3",
+                    ParamType::Vector3 => "vector3",
+                    ParamType::Normal3 => "normal3",
+                    ParamType::Bool => "bool",
+                    ParamType::String => "string",
+                    ParamType::Rgb => "rgb",
+                    ParamType::Spectrum => "spectrum",
+                    ParamType::Blackbody => "blackbody",
+                    ParamType::Texture => "texture",
+                },
+                p.name
+            );
+        }
+    }
+}
+
 /// Approximate reflectance color for named metal spectra.
 fn metal_color_from_params(params: &[pbrt_parser::Param]) -> Option<[f32; 3]> {
     // Check for "spectrum eta" with a named metal
@@ -296,7 +323,7 @@ fn parse_shape(ty: &str, params: &[pbrt_parser::Param], scene_dir: &Path) -> Opt
             })
         }
         _ => {
-            eprintln!("Unsupported shape type: {ty}");
+            eprintln!("  warning: unsupported shape type: {ty}");
             None
         }
     }
@@ -597,8 +624,25 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                             .or_else(|| get_spectrum_avg(params, "eta"))
                             .unwrap_or(1.5);
                     }
-                    _ => eprintln!("Unsupported material type: {ty}"),
+                    _ => eprintln!("  warning: unsupported material type: {ty}"),
                 }
+                warn_unhandled_params(
+                    &format!("Material \"{ty}\""),
+                    params,
+                    &[
+                        "reflectance",
+                        "roughness",
+                        "uroughness",
+                        "vroughness",
+                        "eta",
+                        "k",
+                        "displacement",
+                        "alpha",
+                        "remaproughness",
+                        "normalmap",
+                        "type",
+                    ],
+                );
                 if let Some(tex_name) = get_param_texture_ref(params, "displacement") {
                     if let Some(SceneTexture::Image(img)) = textures.get(tex_name) {
                         current_material.bump_map = Some(img.clone());
@@ -685,8 +729,29 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                             }
                         }
                     }
-                    _ => {}
+                    _ => {
+                        eprintln!("  warning: unsupported MakeNamedMaterial type: {ty}");
+                    }
                 }
+                warn_unhandled_params(
+                    &format!("MakeNamedMaterial \"{name}\" ({ty})"),
+                    params,
+                    &[
+                        "type",
+                        "reflectance",
+                        "roughness",
+                        "uroughness",
+                        "vroughness",
+                        "eta",
+                        "k",
+                        "displacement",
+                        "alpha",
+                        "remaproughness",
+                        "normalmap",
+                        "materials",
+                        "amount",
+                    ],
+                );
                 // Bind displacement/bump map for any material type
                 if let Some(tex_name) = get_param_texture_ref(params, "displacement") {
                     if let Some(SceneTexture::Image(img)) = textures.get(tex_name) {
@@ -777,6 +842,13 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                             textures.insert(name.clone(), base.clone());
                         }
                     }
+                } else if class != "checkerboard"
+                    && class != "imagemap"
+                    && class != "constant"
+                    && class != "scale"
+                    && class != "mix"
+                {
+                    eprintln!("  warning: unsupported texture class: {class} (texture \"{name}\")");
                 }
             }
             Directive::Shape { ty, params } => {
@@ -848,6 +920,15 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                     }
                     Err(e) => eprintln!("Failed to include {}: {e}", include_path.display()),
                 }
+            }
+            Directive::ReverseOrientation
+            | Directive::ObjectBegin(_)
+            | Directive::ObjectEnd
+            | Directive::ObjectInstance(_)
+            | Directive::Attribute { .. }
+            | Directive::Option { .. }
+            | Directive::ColorSpace(_) => {
+                // Known but not implemented
             }
             _ => {}
         }
