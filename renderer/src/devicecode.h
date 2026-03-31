@@ -39,6 +39,7 @@ struct HitGroupData {
     int           material_type;
     float         albedo[3];
     float         eta;
+    float         emission[3];
     // Procedural checkerboard
     int           has_checkerboard;
     float         checker_scale_u;

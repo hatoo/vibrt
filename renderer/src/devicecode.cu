@@ -169,8 +169,9 @@ extern "C" __global__ void __raygen__rg()
         float3 radiance = make_float3(0, 0, 0);
 
         for (unsigned int depth = 0; depth < params.max_depth; depth++) {
-            unsigned int p0, p1, p2, p3, p4, p5, p6, p7, p8, p9;
+            unsigned int p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12;
             p9 = 0xFFFFFFFF; // miss sentinel
+            p10 = p11 = p12 = 0;
 
             optixTrace(
                 params.traversable,
@@ -179,7 +180,7 @@ extern "C" __global__ void __raygen__rg()
                 OptixVisibilityMask(255),
                 OPTIX_RAY_FLAG_NONE,
                 0, 1, 0,
-                p0, p1, p2, p3, p4, p5, p6, p7, p8, p9
+                p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12
             );
 
             if (p9 == 0xFFFFFFFF) {
@@ -192,7 +193,13 @@ extern "C" __global__ void __raygen__rg()
             float3 hit_pos = make_float3(__uint_as_float(p3), __uint_as_float(p4), __uint_as_float(p5));
             float3 hit_normal = make_float3(__uint_as_float(p6), __uint_as_float(p7), __uint_as_float(p8));
             float3 hit_albedo = make_float3(__uint_as_float(p0), __uint_as_float(p1), __uint_as_float(p2));
+            float3 hit_emission = make_float3(__uint_as_float(p10), __uint_as_float(p11), __uint_as_float(p12));
             int mat_type = (int)p9;
+
+            // Add emission from area lights
+            if (hit_emission.x > 0 || hit_emission.y > 0 || hit_emission.z > 0) {
+                radiance = radiance + throughput * hit_emission;
+            }
 
             if (mat_type == MAT_DIFFUSE) {
                 // Direct lighting from distant lights
@@ -203,6 +210,7 @@ extern "C" __global__ void __raygen__rg()
                     if (ndotl > 0.0f) {
                         // Shadow ray
                         unsigned int shadow_p9 = 0xFFFFFFFF;
+                        unsigned int sp10 = 0, sp11 = 0, sp12 = 0;
                         optixTrace(
                             params.traversable,
                             hit_pos, light_dir,
@@ -210,7 +218,7 @@ extern "C" __global__ void __raygen__rg()
                             OptixVisibilityMask(255),
                             OPTIX_RAY_FLAG_TERMINATE_ON_FIRST_HIT,
                             0, 1, 0,
-                            p0, p1, p2, p3, p4, p5, p6, p7, p8, shadow_p9
+                            p0, p1, p2, p3, p4, p5, p6, p7, p8, shadow_p9, sp10, sp11, sp12
                         );
                         if (shadow_p9 == 0xFFFFFFFF) {
                             radiance = radiance + throughput * hit_albedo * light_em * ndotl * (1.0f / M_PIf);
@@ -363,6 +371,9 @@ extern "C" __global__ void __closesthit__ch()
     optixSetPayload_7(__float_as_uint(shading_normal.y));
     optixSetPayload_8(__float_as_uint(shading_normal.z));
     optixSetPayload_9((unsigned int)data->material_type);
+    optixSetPayload_10(__float_as_uint(data->emission[0]));
+    optixSetPayload_11(__float_as_uint(data->emission[1]));
+    optixSetPayload_12(__float_as_uint(data->emission[2]));
 }
 
 // Closest hit for sphere (built-in intersection)
@@ -403,4 +414,7 @@ extern "C" __global__ void __closesthit__sphere()
     optixSetPayload_7(__float_as_uint(world_normal.y));
     optixSetPayload_8(__float_as_uint(world_normal.z));
     optixSetPayload_9((unsigned int)data->material_type);
+    optixSetPayload_10(__float_as_uint(data->emission[0]));
+    optixSetPayload_11(__float_as_uint(data->emission[1]));
+    optixSetPayload_12(__float_as_uint(data->emission[2]));
 }

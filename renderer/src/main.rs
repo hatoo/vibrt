@@ -82,6 +82,7 @@ struct HitGroupData {
     material_type: i32,
     albedo: [f32; 3],
     eta: f32,
+    emission: [f32; 3],
     has_checkerboard: i32,
     checker_scale_u: f32,
     checker_scale_v: f32,
@@ -156,6 +157,7 @@ struct SceneMaterial {
     material_type: i32,
     albedo: [f32; 3],
     eta: f32,
+    emission: [f32; 3],
     has_checkerboard: bool,
     checker_scale_u: f32,
     checker_scale_v: f32,
@@ -169,6 +171,7 @@ impl Default for SceneMaterial {
             material_type: MAT_DIFFUSE,
             albedo: [0.5, 0.5, 0.5],
             eta: 1.5,
+            emission: [0.0, 0.0, 0.0],
             has_checkerboard: false,
             checker_scale_u: 1.0,
             checker_scale_v: 1.0,
@@ -298,7 +301,47 @@ fn identity_transform() -> [f32; 12] {
     [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0]
 }
 
-fn parse_scene(input: &str) -> ParsedScene {
+/// Multiply two 3x4 row-major transforms: result = a * b
+fn mul_transform(a: &[f32; 12], b: &[f32; 12]) -> [f32; 12] {
+    let mut r = [0.0f32; 12];
+    for i in 0..3 {
+        for j in 0..4 {
+            let mut sum = 0.0;
+            for k in 0..3 {
+                sum += a[i * 4 + k] * b[k * 4 + j];
+            }
+            if j == 3 {
+                sum += a[i * 4 + 3];
+            }
+            r[i * 4 + j] = sum;
+        }
+    }
+    r
+}
+
+fn translate_matrix(tx: f32, ty: f32, tz: f32) -> [f32; 12] {
+    [1.0, 0.0, 0.0, tx, 0.0, 1.0, 0.0, ty, 0.0, 0.0, 1.0, tz]
+}
+
+fn scale_matrix(sx: f32, sy: f32, sz: f32) -> [f32; 12] {
+    [sx, 0.0, 0.0, 0.0, 0.0, sy, 0.0, 0.0, 0.0, 0.0, sz, 0.0]
+}
+
+fn rotate_matrix(angle_deg: f32, ax: f32, ay: f32, az: f32) -> [f32; 12] {
+    let angle = angle_deg.to_radians();
+    let c = angle.cos();
+    let s = angle.sin();
+    let len = (ax * ax + ay * ay + az * az).sqrt();
+    let (x, y, z) = (ax / len, ay / len, az / len);
+    let t = 1.0 - c;
+    [
+        t * x * x + c,     t * x * y - s * z, t * x * z + s * y, 0.0,
+        t * x * y + s * z, t * y * y + c,     t * y * z - s * x, 0.0,
+        t * x * z - s * y, t * y * z + s * x, t * z * z + c,     0.0,
+    ]
+}
+
+fn parse_scene(input: &str, scene_dir: &std::path::Path) -> ParsedScene {
     let scene = pbrt_parser::parse(input).expect("Failed to parse PBRT scene");
 
     let mut parsed = ParsedScene {
@@ -375,9 +418,16 @@ fn parse_scene(input: &str) -> ParsedScene {
                 }
             }
             Directive::Translate { v } => {
-                current_transform[3] += v[0] as f32;
-                current_transform[7] += v[1] as f32;
-                current_transform[11] += v[2] as f32;
+                let t = translate_matrix(v[0] as f32, v[1] as f32, v[2] as f32);
+                current_transform = mul_transform(&current_transform, &t);
+            }
+            Directive::Scale { v } => {
+                let s = scale_matrix(v[0] as f32, v[1] as f32, v[2] as f32);
+                current_transform = mul_transform(&current_transform, &s);
+            }
+            Directive::Rotate { angle, axis } => {
+                let r = rotate_matrix(*angle as f32, axis[0] as f32, axis[1] as f32, axis[2] as f32);
+                current_transform = mul_transform(&current_transform, &r);
             }
             Directive::Identity => {
                 current_transform = identity_transform();
@@ -447,7 +497,20 @@ fn parse_scene(input: &str) -> ParsedScene {
                             }
                         }
                     }
-                    "dielectric" => {
+                    "coateddiffuse" | "coatedconductor" => {
+                        current_material.material_type = MAT_DIFFUSE;
+                        if let Some(c) = get_param_rgb(params, "reflectance") {
+                            current_material.albedo = c;
+                        }
+                    }
+                    "conductor" => {
+                        // Approximate as slightly reflective diffuse
+                        current_material.material_type = MAT_DIFFUSE;
+                        if let Some(c) = get_param_rgb(params, "reflectance") {
+                            current_material.albedo = c;
+                        }
+                    }
+                    "dielectric" | "thindielectric" => {
                         current_material.material_type = MAT_DIELECTRIC;
                         current_material.eta = get_param_float(params, "eta").unwrap_or(1.5);
                     }
@@ -520,6 +583,20 @@ fn parse_scene(input: &str) -> ParsedScene {
                             texcoords,
                         }
                     }
+                    "loopsubdiv" | "plymesh" => {
+                        // Treat as triangle mesh (skip subdivision)
+                        let verts: Vec<f32> = get_param_floats(params, "P")
+                            .map(|v| v.iter().map(|x| *x as f32).collect())
+                            .unwrap_or_default();
+                        let indices: Vec<i32> = get_param_ints(params, "indices")
+                            .map(|v| v.iter().map(|x| *x as i32).collect())
+                            .unwrap_or_default();
+                        SceneShape::TriangleMesh {
+                            vertices: verts,
+                            indices,
+                            texcoords: Vec::new(),
+                        }
+                    }
                     _ => {
                         eprintln!("Unsupported shape type: {ty}");
                         continue;
@@ -530,6 +607,53 @@ fn parse_scene(input: &str) -> ParsedScene {
                     material: current_material.clone(),
                     transform: current_transform,
                 });
+            }
+            Directive::AreaLightSource { ty, params } => {
+                // Store area light emission for the next shape
+                if ty == "diffuse" {
+                    if let Some(c) = get_param_rgb(params, "L") {
+                        current_material.emission = c;
+                    }
+                }
+            }
+            Directive::Include(path) => {
+                let include_path = scene_dir.join(path);
+                match std::fs::read_to_string(&include_path) {
+                    Ok(content) => {
+                        let included = pbrt_parser::parse(&content)
+                            .expect(&format!("Failed to parse included file: {}", include_path.display()));
+                        // Process included directives with current state
+                        for inc_directive in &included.directives {
+                            // Only handle Shape directives from includes
+                            if let Directive::Shape { ty, params } = inc_directive {
+                                let shape = match ty.as_str() {
+                                    "trianglemesh" | "loopsubdiv" => {
+                                        let verts: Vec<f32> = get_param_floats(params, "P")
+                                            .map(|v| v.iter().map(|x| *x as f32).collect())
+                                            .unwrap_or_default();
+                                        let indices: Vec<i32> = get_param_ints(params, "indices")
+                                            .map(|v| v.iter().map(|x| *x as i32).collect())
+                                            .unwrap_or_default();
+                                        let texcoords: Vec<f32> = get_param_floats(params, "uv")
+                                            .map(|v| v.iter().map(|x| *x as f32).collect())
+                                            .unwrap_or_default();
+                                        SceneShape::TriangleMesh { vertices: verts, indices, texcoords }
+                                    }
+                                    "sphere" => {
+                                        SceneShape::Sphere { radius: get_param_float(params, "radius").unwrap_or(1.0) }
+                                    }
+                                    _ => continue,
+                                };
+                                parsed.objects.push(SceneObject {
+                                    shape,
+                                    material: current_material.clone(),
+                                    transform: current_transform,
+                                });
+                            }
+                        }
+                    }
+                    Err(e) => eprintln!("Failed to include {}: {e}", include_path.display()),
+                }
             }
             _ => {}
         }
@@ -550,7 +674,10 @@ fn main() -> Result<()> {
     let input =
         std::fs::read_to_string(&cli.input).context(format!("Failed to read {}", cli.input))?;
 
-    let mut scene = parse_scene(&input);
+    let scene_dir = std::path::Path::new(&cli.input)
+        .parent()
+        .unwrap_or(std::path::Path::new("."));
+    let mut scene = parse_scene(&input, scene_dir);
 
     // Apply CLI overrides
     if let Some(spp) = cli.spp {
@@ -635,7 +762,7 @@ fn main() -> Result<()> {
         } else {
             TraversableGraphFlags::ALLOW_SINGLE_GAS
         })
-        .num_payload_values(10)
+        .num_payload_values(13)
         .num_attribute_values(2)
         .uses_primitive_type_flags(prim_flags);
 
@@ -763,6 +890,7 @@ fn main() -> Result<()> {
                     material_type: obj.material.material_type,
                     albedo: obj.material.albedo,
                     eta: obj.material.eta,
+                    emission: obj.material.emission,
                     has_checkerboard: 0,
                     checker_scale_u: 0.0,
                     checker_scale_v: 0.0,
@@ -851,6 +979,7 @@ fn main() -> Result<()> {
                     material_type: obj.material.material_type,
                     albedo: obj.material.albedo,
                     eta: obj.material.eta,
+                    emission: obj.material.emission,
                     has_checkerboard: if obj.material.has_checkerboard { 1 } else { 0 },
                     checker_scale_u: obj.material.checker_scale_u,
                     checker_scale_v: obj.material.checker_scale_v,
