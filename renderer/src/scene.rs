@@ -500,6 +500,7 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
     let mut current_material = SceneMaterial::default();
     let mut current_transform = identity_transform();
     let mut transform_stack: Vec<([f32; 12], SceneMaterial)> = Vec::new();
+    let mut _in_world = false;
 
     for directive in &scene.directives {
         match directive {
@@ -535,7 +536,33 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                 }
             }
             Directive::WorldBegin => {
+                // Apply accumulated pre-WorldBegin transform to camera.
+                // In PBRT, transforms before WorldBegin modify the camera orientation.
+                // The CTM at this point = post-LookAt transforms (e.g. Rotate).
+                // Apply the rotation part to the look direction and up vector.
+                if current_transform != identity_transform() {
+                    let t = &current_transform;
+                    // Rotate look direction (look_at - eye) and up vector
+                    let dx = parsed.cam_look[0] - parsed.cam_eye[0];
+                    let dy = parsed.cam_look[1] - parsed.cam_eye[1];
+                    let dz = parsed.cam_look[2] - parsed.cam_eye[2];
+                    // Apply rotation (3x3 part of transform) to direction
+                    parsed.cam_look = [
+                        parsed.cam_eye[0] + t[0] * dx + t[1] * dy + t[2] * dz,
+                        parsed.cam_eye[1] + t[4] * dx + t[5] * dy + t[6] * dz,
+                        parsed.cam_eye[2] + t[8] * dx + t[9] * dy + t[10] * dz,
+                    ];
+                    let ux = parsed.cam_up[0];
+                    let uy = parsed.cam_up[1];
+                    let uz = parsed.cam_up[2];
+                    parsed.cam_up = [
+                        t[0] * ux + t[1] * uy + t[2] * uz,
+                        t[4] * ux + t[5] * uy + t[6] * uz,
+                        t[8] * ux + t[9] * uy + t[10] * uz,
+                    ];
+                }
                 current_transform = identity_transform();
+                _in_world = true;
             }
             Directive::AttributeBegin => {
                 transform_stack.push((current_transform, current_material.clone()));
