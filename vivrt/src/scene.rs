@@ -99,118 +99,168 @@ pub struct ParsedScene {
     pub cam_flip_x: bool,
 }
 
-// ---- Parameter helpers ----
+// ---- Parameter access tracking ----
 
-fn get_param_floats<'a>(params: &'a [pbrt_parser::Param], name: &str) -> Option<&'a [f64]> {
-    params
-        .iter()
-        .find(|p| p.name == name)
-        .and_then(|p| match &p.value {
-            ParamValue::Floats(v) => Some(v.as_slice()),
-            _ => None,
-        })
+/// Wraps a param list and tracks which params were accessed.
+/// Warns about unaccessed params on drop.
+struct ParamSet<'a> {
+    params: &'a [pbrt_parser::Param],
+    accessed: std::cell::RefCell<std::collections::HashSet<usize>>,
+    context: String,
 }
 
-fn get_param_float(params: &[pbrt_parser::Param], name: &str) -> Option<f32> {
-    get_param_floats(params, name).and_then(|v| v.first().map(|x| *x as f32))
-}
+impl<'a> ParamSet<'a> {
+    fn new(params: &'a [pbrt_parser::Param], context: impl Into<String>) -> Self {
+        Self {
+            params,
+            accessed: std::cell::RefCell::new(std::collections::HashSet::new()),
+            context: context.into(),
+        }
+    }
 
-fn get_param_string<'a>(params: &'a [pbrt_parser::Param], name: &str) -> Option<&'a str> {
-    params
-        .iter()
-        .find(|p| p.name == name)
-        .and_then(|p| match &p.value {
-            ParamValue::Strings(v) => v.first().map(|s| s.as_str()),
-            _ => None,
-        })
-}
-
-fn get_param_ints<'a>(params: &'a [pbrt_parser::Param], name: &str) -> Option<&'a [i64]> {
-    params
-        .iter()
-        .find(|p| p.name == name)
-        .and_then(|p| match &p.value {
-            ParamValue::Ints(v) => Some(v.as_slice()),
-            _ => None,
-        })
-}
-
-fn get_param_rgb(params: &[pbrt_parser::Param], name: &str) -> Option<[f32; 3]> {
-    params
-        .iter()
-        .find(|p| p.name == name)
-        .and_then(|p| match &p.value {
-            ParamValue::Floats(v) if v.len() >= 3 => Some([v[0] as f32, v[1] as f32, v[2] as f32]),
-            _ => None,
-        })
-}
-
-fn get_param_texture_ref<'a>(params: &'a [pbrt_parser::Param], name: &str) -> Option<&'a str> {
-    params
-        .iter()
-        .find(|p| p.name == name && p.ty == ParamType::Texture)
-        .and_then(|p| match &p.value {
-            ParamValue::Strings(v) => v.first().map(|s| s.as_str()),
-            _ => None,
-        })
-}
-
-/// Extract average value from inline spectrum data (wavelength/value pairs).
-fn get_spectrum_avg(params: &[pbrt_parser::Param], name: &str) -> Option<f32> {
-    params
-        .iter()
-        .find(|p| p.name == name && p.ty == ParamType::Spectrum)
-        .and_then(|p| match &p.value {
-            ParamValue::Floats(v) if v.len() >= 2 => {
-                // Pairs of (wavelength, value) — average the values
-                let values: Vec<f64> = v.iter().skip(1).step_by(2).copied().collect();
-                if values.is_empty() {
-                    None
-                } else {
-                    Some((values.iter().sum::<f64>() / values.len() as f64) as f32)
-                }
+    fn mark(&self, name: &str) {
+        for (i, p) in self.params.iter().enumerate() {
+            if p.name == name {
+                self.accessed.borrow_mut().insert(i);
             }
-            _ => None,
-        })
+        }
+    }
+
+    fn floats(&self, name: &str) -> Option<&'a [f64]> {
+        self.mark(name);
+        self.params
+            .iter()
+            .find(|p| p.name == name)
+            .and_then(|p| match &p.value {
+                ParamValue::Floats(v) => Some(v.as_slice()),
+                _ => None,
+            })
+    }
+
+    fn float(&self, name: &str) -> Option<f32> {
+        self.floats(name).and_then(|v| v.first().map(|x| *x as f32))
+    }
+
+    fn string(&self, name: &str) -> Option<&'a str> {
+        self.mark(name);
+        self.params
+            .iter()
+            .find(|p| p.name == name)
+            .and_then(|p| match &p.value {
+                ParamValue::Strings(v) => v.first().map(|s| s.as_str()),
+                _ => None,
+            })
+    }
+
+    fn ints(&self, name: &str) -> Option<&'a [i64]> {
+        self.mark(name);
+        self.params
+            .iter()
+            .find(|p| p.name == name)
+            .and_then(|p| match &p.value {
+                ParamValue::Ints(v) => Some(v.as_slice()),
+                _ => None,
+            })
+    }
+
+    fn rgb(&self, name: &str) -> Option<[f32; 3]> {
+        self.mark(name);
+        self.params
+            .iter()
+            .find(|p| p.name == name)
+            .and_then(|p| match &p.value {
+                ParamValue::Floats(v) if v.len() >= 3 => {
+                    Some([v[0] as f32, v[1] as f32, v[2] as f32])
+                }
+                _ => None,
+            })
+    }
+
+    fn texture_ref(&self, name: &str) -> Option<&'a str> {
+        self.mark(name);
+        self.params
+            .iter()
+            .find(|p| p.name == name && p.ty == ParamType::Texture)
+            .and_then(|p| match &p.value {
+                ParamValue::Strings(v) => v.first().map(|s| s.as_str()),
+                _ => None,
+            })
+    }
+
+    fn spectrum_avg(&self, name: &str) -> Option<f32> {
+        self.mark(name);
+        self.params
+            .iter()
+            .find(|p| p.name == name && p.ty == ParamType::Spectrum)
+            .and_then(|p| match &p.value {
+                ParamValue::Floats(v) if v.len() >= 2 => {
+                    let values: Vec<f64> = v.iter().skip(1).step_by(2).copied().collect();
+                    if values.is_empty() {
+                        None
+                    } else {
+                        Some((values.iter().sum::<f64>() / values.len() as f64) as f32)
+                    }
+                }
+                _ => None,
+            })
+    }
+
+    fn spectrum_string(&self, name: &str) -> Option<&'a str> {
+        self.mark(name);
+        self.params
+            .iter()
+            .find(|p| p.name == name && p.ty == ParamType::Spectrum)
+            .and_then(|p| match &p.value {
+                ParamValue::Strings(v) => v.first().map(|s| s.as_str()),
+                _ => None,
+            })
+    }
+
+    fn blackbody(&self, name: &str) -> Option<f32> {
+        self.mark(name);
+        self.params
+            .iter()
+            .find(|p| p.name == name && p.ty == ParamType::Blackbody)
+            .and_then(|p| match &p.value {
+                ParamValue::Floats(v) => v.first().map(|x| *x as f32),
+                _ => None,
+            })
+    }
 }
 
-/// Warn about unhandled parameters in a directive.
-fn warn_unhandled_params(context: &str, params: &[pbrt_parser::Param], handled: &[&str]) {
-    for p in params {
-        if !handled.contains(&p.name.as_str()) {
-            eprintln!(
-                "  warning: unhandled param \"{} {}\" in {context}",
-                match p.ty {
-                    ParamType::Integer => "integer",
-                    ParamType::Float => "float",
-                    ParamType::Point2 => "point2",
-                    ParamType::Vector2 => "vector2",
-                    ParamType::Point3 => "point3",
-                    ParamType::Vector3 => "vector3",
-                    ParamType::Normal3 => "normal3",
-                    ParamType::Bool => "bool",
-                    ParamType::String => "string",
-                    ParamType::Rgb => "rgb",
-                    ParamType::Spectrum => "spectrum",
-                    ParamType::Blackbody => "blackbody",
-                    ParamType::Texture => "texture",
-                },
-                p.name
-            );
+impl Drop for ParamSet<'_> {
+    fn drop(&mut self) {
+        let accessed = self.accessed.borrow();
+        for (i, p) in self.params.iter().enumerate() {
+            if !accessed.contains(&i) {
+                eprintln!(
+                    "  warning: unhandled param \"{} {}\" in {}",
+                    match p.ty {
+                        ParamType::Integer => "integer",
+                        ParamType::Float => "float",
+                        ParamType::Point2 => "point2",
+                        ParamType::Vector2 => "vector2",
+                        ParamType::Point3 => "point3",
+                        ParamType::Vector3 => "vector3",
+                        ParamType::Normal3 => "normal3",
+                        ParamType::Bool => "bool",
+                        ParamType::String => "string",
+                        ParamType::Rgb => "rgb",
+                        ParamType::Spectrum => "spectrum",
+                        ParamType::Blackbody => "blackbody",
+                        ParamType::Texture => "texture",
+                    },
+                    p.name,
+                    self.context
+                );
+            }
         }
     }
 }
 
 /// Approximate reflectance color for named metal spectra.
-fn metal_color_from_params(params: &[pbrt_parser::Param]) -> Option<[f32; 3]> {
-    // Check for "spectrum eta" with a named metal
-    let eta_str = params
-        .iter()
-        .find(|p| p.name == "eta")
-        .and_then(|p| match &p.value {
-            ParamValue::Strings(v) => v.first().map(|s| s.as_str()),
-            _ => None,
-        });
+fn metal_color_from_params(p: &ParamSet) -> Option<[f32; 3]> {
+    let eta_str = p.spectrum_string("eta");
     match eta_str {
         Some(s) if s.contains("Au") => Some([1.0, 0.78, 0.34]), // gold
         Some(s) if s.contains("Ag") => Some([0.97, 0.96, 0.91]), // silver
@@ -252,19 +302,27 @@ fn blackbody_to_rgb(kelvin: f32) -> [f32; 3] {
 // ---- Shape parsing helper ----
 
 fn parse_shape(ty: &str, params: &[pbrt_parser::Param], scene_dir: &Path) -> Option<SceneShape> {
+    let p = ParamSet::new(params, format!("Shape \"{ty}\""));
+    // Known but not fully used
+    p.mark("N"); // per-vertex normals (we compute our own for subdiv)
+    p.mark("S"); // tangents
+    p.mark("alpha"); // alpha handled at material level
     match ty {
         "sphere" => {
-            let radius = get_param_float(params, "radius").unwrap_or(1.0);
+            let radius = p.float("radius").unwrap_or(1.0);
             Some(SceneShape::Sphere { radius })
         }
         "loopsubdiv" => {
-            let verts: Vec<f32> = get_param_floats(params, "P")
+            let verts: Vec<f32> = p
+                .floats("P")
                 .map(|v| v.iter().map(|x| *x as f32).collect())
                 .unwrap_or_default();
-            let indices: Vec<i32> = get_param_ints(params, "indices")
+            let indices: Vec<i32> = p
+                .ints("indices")
                 .map(|v| v.iter().map(|x| *x as i32).collect())
                 .unwrap_or_default();
-            let levels = get_param_ints(params, "levels")
+            let levels = p
+                .ints("levels")
                 .and_then(|v| v.first().map(|x| *x as u32))
                 .unwrap_or(3);
             let (subdivided_verts, subdivided_indices) =
@@ -279,13 +337,16 @@ fn parse_shape(ty: &str, params: &[pbrt_parser::Param], scene_dir: &Path) -> Opt
             })
         }
         "trianglemesh" => {
-            let verts: Vec<f32> = get_param_floats(params, "P")
+            let verts: Vec<f32> = p
+                .floats("P")
                 .map(|v| v.iter().map(|x| *x as f32).collect())
                 .unwrap_or_default();
-            let indices: Vec<i32> = get_param_ints(params, "indices")
+            let indices: Vec<i32> = p
+                .ints("indices")
                 .map(|v| v.iter().map(|x| *x as i32).collect())
                 .unwrap_or_default();
-            let texcoords: Vec<f32> = get_param_floats(params, "uv")
+            let texcoords: Vec<f32> = p
+                .floats("uv")
                 .map(|v| v.iter().map(|x| *x as f32).collect())
                 .unwrap_or_default();
             Some(SceneShape::TriangleMesh {
@@ -296,10 +357,11 @@ fn parse_shape(ty: &str, params: &[pbrt_parser::Param], scene_dir: &Path) -> Opt
             })
         }
         "bilinearmesh" => {
-            let verts: Vec<f32> = get_param_floats(params, "P")
+            let verts: Vec<f32> = p
+                .floats("P")
                 .map(|v| v.iter().map(|x| *x as f32).collect())
                 .unwrap_or_default();
-            let texcoords: Vec<f32> = if get_param_floats(params, "uv").is_some() {
+            let texcoords: Vec<f32> = if p.floats("uv").is_some() {
                 vec![0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0]
             } else {
                 Vec::new()
@@ -313,7 +375,7 @@ fn parse_shape(ty: &str, params: &[pbrt_parser::Param], scene_dir: &Path) -> Opt
             })
         }
         "plymesh" => {
-            let filename = get_param_string(params, "filename")?;
+            let filename = p.string("filename")?;
             let mesh = ply::load(&scene_dir.join(filename))?;
             Some(SceneShape::TriangleMesh {
                 vertices: mesh.vertices,
@@ -376,20 +438,36 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
     for directive in &scene.directives {
         match directive {
             Directive::Film { params, .. } => {
-                if let Some(v) = get_param_ints(params, "xresolution") {
+                let p = ParamSet::new(params, "Film");
+                if let Some(v) = p.ints("xresolution") {
                     parsed.width = v[0] as u32;
                 }
-                if let Some(v) = get_param_ints(params, "yresolution") {
+                if let Some(v) = p.ints("yresolution") {
                     parsed.height = v[0] as u32;
                 }
-                if let Some(s) = get_param_string(params, "filename") {
+                if let Some(s) = p.string("filename") {
                     parsed.filename = s.to_string();
                 }
+                // Known but not implemented
+                p.mark("iso");
+                p.mark("sensor");
+                p.mark("diagonal");
+                p.mark("savefp16");
+                p.mark("maxcomponentvalue");
+                p.mark("cropwindow");
+                p.mark("pixelbounds");
             }
             Directive::Camera { params, .. } => {
-                if let Some(f) = get_param_float(params, "fov") {
+                let p = ParamSet::new(params, "Camera");
+                if let Some(f) = p.float("fov") {
                     parsed.fov = f;
                 }
+                p.mark("lensradius");
+                p.mark("focaldistance");
+                p.mark("frameaspectratio");
+                p.mark("screenwindow");
+                p.mark("shutteropen");
+                p.mark("shutterclose");
             }
             Directive::LookAt { eye, look, up } => {
                 let e = [eye[0] as f32, eye[1] as f32, eye[2] as f32];
@@ -413,12 +491,14 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                 parsed.cam_up = u;
             }
             Directive::Sampler { params, .. } => {
-                if let Some(v) = get_param_ints(params, "pixelsamples") {
+                let p = ParamSet::new(params, "Sampler");
+                if let Some(v) = p.ints("pixelsamples") {
                     parsed.spp = v[0] as u32;
                 }
             }
             Directive::Integrator { params, .. } => {
-                if let Some(v) = get_param_ints(params, "maxdepth") {
+                let p = ParamSet::new(params, "Integrator");
+                if let Some(v) = p.ints("maxdepth") {
                     parsed.max_depth = v[0] as u32;
                 }
             }
@@ -518,15 +598,19 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
             }
             Directive::LightSource { ty, params } => match ty.as_str() {
                 "infinite" => {
-                    if let Some(c) = get_param_rgb(params, "L") {
+                    let p = ParamSet::new(params, "LightSource \"infinite\"");
+                    if let Some(c) = p.rgb("L") {
                         parsed.ambient_light = c;
                     }
                 }
                 "distant" => {
-                    let from = get_param_floats(params, "from")
+                    let p = ParamSet::new(params, "LightSource \"distant\"");
+                    let from = p
+                        .floats("from")
                         .map(|v| [v[0] as f32, v[1] as f32, v[2] as f32])
                         .unwrap_or([0.0, 0.0, 1.0]);
-                    let to = get_param_floats(params, "to")
+                    let to = p
+                        .floats("to")
                         .map(|v| [v[0] as f32, v[1] as f32, v[2] as f32])
                         .unwrap_or([0.0, 0.0, 0.0]);
                     let dir = {
@@ -536,18 +620,11 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                         let len = (dx * dx + dy * dy + dz * dz).sqrt();
                         [dx / len, dy / len, dz / len]
                     };
-                    let mut emission = get_param_rgb(params, "L").unwrap_or([1.0, 1.0, 1.0]);
-                    if let Some(p) = params
-                        .iter()
-                        .find(|p| p.name == "L" && p.ty == ParamType::Blackbody)
-                    {
-                        if let ParamValue::Floats(v) = &p.value {
-                            if let Some(&k) = v.first() {
-                                emission = blackbody_to_rgb(k as f32);
-                            }
-                        }
+                    let mut emission = p.rgb("L").unwrap_or([1.0, 1.0, 1.0]);
+                    if let Some(k) = p.blackbody("L") {
+                        emission = blackbody_to_rgb(k);
                     }
-                    let scale = get_param_float(params, "scale").unwrap_or(1.0);
+                    let scale = p.float("scale").unwrap_or(1.0);
                     emission[0] *= scale;
                     emission[1] *= scale;
                     emission[2] *= scale;
@@ -559,14 +636,15 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                 _ => eprintln!("Unsupported light type: {ty}"),
             },
             Directive::Material { ty, params } => {
+                let p = ParamSet::new(params, format!("Material \"{ty}\""));
                 current_material = SceneMaterial::default();
                 match ty.as_str() {
                     "diffuse" => {
                         current_material.material_type = MAT_DIFFUSE;
-                        if let Some(c) = get_param_rgb(params, "reflectance") {
+                        if let Some(c) = p.rgb("reflectance") {
                             current_material.albedo = c;
                         }
-                        if let Some(tex_name) = get_param_texture_ref(params, "reflectance") {
+                        if let Some(tex_name) = p.texture_ref("reflectance") {
                             match textures.get(tex_name) {
                                 Some(SceneTexture::Checker(tex)) => {
                                     current_material.has_checkerboard = true;
@@ -584,10 +662,10 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                     }
                     "coateddiffuse" => {
                         current_material.material_type = MAT_COATED_DIFFUSE;
-                        if let Some(c) = get_param_rgb(params, "reflectance") {
+                        if let Some(c) = p.rgb("reflectance") {
                             current_material.albedo = c;
                         }
-                        if let Some(tex_name) = get_param_texture_ref(params, "reflectance") {
+                        if let Some(tex_name) = p.texture_ref("reflectance") {
                             match textures.get(tex_name) {
                                 Some(SceneTexture::Checker(tex)) => {
                                     current_material.has_checkerboard = true;
@@ -602,73 +680,66 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                                 None => {}
                             }
                         }
-                        current_material.roughness =
-                            get_param_float(params, "roughness").unwrap_or(0.0);
+                        current_material.roughness = p.float("roughness").unwrap_or(0.0);
                     }
                     "conductor" | "coatedconductor" => {
                         current_material.material_type = MAT_CONDUCTOR;
-                        if let Some(c) = get_param_rgb(params, "reflectance") {
+                        if let Some(c) = p.rgb("reflectance") {
                             current_material.albedo = c;
-                        } else if let Some(c) = metal_color_from_params(params) {
+                        } else if let Some(c) = metal_color_from_params(&p) {
                             current_material.albedo = c;
                         } else {
                             current_material.albedo = [0.8, 0.7, 0.3];
                         }
-                        current_material.roughness = get_param_float(params, "roughness")
-                            .or(get_param_float(params, "uroughness"))
+                        current_material.roughness = p
+                            .float("roughness")
+                            .or(p.float("uroughness"))
                             .unwrap_or(0.01);
                     }
                     "dielectric" | "thindielectric" => {
                         current_material.material_type = MAT_DIELECTRIC;
-                        current_material.eta = get_param_float(params, "eta")
-                            .or_else(|| get_spectrum_avg(params, "eta"))
+                        current_material.eta = p
+                            .float("eta")
+                            .or_else(|| p.spectrum_avg("eta"))
                             .unwrap_or(1.5);
                     }
                     _ => eprintln!("  warning: unsupported material type: {ty}"),
                 }
-                warn_unhandled_params(
-                    &format!("Material \"{ty}\""),
-                    params,
-                    &[
-                        "reflectance",
-                        "roughness",
-                        "uroughness",
-                        "vroughness",
-                        "eta",
-                        "k",
-                        "displacement",
-                        "alpha",
-                        "remaproughness",
-                        "normalmap",
-                        "type",
-                    ],
-                );
-                if let Some(tex_name) = get_param_texture_ref(params, "displacement") {
+                // Mark known-but-unhandled params so they don't trigger warnings
+                p.mark("vroughness");
+                p.mark("k");
+                p.mark("displacement");
+                p.mark("alpha");
+                p.mark("remaproughness");
+                p.mark("normalmap");
+                p.mark("type");
+                if let Some(tex_name) = p.texture_ref("displacement") {
                     if let Some(SceneTexture::Image(img)) = textures.get(tex_name) {
                         current_material.bump_map = Some(img.clone());
                     }
                 }
-                if let Some(tex_name) = get_param_texture_ref(params, "alpha") {
+                if let Some(tex_name) = p.texture_ref("alpha") {
                     if let Some(SceneTexture::Image(img)) = textures.get(tex_name) {
                         current_material.alpha_map = Some(img.clone());
                     }
                 }
-                if let Some(tex_name) = get_param_texture_ref(params, "roughness") {
+                if let Some(tex_name) = p.texture_ref("roughness") {
                     if let Some(SceneTexture::Image(img)) = textures.get(tex_name) {
                         current_material.roughness_map = Some(img.clone());
                     }
                 }
             }
             Directive::MakeNamedMaterial { name, params } => {
-                let ty = get_param_string(params, "type").unwrap_or("diffuse");
+                let p = ParamSet::new(params, format!("MakeNamedMaterial \"{name}\""));
+                let ty = p.string("type").unwrap_or("diffuse");
                 let mut mat = SceneMaterial::default();
                 match ty {
                     "diffuse" => {
                         mat.material_type = MAT_DIFFUSE;
-                        if let Some(c) = get_param_rgb(params, "reflectance") {
+                        if let Some(c) = p.rgb("reflectance") {
                             mat.albedo = c;
                         }
-                        if let Some(tex_name) = get_param_texture_ref(params, "reflectance") {
+                        if let Some(tex_name) = p.texture_ref("reflectance") {
                             match textures.get(tex_name) {
                                 Some(SceneTexture::Checker(tex)) => {
                                     mat.has_checkerboard = true;
@@ -686,13 +757,14 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                     }
                     "coateddiffuse" => {
                         mat.material_type = MAT_COATED_DIFFUSE;
-                        if let Some(c) = get_param_rgb(params, "reflectance") {
+                        if let Some(c) = p.rgb("reflectance") {
                             mat.albedo = c;
                         }
-                        mat.roughness = get_param_float(params, "roughness")
-                            .or(get_param_float(params, "uroughness"))
+                        mat.roughness = p
+                            .float("roughness")
+                            .or(p.float("uroughness"))
                             .unwrap_or(0.0);
-                        if let Some(tex_name) = get_param_texture_ref(params, "reflectance") {
+                        if let Some(tex_name) = p.texture_ref("reflectance") {
                             if let Some(SceneTexture::Image(img)) = textures.get(tex_name) {
                                 mat.texture = Some(img.clone());
                             }
@@ -700,27 +772,31 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                     }
                     "conductor" | "coatedconductor" => {
                         mat.material_type = MAT_CONDUCTOR;
-                        if let Some(c) = get_param_rgb(params, "reflectance") {
+                        if let Some(c) = p.rgb("reflectance") {
                             mat.albedo = c;
-                        } else if let Some(c) = metal_color_from_params(params) {
+                        } else if let Some(c) = metal_color_from_params(&p) {
                             mat.albedo = c;
                         } else {
                             mat.albedo = [0.8, 0.7, 0.3];
                         }
-                        mat.roughness = get_param_float(params, "roughness")
-                            .or(get_param_float(params, "uroughness"))
+                        mat.roughness = p
+                            .float("roughness")
+                            .or(p.float("uroughness"))
                             .unwrap_or(0.01);
                     }
                     "dielectric" | "thindielectric" => {
                         mat.material_type = MAT_DIELECTRIC;
-                        mat.eta = get_param_float(params, "eta")
-                            .or_else(|| get_spectrum_avg(params, "eta"))
+                        mat.eta = p
+                            .float("eta")
+                            .or_else(|| p.spectrum_avg("eta"))
                             .unwrap_or(1.5);
                     }
                     "mix" => {
                         // Use the first referenced material as approximation
-                        if let Some(p) = params.iter().find(|p| p.name == "materials") {
-                            if let ParamValue::Strings(names) = &p.value {
+                        p.mark("materials");
+                        p.mark("amount");
+                        if let Some(param) = params.iter().find(|param| param.name == "materials") {
+                            if let ParamValue::Strings(names) = &param.value {
                                 if let Some(first) = names.first() {
                                     if let Some(base) = named_materials.get(first.as_str()) {
                                         mat = base.clone();
@@ -733,37 +809,25 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                         eprintln!("  warning: unsupported MakeNamedMaterial type: {ty}");
                     }
                 }
-                warn_unhandled_params(
-                    &format!("MakeNamedMaterial \"{name}\" ({ty})"),
-                    params,
-                    &[
-                        "type",
-                        "reflectance",
-                        "roughness",
-                        "uroughness",
-                        "vroughness",
-                        "eta",
-                        "k",
-                        "displacement",
-                        "alpha",
-                        "remaproughness",
-                        "normalmap",
-                        "materials",
-                        "amount",
-                    ],
-                );
+                // Mark known-but-unhandled params so they don't trigger warnings
+                p.mark("vroughness");
+                p.mark("k");
+                p.mark("displacement");
+                p.mark("alpha");
+                p.mark("remaproughness");
+                p.mark("normalmap");
                 // Bind displacement/bump map for any material type
-                if let Some(tex_name) = get_param_texture_ref(params, "displacement") {
+                if let Some(tex_name) = p.texture_ref("displacement") {
                     if let Some(SceneTexture::Image(img)) = textures.get(tex_name) {
                         mat.bump_map = Some(img.clone());
                     }
                 }
-                if let Some(tex_name) = get_param_texture_ref(params, "alpha") {
+                if let Some(tex_name) = p.texture_ref("alpha") {
                     if let Some(SceneTexture::Image(img)) = textures.get(tex_name) {
                         mat.alpha_map = Some(img.clone());
                     }
                 }
-                if let Some(tex_name) = get_param_texture_ref(params, "roughness") {
+                if let Some(tex_name) = p.texture_ref("roughness") {
                     if let Some(SceneTexture::Image(img)) = textures.get(tex_name) {
                         mat.roughness_map = Some(img.clone());
                     }
@@ -783,18 +847,19 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                 params,
                 ..
             } => {
+                let p = ParamSet::new(params, format!("Texture \"{name}\" \"{class}\""));
                 if class == "checkerboard" {
                     textures.insert(
                         name.clone(),
                         SceneTexture::Checker(CheckerTex {
-                            scale_u: get_param_float(params, "uscale").unwrap_or(1.0),
-                            scale_v: get_param_float(params, "vscale").unwrap_or(1.0),
-                            color1: get_param_rgb(params, "tex1").unwrap_or([1.0, 1.0, 1.0]),
-                            color2: get_param_rgb(params, "tex2").unwrap_or([0.0, 0.0, 0.0]),
+                            scale_u: p.float("uscale").unwrap_or(1.0),
+                            scale_v: p.float("vscale").unwrap_or(1.0),
+                            color1: p.rgb("tex1").unwrap_or([1.0, 1.0, 1.0]),
+                            color2: p.rgb("tex2").unwrap_or([0.0, 0.0, 0.0]),
                         }),
                     );
                 } else if class == "imagemap" {
-                    if let Some(filename) = get_param_string(params, "filename") {
+                    if let Some(filename) = p.string("filename") {
                         let path = scene_dir.join(filename);
                         match image::open(&path) {
                             Ok(img) => {
@@ -817,8 +882,8 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                 } else if class == "constant" {
                     // Constant texture: single RGB or float value
                     // Store as a 1x1 imagemap so it works in texture chains
-                    let color = get_param_rgb(params, "value").unwrap_or_else(|| {
-                        let v = get_param_float(params, "value").unwrap_or(1.0);
+                    let color = p.rgb("value").unwrap_or_else(|| {
+                        let v = p.float("value").unwrap_or(1.0);
                         [v, v, v]
                     });
                     textures.insert(
@@ -830,24 +895,21 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                         })),
                     );
                 } else if class == "scale" || class == "mix" {
-                    // Resolve texture chain: "scale" and "mix" wrap other textures
-                    if let Some(tex_ref) = get_param_texture_ref(params, "tex") {
+                    p.mark("scale"); // scale factor (we approximate by ignoring it)
+                    p.mark("tex2"); // mix second texture
+                    p.mark("amount"); // mix blend factor
+                    if let Some(tex_ref) = p.texture_ref("tex") {
                         if let Some(base) = textures.get(tex_ref) {
                             textures.insert(name.clone(), base.clone());
                         }
                     }
                     // Also check tex1/tex2 for mix
-                    if let Some(tex_ref) = get_param_texture_ref(params, "tex1") {
+                    if let Some(tex_ref) = p.texture_ref("tex1") {
                         if let Some(base) = textures.get(tex_ref) {
                             textures.insert(name.clone(), base.clone());
                         }
                     }
-                } else if class != "checkerboard"
-                    && class != "imagemap"
-                    && class != "constant"
-                    && class != "scale"
-                    && class != "mix"
-                {
+                } else {
                     eprintln!("  warning: unsupported texture class: {class} (texture \"{name}\")");
                 }
             }
@@ -863,19 +925,12 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
             }
             Directive::AreaLightSource { ty, params } => {
                 if ty == "diffuse" {
-                    let mut emission = get_param_rgb(params, "L").unwrap_or([1.0, 1.0, 1.0]);
-                    // Handle blackbody L
-                    if let Some(p) = params
-                        .iter()
-                        .find(|p| p.name == "L" && p.ty == ParamType::Blackbody)
-                    {
-                        if let ParamValue::Floats(v) = &p.value {
-                            if let Some(&k) = v.first() {
-                                emission = blackbody_to_rgb(k as f32);
-                            }
-                        }
+                    let p = ParamSet::new(params, "AreaLightSource \"diffuse\"");
+                    let mut emission = p.rgb("L").unwrap_or([1.0, 1.0, 1.0]);
+                    if let Some(k) = p.blackbody("L") {
+                        emission = blackbody_to_rgb(k);
                     }
-                    let scale = get_param_float(params, "scale").unwrap_or(1.0);
+                    let scale = p.float("scale").unwrap_or(1.0);
                     emission[0] *= scale;
                     emission[1] *= scale;
                     emission[2] *= scale;
@@ -883,8 +938,10 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                 }
             }
             Directive::MakeNamedMedium { name, params } => {
-                // Convert sigma_a to a tint color: exp(-sigma_a * d) for typical distance
-                if let Some(sigma_a) = get_param_rgb(params, "sigma_a") {
+                let p = ParamSet::new(params, format!("MakeNamedMedium \"{name}\""));
+                p.mark("type");
+                p.mark("sigma_s");
+                if let Some(sigma_a) = p.rgb("sigma_a") {
                     let d = 3.0; // approximate gem thickness
                     let tint = [
                         (-sigma_a[0] * d).exp(),
