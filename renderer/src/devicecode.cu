@@ -72,6 +72,45 @@ static __forceinline__ __device__ float3 reflect3(float3 I, float3 N) {
     return I - 2.0f * dot3(I, N) * N;
 }
 
+// GGX NDF
+static __forceinline__ __device__ float ggx_D(float NdotH, float alpha) {
+    float a2 = alpha * alpha;
+    float d = NdotH * NdotH * (a2 - 1.0f) + 1.0f;
+    return a2 / (M_PIf * d * d);
+}
+
+// Smith G1 for GGX
+static __forceinline__ __device__ float ggx_G1(float NdotX, float alpha) {
+    float a2 = alpha * alpha;
+    return 2.0f * NdotX / (NdotX + sqrtf(a2 + (1.0f - a2) * NdotX * NdotX));
+}
+
+// Evaluate Cook-Torrance specular BRDF for a given light direction
+static __forceinline__ __device__ float3 eval_conductor_brdf(
+    float3 V, float3 L, float3 N, float3 albedo, float alpha)
+{
+    float NdotV = fmaxf(dot3(N, V), 0.001f);
+    float NdotL = fmaxf(dot3(N, L), 0.001f);
+    float3 H = normalize3(V + L);
+    float NdotH = fmaxf(dot3(N, H), 0.0f);
+    float VdotH = fmaxf(dot3(V, H), 0.0f);
+
+    float D = ggx_D(NdotH, alpha);
+    float G = ggx_G1(NdotV, alpha) * ggx_G1(NdotL, alpha);
+
+    // Metallic Fresnel
+    float x = 1.0f - VdotH;
+    float x5 = x * x * x * x * x;
+    float3 F = make_float3(
+        albedo.x + (1.0f - albedo.x) * x5,
+        albedo.y + (1.0f - albedo.y) * x5,
+        albedo.z + (1.0f - albedo.z) * x5);
+
+    float denom = 4.0f * NdotV * NdotL;
+    if (denom < 0.0001f) return make_float3(0,0,0);
+    return F * (D * G / denom);
+}
+
 // Cosine-weighted hemisphere sample
 static __forceinline__ __device__ float3 cosine_sample_hemisphere(float u1, float u2, float3 N) {
     float phi = 2.0f * M_PIf * u1;
@@ -441,22 +480,68 @@ extern "C" __global__ void __raygen__rg()
                 }
             }
             else if (mat_type == MAT_CONDUCTOR) {
-                // Metallic reflection: F0 = albedo color (metals reflect with their color)
                 float hit_roughness = __uint_as_float(p13);
                 float alpha = fmaxf(hit_roughness * hit_roughness, 0.001f);
                 RNG bounce_rng(pixel_idx, s, depth + 1);
+                float3 V = direction * (-1.0f); // view direction (toward camera)
 
-                // Metallic Fresnel: F0 = albedo (e.g. gold = [0.8, 0.7, 0.3])
-                float cos_i = fmaxf(fabsf(dot3(direction * (-1.0f), hit_normal)), 0.001f);
-                float3 F;
-                float x = 1.0f - cos_i;
-                float x5 = x * x * x * x * x;
-                F.x = hit_albedo.x + (1.0f - hit_albedo.x) * x5;
-                F.y = hit_albedo.y + (1.0f - hit_albedo.y) * x5;
-                F.z = hit_albedo.z + (1.0f - hit_albedo.z) * x5;
+                // NEE for conductor: evaluate GGX BRDF for each light
+                for (int i = 0; i < params.num_distant_lights; i++) {
+                    float3 L = make_f3(params.distant_lights[i].direction);
+                    float NdotL = dot3(hit_normal, L);
+                    if (NdotL > 0.0f) {
+                        float3 brdf = eval_conductor_brdf(V, L, hit_normal, hit_albedo, alpha);
+                        unsigned int shadow_p9 = 0xFFFFFFFF;
+                        unsigned int sp10=0,sp11=0,sp12=0,sp13=0;
+                        optixTrace(params.traversable, hit_pos, L, 0.001f, 1e16f, 0.0f,
+                            OptixVisibilityMask(255), OPTIX_RAY_FLAG_TERMINATE_ON_FIRST_HIT,
+                            0, 1, 0, p0,p1,p2,p3,p4,p5,p6,p7,p8,shadow_p9,sp10,sp11,sp12,sp13);
+                        if (shadow_p9 == 0xFFFFFFFF) {
+                            float3 light_em = make_f3(params.distant_lights[i].emission);
+                            radiance = radiance + throughput * brdf * light_em * NdotL;
+                        }
+                    }
+                }
+                for (int i = 0; i < params.num_triangle_lights; i++) {
+                    RNG light_rng(pixel_idx * 37 + i, s, depth + 200);
+                    float3 lv0 = make_f3(params.triangle_lights[i].v0);
+                    float3 lv1 = make_f3(params.triangle_lights[i].v1);
+                    float3 lv2 = make_f3(params.triangle_lights[i].v2);
+                    float3 light_em = make_f3(params.triangle_lights[i].emission);
+                    float3 light_normal = make_f3(params.triangle_lights[i].normal);
+                    float light_area = params.triangle_lights[i].area;
+                    float u1 = light_rng.next(), u2 = light_rng.next();
+                    if (u1 + u2 > 1.0f) { u1 = 1.0f - u1; u2 = 1.0f - u2; }
+                    float3 light_pos = lv0*(1.0f-u1-u2) + lv1*u1 + lv2*u2;
+                    float3 to_light = light_pos - hit_pos;
+                    float dist2 = dot3(to_light, to_light);
+                    float dist = sqrtf(dist2);
+                    float3 L = to_light * (1.0f / dist);
+                    float NdotL = dot3(hit_normal, L);
+                    float lndotl = -dot3(light_normal, L);
+                    if (NdotL > 0.0f && lndotl > 0.0f) {
+                        unsigned int shadow_p9 = 0xFFFFFFFF;
+                        unsigned int sp10=0,sp11=0,sp12=0,sp13=0;
+                        optixTrace(params.traversable, hit_pos, L, 0.001f, dist-0.001f, 0.0f,
+                            OptixVisibilityMask(255), OPTIX_RAY_FLAG_TERMINATE_ON_FIRST_HIT,
+                            0, 1, 0, p0,p1,p2,p3,p4,p5,p6,p7,p8,shadow_p9,sp10,sp11,sp12,sp13);
+                        if (shadow_p9 == 0xFFFFFFFF) {
+                            float3 brdf = eval_conductor_brdf(V, L, hit_normal, hit_albedo, alpha);
+                            float geo = light_area * lndotl / dist2;
+                            radiance = radiance + throughput * brdf * light_em * NdotL * geo;
+                        }
+                    }
+                }
 
-                // Sample GGX for specular reflection
+                // Specular bounce
                 float3 H = ggx_sample(bounce_rng.next(), bounce_rng.next(), alpha, hit_normal);
+                float cos_i = fmaxf(dot3(V, hit_normal), 0.001f);
+                float xi = 1.0f - cos_i;
+                float xi5 = xi*xi*xi*xi*xi;
+                float3 F = make_float3(
+                    hit_albedo.x + (1.0f - hit_albedo.x) * xi5,
+                    hit_albedo.y + (1.0f - hit_albedo.y) * xi5,
+                    hit_albedo.z + (1.0f - hit_albedo.z) * xi5);
                 direction = reflect3(direction, H);
                 if (dot3(direction, hit_normal) <= 0.0f) break;
                 origin = hit_pos;
