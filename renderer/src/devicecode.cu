@@ -235,6 +235,7 @@ extern "C" __global__ void __raygen__rg()
 
         float3 throughput = make_float3(1, 1, 1);
         float3 radiance = make_float3(0, 0, 0);
+        bool specular_bounce = true; // camera ray counts as specular
 
         for (unsigned int depth = 0; depth < params.max_depth; depth++) {
             unsigned int p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12, p13;
@@ -264,9 +265,9 @@ extern "C" __global__ void __raygen__rg()
             float3 hit_emission = make_float3(__uint_as_float(p10), __uint_as_float(p11), __uint_as_float(p12));
             int mat_type = (int)p9;
 
-            // Add emission only on direct camera ray (depth 0).
-            // Indirect illumination from emissive surfaces is handled by NEE.
-            if (depth == 0 && (hit_emission.x > 0 || hit_emission.y > 0 || hit_emission.z > 0)) {
+            // Add emission on camera ray or after specular bounces.
+            // Diffuse NEE already accounts for lights, so skip after diffuse bounce.
+            if (specular_bounce && (hit_emission.x > 0 || hit_emission.y > 0 || hit_emission.z > 0)) {
                 radiance = radiance + throughput * hit_emission;
             }
 
@@ -406,6 +407,7 @@ extern "C" __global__ void __raygen__rg()
                 direction = cosine_sample_hemisphere(bounce_rng.next(), bounce_rng.next(), hit_normal);
                 origin = hit_pos;
                 throughput = throughput * hit_albedo;
+                specular_bounce = false;
             }
             else if (mat_type == MAT_COATED_DIFFUSE) {
                 float hit_roughness = __uint_as_float(p13);
@@ -420,9 +422,9 @@ extern "C" __global__ void __raygen__rg()
                     // Specular reflection: sample GGX
                     float3 H = ggx_sample(bounce_rng.next(), bounce_rng.next(), alpha, hit_normal);
                     direction = reflect3(direction, H);
-                    if (dot3(direction, hit_normal) <= 0.0f) break; // below surface
+                    if (dot3(direction, hit_normal) <= 0.0f) break;
                     origin = hit_pos;
-                    // Specular doesn't tint by albedo (dielectric coat)
+                    specular_bounce = true;
                 } else {
                     // Diffuse: same as MAT_DIFFUSE with NEE
                     for (int i = 0; i < params.num_distant_lights; i++) {
@@ -477,6 +479,7 @@ extern "C" __global__ void __raygen__rg()
                     direction = cosine_sample_hemisphere(bounce_rng.next(), bounce_rng.next(), hit_normal);
                     origin = hit_pos;
                     throughput = throughput * hit_albedo;
+                    specular_bounce = false;
                 }
             }
             else if (mat_type == MAT_CONDUCTOR) {
@@ -546,6 +549,7 @@ extern "C" __global__ void __raygen__rg()
                 if (dot3(direction, hit_normal) <= 0.0f) break;
                 origin = hit_pos;
                 throughput = throughput * F;
+                specular_bounce = true;
             }
             else if (mat_type == MAT_DIELECTRIC) {
                 float eta_val = __uint_as_float(p0); // eta stored in p0 for dielectric
@@ -567,7 +571,7 @@ extern "C" __global__ void __raygen__rg()
                     direction = normalize3(refracted);
                 }
                 origin = hit_pos;
-                // Glass doesn't absorb (throughput unchanged)
+                specular_bounce = true;
             }
         }
 
