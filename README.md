@@ -1,4 +1,4 @@
-# vivrt
+# vibrt
 
 A Rust workspace for GPU ray tracing with NVIDIA OptiX 9.
 
@@ -9,9 +9,9 @@ A Rust workspace for GPU ray tracing with NVIDIA OptiX 9.
 | [`optix-sys`](optix-sys/) | Raw FFI bindings to OptiX 9.0.0 (bindgen) |
 | [`optix`](optix/) | Safe Rust wrapper with RAII, builders, and type-safe enums |
 | [`pbrt-parser`](pbrt-parser/) | Zero-dependency parser for PBRTv4 scene files |
-| [`vivrt`](vivrt/) | OptiX path tracing renderer for PBRTv4 scenes |
+| [`vibrt`](vibrt/) | OptiX path tracing renderer for PBRTv4 scenes |
 
-## vivrt renderer
+## vibrt renderer
 
 A GPU path tracer that reads [PBRTv4](https://pbrt.org/fileformat-v4) scene files and renders them using OptiX hardware ray tracing.
 
@@ -27,21 +27,21 @@ A GPU path tracer that reads [PBRTv4](https://pbrt.org/fileformat-v4) scene file
 ### Usage
 
 ```bash
-cargo run --release -p vivrt -- scene.pbrt
-cargo run --release -p vivrt -- scene.pbrt --spp 64 --width 800 --height 600
+cargo run --release -p vibrt -- scene.pbrt
+cargo run --release -p vibrt -- scene.pbrt --spp 64 --width 800 --height 600
 ```
 
 ### Example renders
 
 ```bash
 # Simple glass sphere on checkerboard
-cargo run --release -p vivrt -- test.pbrt
+cargo run --release -p vibrt -- test.pbrt
 
 # Killeroo scene (coated diffuse + area lights)
-cargo run --release -p vivrt -- path/to/killeroos/killeroo-simple.pbrt --spp 64
+cargo run --release -p vibrt -- path/to/killeroos/killeroo-simple.pbrt --spp 64
 
 # Crown scene (conductors, dielectrics, textures, 793 objects)
-cargo run --release -p vivrt -- path/to/crown/crown.pbrt --spp 32 --width 500 --height 700
+cargo run --release -p vibrt -- path/to/crown/crown.pbrt --spp 32 --width 500 --height 700
 ```
 
 ## Requirements
@@ -54,5 +54,5 @@ cargo run --release -p vivrt -- path/to/crown/crown.pbrt --spp 32 --width 500 --
 ## Building
 
 ```bash
-cargo build --release -p vivrt
+cargo build --release -p vibrt
 ```

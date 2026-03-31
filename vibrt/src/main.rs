@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 #[derive(Parser)]
 #[command(
-    name = "vivrt",
+    name = "vibrt",
     about = "OptiX path tracing renderer for PBRTv4 scenes"
 )]
 struct Args {
