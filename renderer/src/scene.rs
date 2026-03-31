@@ -212,6 +212,19 @@ fn rotate_matrix(angle_deg: f32, ax: f32, ay: f32, az: f32) -> [f32; 12] {
     ]
 }
 
+fn cross3f(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+fn normalize3f(v: [f32; 3]) -> [f32; 3] {
+    let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+    [v[0] / len, v[1] / len, v[2] / len]
+}
+
 pub fn transform_vertices(verts: &[f32], t: &[f32; 12]) -> Vec<f32> {
     let mut result = Vec::with_capacity(verts.len());
     for i in (0..verts.len()).step_by(3) {
@@ -537,29 +550,47 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
             }
             Directive::WorldBegin => {
                 // Apply accumulated pre-WorldBegin transform to camera.
-                // In PBRT, transforms before WorldBegin modify the camera orientation.
-                // The CTM at this point = post-LookAt transforms (e.g. Rotate).
-                // Apply the rotation part to the look direction and up vector.
+                // In PBRT, CTM = LookAt * Rotate * ... (post-multiplied).
+                // Post-multiply rotations are camera-space adjustments.
+                // We reconstruct the camera frame, apply the camera-space
+                // transform, then write back the modified vectors.
                 if current_transform != identity_transform() {
-                    let t = &current_transform;
-                    // Rotate look direction (look_at - eye) and up vector
-                    let dx = parsed.cam_look[0] - parsed.cam_eye[0];
-                    let dy = parsed.cam_look[1] - parsed.cam_eye[1];
-                    let dz = parsed.cam_look[2] - parsed.cam_eye[2];
-                    // Apply rotation (3x3 part of transform) to direction
+                    let r = &current_transform; // camera-space rotation
+
+                    // Build camera frame from LookAt
+                    let e = parsed.cam_eye;
+                    let l = parsed.cam_look;
+                    let u = parsed.cam_up;
+                    let fwd = normalize3f([l[0] - e[0], l[1] - e[1], l[2] - e[2]]);
+                    let right = normalize3f(cross3f(fwd, u));
+                    let up = cross3f(right, fwd);
+
+                    // Camera-space axes in world coords: right=X, up=Y, -fwd=Z
+                    // A camera-space rotation R transforms these axes.
+                    // New world-space axis = old_right*R[col0] + old_up*R[col1] + (-old_fwd)*R[col2]
+                    // But R is the 3x3 part of the post-multiplied transform.
+                    // New forward (negated camera Z): apply R to [0,0,-1] in camera space
+                    let new_fwd = [
+                        -(right[0] * r[2] + up[0] * r[6] + (-fwd[0]) * r[10]),
+                        -(right[1] * r[2] + up[1] * r[6] + (-fwd[1]) * r[10]),
+                        -(right[2] * r[2] + up[2] * r[6] + (-fwd[2]) * r[10]),
+                    ];
+                    // New up: apply R to [0,1,0] in camera space
+                    let new_up = [
+                        right[0] * r[1] + up[0] * r[5] + (-fwd[0]) * r[9],
+                        right[1] * r[1] + up[1] * r[5] + (-fwd[1]) * r[9],
+                        right[2] * r[1] + up[2] * r[5] + (-fwd[2]) * r[9],
+                    ];
+
+                    let dist =
+                        ((l[0] - e[0]).powi(2) + (l[1] - e[1]).powi(2) + (l[2] - e[2]).powi(2))
+                            .sqrt();
                     parsed.cam_look = [
-                        parsed.cam_eye[0] + t[0] * dx + t[1] * dy + t[2] * dz,
-                        parsed.cam_eye[1] + t[4] * dx + t[5] * dy + t[6] * dz,
-                        parsed.cam_eye[2] + t[8] * dx + t[9] * dy + t[10] * dz,
+                        e[0] + new_fwd[0] * dist,
+                        e[1] + new_fwd[1] * dist,
+                        e[2] + new_fwd[2] * dist,
                     ];
-                    let ux = parsed.cam_up[0];
-                    let uy = parsed.cam_up[1];
-                    let uz = parsed.cam_up[2];
-                    parsed.cam_up = [
-                        t[0] * ux + t[1] * uy + t[2] * uz,
-                        t[4] * ux + t[5] * uy + t[6] * uz,
-                        t[8] * ux + t[9] * uy + t[10] * uz,
-                    ];
+                    parsed.cam_up = new_up;
                 }
                 current_transform = identity_transform();
                 _in_world = true;
