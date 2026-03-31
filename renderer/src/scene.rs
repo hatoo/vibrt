@@ -431,6 +431,8 @@ fn compute_smooth_normals(verts: &[f32], indices: &[i32]) -> Vec<f32> {
 // ---- PLY mesh loading ----
 
 fn load_ply_mesh(path: &Path) -> Option<SceneShape> {
+    use std::io::BufRead;
+
     let file = std::fs::File::open(path)
         .unwrap_or_else(|e| panic!("Failed to open PLY file {}: {e}", path.display()));
 
@@ -442,64 +444,218 @@ fn load_ply_mesh(path: &Path) -> Option<SceneShape> {
     } else {
         Box::new(buf_file)
     };
+    let mut reader = std::io::BufReader::new(reader);
 
-    let mut buf_reader = std::io::BufReader::new(reader);
-    let parser = ply_rs::parser::Parser::<ply_rs::ply::DefaultElement>::new();
-    let ply = parser
-        .read_ply(&mut buf_reader)
-        .unwrap_or_else(|e| panic!("Failed to parse PLY file {}: {e}", path.display()));
+    // Parse header
+    let mut num_vertices = 0usize;
+    let mut num_faces = 0usize;
+    let mut is_binary_le = false;
+    // Track vertex properties in order
+    #[derive(Clone, Copy)]
+    enum PropType {
+        Float,
+        Double,
+        Uchar,
+        Int,
+        UInt,
+        Short,
+        UShort,
+        Skip(usize),
+    }
+    #[derive(Clone, Copy, PartialEq)]
+    enum PropRole {
+        X,
+        Y,
+        Z,
+        Nx,
+        Ny,
+        Nz,
+        U,
+        V,
+        Other,
+    }
+    let mut vertex_props: Vec<(PropType, PropRole)> = Vec::new();
+    let mut face_index_type = PropType::Int;
+    let mut face_count_type = PropType::Uchar;
+    let mut in_vertex_element = false;
+    let mut in_face_element = false;
 
-    let mut vertices = Vec::new();
-    let mut normals = Vec::new();
-    let mut texcoords = Vec::new();
-    let mut indices = Vec::new();
+    loop {
+        let mut line = String::new();
+        reader
+            .read_line(&mut line)
+            .expect("Failed to read PLY header");
+        let line = line.trim();
+        if line == "end_header" {
+            break;
+        }
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.is_empty() {
+            continue;
+        }
 
-    if let Some(verts) = ply.payload.get("vertex") {
-        for v in verts {
-            let x = prop_float(v, "x");
-            let y = prop_float(v, "y");
-            let z = prop_float(v, "z");
-            vertices.push(x);
-            vertices.push(y);
-            vertices.push(z);
-
-            // Optional normals
-            if v.contains_key("nx") {
-                let nx = prop_float(v, "nx");
-                let ny = prop_float(v, "ny");
-                let nz = prop_float(v, "nz");
-                normals.push(nx);
-                normals.push(ny);
-                normals.push(nz);
+        match parts[0] {
+            "format" => {
+                is_binary_le = parts.get(1) == Some(&"binary_little_endian");
             }
+            "element" => {
+                in_vertex_element = false;
+                in_face_element = false;
+                if parts.get(1) == Some(&"vertex") {
+                    num_vertices = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
+                    in_vertex_element = true;
+                } else if parts.get(1) == Some(&"face") {
+                    num_faces = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
+                    in_face_element = true;
+                }
+            }
+            "property" if in_vertex_element && parts.len() >= 3 => {
+                let ptype = match parts[1] {
+                    "float" | "float32" => PropType::Float,
+                    "double" | "float64" => PropType::Double,
+                    "uchar" | "uint8" => PropType::Uchar,
+                    "int" | "int32" => PropType::Int,
+                    "uint" | "uint32" => PropType::UInt,
+                    "short" | "int16" => PropType::Short,
+                    "ushort" | "uint16" => PropType::UShort,
+                    _ => PropType::Float,
+                };
+                let role = match parts[2] {
+                    "x" => PropRole::X,
+                    "y" => PropRole::Y,
+                    "z" => PropRole::Z,
+                    "nx" => PropRole::Nx,
+                    "ny" => PropRole::Ny,
+                    "nz" => PropRole::Nz,
+                    "u" | "s" | "texture_u" => PropRole::U,
+                    "v" | "t" | "texture_v" => PropRole::V,
+                    _ => PropRole::Other,
+                };
+                vertex_props.push((ptype, role));
+            }
+            "property" if in_face_element && parts.get(1) == Some(&"list") && parts.len() >= 5 => {
+                face_count_type = match parts[2] {
+                    "uchar" | "uint8" => PropType::Uchar,
+                    "int" | "int32" => PropType::Int,
+                    _ => PropType::Uchar,
+                };
+                face_index_type = match parts[3] {
+                    "int" | "int32" => PropType::Int,
+                    "uint" | "uint32" => PropType::UInt,
+                    "short" | "int16" => PropType::Short,
+                    "ushort" | "uint16" => PropType::UShort,
+                    _ => PropType::Int,
+                };
+            }
+            _ => {}
+        }
+    }
 
-            // Optional UVs
-            if v.contains_key("u") {
-                texcoords.push(prop_float(v, "u"));
-                texcoords.push(prop_float(v, "v"));
-            } else if v.contains_key("s") {
-                texcoords.push(prop_float(v, "s"));
-                texcoords.push(prop_float(v, "t"));
+    if !is_binary_le {
+        eprintln!(
+            "Only binary_little_endian PLY is supported: {}",
+            path.display()
+        );
+        return None;
+    }
+
+    let has_normals = vertex_props.iter().any(|(_, r)| *r == PropRole::Nx);
+    let has_uvs = vertex_props.iter().any(|(_, r)| *r == PropRole::U);
+
+    // Read vertex data
+    let mut vertices = Vec::with_capacity(num_vertices * 3);
+    let mut normals = if has_normals {
+        Vec::with_capacity(num_vertices * 3)
+    } else {
+        Vec::new()
+    };
+    let mut texcoords = if has_uvs {
+        Vec::with_capacity(num_vertices * 2)
+    } else {
+        Vec::new()
+    };
+
+    fn read_prop_f32(r: &mut impl Read, ptype: PropType) -> f32 {
+        match ptype {
+            PropType::Float => {
+                let mut b = [0u8; 4];
+                r.read_exact(&mut b).unwrap();
+                f32::from_le_bytes(b)
+            }
+            PropType::Double => {
+                let mut b = [0u8; 8];
+                r.read_exact(&mut b).unwrap();
+                f64::from_le_bytes(b) as f32
+            }
+            PropType::Uchar => {
+                let mut b = [0u8; 1];
+                r.read_exact(&mut b).unwrap();
+                b[0] as f32
+            }
+            PropType::Int => {
+                let mut b = [0u8; 4];
+                r.read_exact(&mut b).unwrap();
+                i32::from_le_bytes(b) as f32
+            }
+            PropType::UInt => {
+                let mut b = [0u8; 4];
+                r.read_exact(&mut b).unwrap();
+                u32::from_le_bytes(b) as f32
+            }
+            PropType::Short => {
+                let mut b = [0u8; 2];
+                r.read_exact(&mut b).unwrap();
+                i16::from_le_bytes(b) as f32
+            }
+            PropType::UShort => {
+                let mut b = [0u8; 2];
+                r.read_exact(&mut b).unwrap();
+                u16::from_le_bytes(b) as f32
+            }
+            PropType::Skip(n) => {
+                let mut b = vec![0u8; n];
+                r.read_exact(&mut b).unwrap();
+                0.0
             }
         }
     }
 
-    if let Some(faces) = ply.payload.get("face") {
-        for f in faces {
-            if let Some(ply_rs::ply::Property::ListInt(ref idx)) = f.get("vertex_indices") {
-                // Triangulate: fan from first vertex
-                for i in 1..idx.len() - 1 {
-                    indices.push(idx[0]);
-                    indices.push(idx[i as usize] as i32);
-                    indices.push(idx[i as usize + 1] as i32);
-                }
-            } else if let Some(ply_rs::ply::Property::ListUInt(ref idx)) = f.get("vertex_indices") {
-                for i in 1..idx.len() - 1 {
-                    indices.push(idx[0] as i32);
-                    indices.push(idx[i as usize] as i32);
-                    indices.push(idx[i as usize + 1] as i32);
-                }
+    fn prop_size(ptype: PropType) -> usize {
+        match ptype {
+            PropType::Float | PropType::Int | PropType::UInt => 4,
+            PropType::Double => 8,
+            PropType::Uchar => 1,
+            PropType::Short | PropType::UShort => 2,
+            PropType::Skip(n) => n,
+        }
+    }
+
+    for _ in 0..num_vertices {
+        for &(ptype, role) in &vertex_props {
+            let val = read_prop_f32(&mut reader, ptype);
+            match role {
+                PropRole::X | PropRole::Y | PropRole::Z => vertices.push(val),
+                PropRole::Nx | PropRole::Ny | PropRole::Nz => normals.push(val),
+                PropRole::U | PropRole::V => texcoords.push(val),
+                PropRole::Other => {} // skip
             }
+        }
+    }
+
+    // Read face data
+    let mut indices = Vec::with_capacity(num_faces * 3);
+    for _ in 0..num_faces {
+        let count = read_prop_f32(&mut reader, face_count_type) as usize;
+        let mut face_indices = Vec::with_capacity(count);
+        for _ in 0..count {
+            let idx = read_prop_f32(&mut reader, face_index_type) as i32;
+            face_indices.push(idx);
+        }
+        // Triangulate (fan)
+        for i in 1..count - 1 {
+            indices.push(face_indices[0]);
+            indices.push(face_indices[i]);
+            indices.push(face_indices[i + 1]);
         }
     }
 
@@ -516,14 +672,6 @@ fn load_ply_mesh(path: &Path) -> Option<SceneShape> {
         texcoords,
         normals,
     })
-}
-
-fn prop_float(element: &ply_rs::ply::DefaultElement, key: &str) -> f32 {
-    match element.get(key) {
-        Some(ply_rs::ply::Property::Float(v)) => *v,
-        Some(ply_rs::ply::Property::Double(v)) => *v as f32,
-        _ => 0.0,
-    }
 }
 
 // ---- Shape parsing helper ----
