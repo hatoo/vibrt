@@ -41,6 +41,7 @@ struct DiffuseParams {
 
 struct DielectricParams {
     float eta;
+    float tint[3]; // absorption tint from participating medium
 };
 
 struct CoatedDiffuseParams {

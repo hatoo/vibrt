@@ -115,7 +115,10 @@ fn make_hitgroup_data(
 ) -> HitGroupData {
     let params = match mat.material_type {
         MAT_DIELECTRIC => MaterialParams {
-            dielectric: DielectricParams { eta: mat.eta },
+            dielectric: DielectricParams {
+                eta: mat.eta,
+                tint: mat.tint,
+            },
         },
         MAT_COATED_DIFFUSE => MaterialParams {
             coated: CoatedDiffuseParams {

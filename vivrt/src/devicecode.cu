@@ -618,7 +618,8 @@ extern "C" __global__ void __raygen__rg()
                 specular_bounce = true;
             }
             else if (mat_type == MAT_DIELECTRIC) {
-                float eta_val = __uint_as_float(p0); // eta stored in p0 for dielectric
+                float eta_val = __uint_as_float(p0);
+                float3 tint = make_float3(__uint_as_float(p1), __uint_as_float(p2), __uint_as_float(p13));
                 RNG bounce_rng(pixel_idx, s, depth + 1);
 
                 bool front_face = dot3(direction, hit_normal) < 0.0f;
@@ -635,6 +636,10 @@ extern "C" __global__ void __raygen__rg()
                     direction = reflect3(direction, outward_normal);
                 } else {
                     direction = normalize3(refracted);
+                    // Apply absorption tint when entering the medium
+                    if (front_face) {
+                        throughput = throughput * tint;
+                    }
                 }
                 origin = hit_pos;
                 specular_bounce = true;
@@ -780,8 +785,10 @@ extern "C" __global__ void __closesthit__ch()
 
     if (data->material_type == MAT_DIELECTRIC) {
         optixSetPayload_0(__float_as_uint(data->dielectric.eta));
-        optixSetPayload_1(0);
-        optixSetPayload_2(0);
+        optixSetPayload_1(__float_as_uint(data->dielectric.tint[0]));
+        optixSetPayload_2(__float_as_uint(data->dielectric.tint[1]));
+        // Use payload 13 for tint.z (reuse roughness slot since dielectric doesn't use it)
+        optixSetPayload_13(__float_as_uint(data->dielectric.tint[2]));
     } else {
         optixSetPayload_0(__float_as_uint(albedo.x));
         optixSetPayload_1(__float_as_uint(albedo.y));
@@ -823,8 +830,10 @@ extern "C" __global__ void __closesthit__sphere()
 
     if (data->material_type == MAT_DIELECTRIC) {
         optixSetPayload_0(__float_as_uint(data->dielectric.eta));
-        optixSetPayload_1(0);
-        optixSetPayload_2(0);
+        optixSetPayload_1(__float_as_uint(data->dielectric.tint[0]));
+        optixSetPayload_2(__float_as_uint(data->dielectric.tint[1]));
+        // Use payload 13 for tint.z (reuse roughness slot since dielectric doesn't use it)
+        optixSetPayload_13(__float_as_uint(data->dielectric.tint[2]));
     } else {
         float3 albedo = make_f3(data->albedo);
         optixSetPayload_0(__float_as_uint(albedo.x));

@@ -16,6 +16,7 @@ pub struct SceneMaterial {
     pub albedo: [f32; 3],
     pub eta: f32,
     pub roughness: f32,
+    pub tint: [f32; 3], // absorption tint for dielectrics (from MediumInterface)
     pub emission: [f32; 3],
     pub has_checkerboard: bool,
     pub checker_scale_u: f32,
@@ -32,6 +33,7 @@ impl Default for SceneMaterial {
             albedo: [0.5, 0.5, 0.5],
             eta: 1.5,
             roughness: 1.0,
+            tint: [1.0, 1.0, 1.0],
             emission: [0.0, 0.0, 0.0],
             has_checkerboard: false,
             checker_scale_u: 1.0,
@@ -328,6 +330,8 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
     }
     let mut textures = std::collections::HashMap::<String, SceneTexture>::new();
     let mut named_materials = std::collections::HashMap::<String, SceneMaterial>::new();
+    // Named media: name -> tint color (exp(-sigma_a * typical_distance))
+    let mut named_media = std::collections::HashMap::<String, [f32; 3]>::new();
     let mut current_material = SceneMaterial::default();
     let mut current_transform = transform::identity();
     let mut transform_stack: Vec<([f32; 12], SceneMaterial)> = Vec::new();
@@ -749,6 +753,23 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                     emission[1] *= scale;
                     emission[2] *= scale;
                     current_material.emission = emission;
+                }
+            }
+            Directive::MakeNamedMedium { name, params } => {
+                // Convert sigma_a to a tint color: exp(-sigma_a * d) for typical distance
+                if let Some(sigma_a) = get_param_rgb(params, "sigma_a") {
+                    let d = 3.0; // approximate gem thickness
+                    let tint = [
+                        (-sigma_a[0] * d).exp(),
+                        (-sigma_a[1] * d).exp(),
+                        (-sigma_a[2] * d).exp(),
+                    ];
+                    named_media.insert(name.clone(), tint);
+                }
+            }
+            Directive::MediumInterface { interior, .. } => {
+                if let Some(tint) = named_media.get(interior.as_str()) {
+                    current_material.tint = *tint;
                 }
             }
             Directive::Include(path) => {

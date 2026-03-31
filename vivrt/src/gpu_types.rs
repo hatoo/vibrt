@@ -48,6 +48,7 @@ pub struct DiffuseParams {
 #[derive(Copy, Clone)]
 pub struct DielectricParams {
     pub eta: f32,
+    pub tint: [f32; 3],
 }
 
 #[repr(C)]
