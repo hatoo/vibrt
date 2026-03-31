@@ -225,8 +225,9 @@ extern "C" __global__ void __raygen__rg()
             float3 hit_emission = make_float3(__uint_as_float(p10), __uint_as_float(p11), __uint_as_float(p12));
             int mat_type = (int)p9;
 
-            // Add emission from area lights
-            if (hit_emission.x > 0 || hit_emission.y > 0 || hit_emission.z > 0) {
+            // Add emission only on direct camera ray (depth 0).
+            // Indirect illumination from emissive surfaces is handled by NEE.
+            if (depth == 0 && (hit_emission.x > 0 || hit_emission.y > 0 || hit_emission.z > 0)) {
                 radiance = radiance + throughput * hit_emission;
             }
 
