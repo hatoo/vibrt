@@ -313,7 +313,7 @@ fn main() -> Result<()> {
     }
 
     let pipeline_options = PipelineCompileOptions::new("params")
-        .traversable_graph_flags(if has_spheres {
+        .traversable_graph_flags(if scene.objects.len() > 1 || has_spheres {
             TraversableGraphFlags::ALLOW_SINGLE_LEVEL_INSTANCING
         } else {
             TraversableGraphFlags::ALLOW_SINGLE_GAS
@@ -377,7 +377,11 @@ fn main() -> Result<()> {
     )
     .context("pipeline")?
     .value;
-    let max_graph_depth = if has_spheres { 2 } else { 1 };
+    let max_graph_depth = if scene.objects.len() > 1 || has_spheres {
+        2
+    } else {
+        1
+    };
     pipeline.set_stack_size(2048, 2048, 2048, max_graph_depth)?;
 
     // --- Build geometry ---
@@ -552,7 +556,8 @@ fn main() -> Result<()> {
     stream.synchronize().cuda()?;
 
     // --- Build IAS or use single GAS ---
-    let traversable = if has_spheres {
+    let needs_ias = has_spheres || gas_entries.len() > 1;
+    let traversable = if needs_ias {
         let sphere_sbt_base = tri_hg_records.len() as u32;
         let instances: Vec<optix_sys::OptixInstance> = gas_entries
             .iter()
