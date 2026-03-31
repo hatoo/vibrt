@@ -377,7 +377,14 @@ fn parse_shape(ty: &str, params: &[pbrt_parser::Param], scene_dir: &Path) -> Opt
         }
         "plymesh" => {
             let filename = p.string("filename")?;
-            let mesh = ply::load(&scene_dir.join(filename))?;
+            let path = scene_dir.join(filename);
+            let mesh = match ply::load(&path) {
+                Some(m) => m,
+                None => {
+                    eprintln!("  warning: failed to load PLY: {}", path.display());
+                    return None;
+                }
+            };
             Some(SceneShape::TriangleMesh {
                 vertices: mesh.vertices,
                 indices: mesh.indices,
