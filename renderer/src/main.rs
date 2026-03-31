@@ -50,6 +50,15 @@ struct DistantLight {
 
 #[repr(C)]
 #[derive(Copy, Clone)]
+struct SphereLight {
+    center: [f32; 3],
+    radius: f32,
+    emission: [f32; 3],
+    _pad: f32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
 struct LaunchParams {
     image: optix_sys::CUdeviceptr,
     width: u32,
@@ -64,6 +73,8 @@ struct LaunchParams {
     ambient_light: [f32; 3],
     num_distant_lights: i32,
     distant_lights: optix_sys::CUdeviceptr,
+    num_sphere_lights: i32,
+    sphere_lights: optix_sys::CUdeviceptr,
 }
 
 #[repr(C)]
@@ -209,6 +220,7 @@ struct ParsedScene {
     max_depth: u32,
     ambient_light: [f32; 3],
     distant_lights: Vec<DistantLight>,
+    sphere_lights: Vec<SphereLight>,
     objects: Vec<SceneObject>,
     filename: String,
 }
@@ -355,6 +367,7 @@ fn parse_scene(input: &str, scene_dir: &std::path::Path) -> ParsedScene {
         max_depth: 5,
         ambient_light: [0.0; 3],
         distant_lights: Vec::new(),
+        sphere_lights: Vec::new(),
         objects: Vec::new(),
         filename: "output.png".to_string(),
     };
@@ -602,6 +615,21 @@ fn parse_scene(input: &str, scene_dir: &std::path::Path) -> ParsedScene {
                         continue;
                     }
                 };
+                // Register sphere area lights for NEE
+                let em = current_material.emission;
+                if em[0] > 0.0 || em[1] > 0.0 || em[2] > 0.0 {
+                    if let SceneShape::Sphere { radius } = &shape {
+                        // Compute world-space center from transform
+                        let t = &current_transform;
+                        let center = [t[3], t[7], t[11]];
+                        parsed.sphere_lights.push(SphereLight {
+                            center,
+                            radius: *radius,
+                            emission: em,
+                            _pad: 0.0,
+                        });
+                    }
+                }
                 parsed.objects.push(SceneObject {
                     shape,
                     material: current_material.clone(),
@@ -697,12 +725,13 @@ fn main() -> Result<()> {
     }
 
     println!(
-        "Scene: {}x{}, {} spp, {} objects, {} distant lights",
+        "Scene: {}x{}, {} spp, {} objects, {} distant lights, {} sphere lights",
         scene.width,
         scene.height,
         scene.spp,
         scene.objects.len(),
-        scene.distant_lights.len()
+        scene.distant_lights.len(),
+        scene.sphere_lights.len()
     );
 
     // --- CUDA / OptiX init ---
@@ -1113,11 +1142,16 @@ fn main() -> Result<()> {
         scene.width as f32 / scene.height as f32,
     );
 
-    // --- Distant lights on device ---
-    let d_lights = if scene.distant_lights.is_empty() {
+    // --- Lights on device ---
+    let d_distant_lights = if scene.distant_lights.is_empty() {
         0
     } else {
         alloc_and_copy_slice(&stream, &scene.distant_lights)?
+    };
+    let d_sphere_lights = if scene.sphere_lights.is_empty() {
+        0
+    } else {
+        alloc_and_copy_slice(&stream, &scene.sphere_lights)?
     };
 
     // --- Output image ---
@@ -1137,7 +1171,9 @@ fn main() -> Result<()> {
         traversable,
         ambient_light: scene.ambient_light,
         num_distant_lights: scene.distant_lights.len() as i32,
-        distant_lights: d_lights,
+        distant_lights: d_distant_lights,
+        num_sphere_lights: scene.sphere_lights.len() as i32,
+        sphere_lights: d_sphere_lights,
     };
     let d_params = alloc_and_copy(&stream, &launch_params)?;
 

@@ -12,6 +12,13 @@ struct DistantLight {
     float emission[3];
 };
 
+struct SphereLight {
+    float center[3];
+    float radius;
+    float emission[3];
+    float _pad;
+};
+
 struct LaunchParams {
     unsigned int* image;
     unsigned int  width;
@@ -27,6 +34,8 @@ struct LaunchParams {
     float         ambient_light[3];
     int           num_distant_lights;
     DistantLight* distant_lights;
+    int           num_sphere_lights;
+    SphereLight*  sphere_lights;
 };
 
 struct RayGenData {};

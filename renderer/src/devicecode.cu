@@ -226,6 +226,73 @@ extern "C" __global__ void __raygen__rg()
                     }
                 }
 
+                // Direct lighting from sphere area lights (NEE)
+                for (int i = 0; i < params.num_sphere_lights; i++) {
+                    RNG light_rng(pixel_idx * 31 + i, s, depth + 100);
+                    float3 light_center = make_f3(params.sphere_lights[i].center);
+                    float light_radius = params.sphere_lights[i].radius;
+                    float3 light_em = make_f3(params.sphere_lights[i].emission);
+
+                    // Sample a point on the sphere
+                    float3 to_light = light_center - hit_pos;
+                    float dist_to_center = sqrtf(dot3(to_light, to_light));
+                    float3 light_dir_norm = to_light * (1.0f / dist_to_center);
+
+                    // Sample uniformly on sphere surface visible from hit point
+                    float sin_theta_max2 = (light_radius * light_radius) / (dist_to_center * dist_to_center);
+                    float cos_theta_max = sqrtf(fmaxf(0.0f, 1.0f - sin_theta_max2));
+
+                    // Sample within the cone subtended by the sphere
+                    float u1 = light_rng.next();
+                    float u2 = light_rng.next();
+                    float cos_theta = 1.0f - u1 + u1 * cos_theta_max;
+                    float sin_theta = sqrtf(fmaxf(0.0f, 1.0f - cos_theta * cos_theta));
+                    float phi = 2.0f * M_PIf * u2;
+
+                    // Build local frame around light direction
+                    float3 tangent;
+                    if (fabsf(light_dir_norm.x) > 0.9f)
+                        tangent = normalize3(cross3(make_float3(0,1,0), light_dir_norm));
+                    else
+                        tangent = normalize3(cross3(make_float3(1,0,0), light_dir_norm));
+                    float3 bitangent = cross3(light_dir_norm, tangent);
+
+                    float3 sample_dir = normalize3(
+                        tangent * (cosf(phi) * sin_theta) +
+                        bitangent * (sinf(phi) * sin_theta) +
+                        light_dir_norm * cos_theta
+                    );
+
+                    float ndotl = dot3(hit_normal, sample_dir);
+                    if (ndotl > 0.0f) {
+                        // Distance to sphere surface along sample direction
+                        float t_max = dist_to_center + light_radius;
+
+                        // Shadow ray
+                        unsigned int shadow_p9 = 0xFFFFFFFF;
+                        unsigned int sp10 = 0, sp11 = 0, sp12 = 0;
+                        optixTrace(
+                            params.traversable,
+                            hit_pos, sample_dir,
+                            0.001f, t_max, 0.0f,
+                            OptixVisibilityMask(255),
+                            OPTIX_RAY_FLAG_NONE,
+                            0, 1, 0,
+                            p0, p1, p2, p3, p4, p5, p6, p7, p8, shadow_p9, sp10, sp11, sp12
+                        );
+
+                        // Check if we hit the light (emission > 0)
+                        float3 shadow_emission = make_float3(
+                            __uint_as_float(sp10), __uint_as_float(sp11), __uint_as_float(sp12));
+                        if (shadow_emission.x > 0 || shadow_emission.y > 0 || shadow_emission.z > 0) {
+                            // Solid angle PDF of cone sampling
+                            float pdf = 1.0f / (2.0f * M_PIf * (1.0f - cos_theta_max));
+                            radiance = radiance + throughput * hit_albedo * shadow_emission * ndotl
+                                * (1.0f / (M_PIf * pdf));
+                        }
+                    }
+                }
+
                 // Indirect: cosine-weighted bounce
                 RNG bounce_rng(pixel_idx, s, depth + 1);
                 direction = cosine_sample_hemisphere(bounce_rng.next(), bounce_rng.next(), hit_normal);
