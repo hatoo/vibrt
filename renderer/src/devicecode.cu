@@ -561,8 +561,47 @@ extern "C" __global__ void __closesthit__ch()
             albedo = make_f3(data->diffuse.checker_color2);
     }
 
+    // Image texture sampling
+    if (data->texture_data && data->texcoords) {
+        float u_coord = 0.0f, v_coord = 0.0f;
+        int i0, i1, i2;
+        if (data->indices) {
+            i0 = data->indices[prim_idx * 3 + 0];
+            i1 = data->indices[prim_idx * 3 + 1];
+            i2 = data->indices[prim_idx * 3 + 2];
+        } else {
+            i0 = prim_idx * 3;
+            i1 = prim_idx * 3 + 1;
+            i2 = prim_idx * 3 + 2;
+        }
+        float w = 1.0f - bary.x - bary.y;
+        u_coord = w * data->texcoords[i0*2] + bary.x * data->texcoords[i1*2] + bary.y * data->texcoords[i2*2];
+        v_coord = w * data->texcoords[i0*2+1] + bary.x * data->texcoords[i1*2+1] + bary.y * data->texcoords[i2*2+1];
+
+        // Wrap UVs
+        u_coord = u_coord - floorf(u_coord);
+        v_coord = v_coord - floorf(v_coord);
+
+        // Bilinear sample
+        float fx = u_coord * (data->texture_width - 1);
+        float fy = (1.0f - v_coord) * (data->texture_height - 1); // flip V
+        int ix = (int)fx;
+        int iy = (int)fy;
+        float dx = fx - ix;
+        float dy = fy - iy;
+        int ix1 = min(ix + 1, data->texture_width - 1);
+        int iy1 = min(iy + 1, data->texture_height - 1);
+
+        int tw = data->texture_width;
+        float3 c00 = make_float3(data->texture_data[(iy*tw+ix)*3], data->texture_data[(iy*tw+ix)*3+1], data->texture_data[(iy*tw+ix)*3+2]);
+        float3 c10 = make_float3(data->texture_data[(iy*tw+ix1)*3], data->texture_data[(iy*tw+ix1)*3+1], data->texture_data[(iy*tw+ix1)*3+2]);
+        float3 c01 = make_float3(data->texture_data[(iy1*tw+ix)*3], data->texture_data[(iy1*tw+ix)*3+1], data->texture_data[(iy1*tw+ix)*3+2]);
+        float3 c11 = make_float3(data->texture_data[(iy1*tw+ix1)*3], data->texture_data[(iy1*tw+ix1)*3+1], data->texture_data[(iy1*tw+ix1)*3+2]);
+
+        albedo = c00*(1-dx)*(1-dy) + c10*dx*(1-dy) + c01*(1-dx)*dy + c11*dx*dy;
+    }
+
     if (data->material_type == MAT_DIELECTRIC) {
-        // Store eta in p0, signal dielectric in p9
         optixSetPayload_0(__float_as_uint(data->dielectric.eta));
         optixSetPayload_1(0);
         optixSetPayload_2(0);

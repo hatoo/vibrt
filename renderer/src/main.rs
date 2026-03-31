@@ -98,6 +98,9 @@ fn alloc_and_copy_slice<T>(
 
 fn make_hitgroup_data(
     mat: &scene::SceneMaterial,
+    texture_data: optix_sys::CUdeviceptr,
+    texture_width: i32,
+    texture_height: i32,
     texcoords: optix_sys::CUdeviceptr,
     normals: optix_sys::CUdeviceptr,
     indices: optix_sys::CUdeviceptr,
@@ -128,6 +131,9 @@ fn make_hitgroup_data(
         albedo: mat.albedo,
         emission: mat.emission,
         params,
+        texture_data,
+        texture_width,
+        texture_height,
         texcoords,
         normals,
         indices,
@@ -443,7 +449,7 @@ fn main() -> Result<()> {
                 )
                 .context("sphere accel build")?;
 
-                let hg_data = make_hitgroup_data(&obj.material, 0, 0, 0, 0, 0);
+                let hg_data = make_hitgroup_data(&obj.material, 0, 0, 0, 0, 0, 0, 0, 0);
 
                 let sbt_offset = sphere_hg_records.len() as u32;
                 sphere_hg_records.push(SbtRecord::new(
@@ -526,8 +532,21 @@ fn main() -> Result<()> {
                 )
                 .context("tri accel build")?;
 
+                // Upload image texture if present
+                let (d_tex, tex_w, tex_h) = if let Some(ref tex) = obj.material.texture {
+                    let s = stream.clone_htod(&tex.data).cuda()?;
+                    let ptr = dptr(&s, &stream);
+                    _device_buffers.push(unsafe { std::mem::transmute(s) });
+                    (ptr, tex.width as i32, tex.height as i32)
+                } else {
+                    (0, 0, 0)
+                };
+
                 let hg_data = make_hitgroup_data(
                     &obj.material,
+                    d_tex,
+                    tex_w,
+                    tex_h,
                     d_tc,
                     d_normals,
                     dptr(&d_indices, &stream),

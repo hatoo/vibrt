@@ -56,6 +56,10 @@ struct HitGroupData {
         DielectricParams    dielectric;
         CoatedDiffuseParams coated;
     };
+    // Image texture (NULL if no texture)
+    float*        texture_data;  // RGB float, width*height*3
+    int           texture_width;
+    int           texture_height;
     // Geometry data
     float*        texcoords;
     float*        normals;

@@ -5,6 +5,12 @@ use pbrt_parser::{self, Directive, ParamType, ParamValue};
 use std::io::Read;
 use std::path::Path;
 
+pub struct ImageTexture {
+    pub data: Vec<f32>, // RGB float, width*height*3
+    pub width: u32,
+    pub height: u32,
+}
+
 pub struct SceneMaterial {
     pub material_type: i32,
     pub albedo: [f32; 3],
@@ -16,6 +22,7 @@ pub struct SceneMaterial {
     pub checker_scale_v: f32,
     pub checker_color1: [f32; 3],
     pub checker_color2: [f32; 3],
+    pub texture: Option<std::sync::Arc<ImageTexture>>,
 }
 
 impl Default for SceneMaterial {
@@ -31,13 +38,17 @@ impl Default for SceneMaterial {
             checker_scale_v: 1.0,
             checker_color1: [1.0, 1.0, 1.0],
             checker_color2: [0.0, 0.0, 0.0],
+            texture: None,
         }
     }
 }
 
 impl Clone for SceneMaterial {
     fn clone(&self) -> Self {
-        Self { ..*self }
+        Self {
+            texture: self.texture.clone(),
+            ..*self
+        }
     }
 }
 
@@ -439,6 +450,7 @@ fn load_ply_mesh(path: &Path) -> Option<SceneShape> {
 
     let mut vertices = Vec::new();
     let mut normals = Vec::new();
+    let mut texcoords = Vec::new();
     let mut indices = Vec::new();
 
     if let Some(verts) = ply.payload.get("vertex") {
@@ -458,6 +470,15 @@ fn load_ply_mesh(path: &Path) -> Option<SceneShape> {
                 normals.push(nx);
                 normals.push(ny);
                 normals.push(nz);
+            }
+
+            // Optional UVs
+            if v.contains_key("u") {
+                texcoords.push(prop_float(v, "u"));
+                texcoords.push(prop_float(v, "v"));
+            } else if v.contains_key("s") {
+                texcoords.push(prop_float(v, "s"));
+                texcoords.push(prop_float(v, "t"));
             }
         }
     }
@@ -491,7 +512,7 @@ fn load_ply_mesh(path: &Path) -> Option<SceneShape> {
     Some(SceneShape::TriangleMesh {
         vertices,
         indices,
-        texcoords: Vec::new(),
+        texcoords,
         normals,
     })
 }
@@ -605,7 +626,11 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
         color1: [f32; 3],
         color2: [f32; 3],
     }
-    let mut textures = std::collections::HashMap::<String, CheckerTex>::new();
+    enum SceneTexture {
+        Checker(CheckerTex),
+        Image(std::sync::Arc<ImageTexture>),
+    }
+    let mut textures = std::collections::HashMap::<String, SceneTexture>::new();
     let mut current_material = SceneMaterial::default();
     let mut current_transform = identity_transform();
     let mut transform_stack: Vec<([f32; 12], SceneMaterial)> = Vec::new();
@@ -805,12 +830,18 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                             current_material.albedo = c;
                         }
                         if let Some(tex_name) = get_param_texture_ref(params, "reflectance") {
-                            if let Some(tex) = textures.get(tex_name) {
-                                current_material.has_checkerboard = true;
-                                current_material.checker_scale_u = tex.scale_u;
-                                current_material.checker_scale_v = tex.scale_v;
-                                current_material.checker_color1 = tex.color1;
-                                current_material.checker_color2 = tex.color2;
+                            match textures.get(tex_name) {
+                                Some(SceneTexture::Checker(tex)) => {
+                                    current_material.has_checkerboard = true;
+                                    current_material.checker_scale_u = tex.scale_u;
+                                    current_material.checker_scale_v = tex.scale_v;
+                                    current_material.checker_color1 = tex.color1;
+                                    current_material.checker_color2 = tex.color2;
+                                }
+                                Some(SceneTexture::Image(img)) => {
+                                    current_material.texture = Some(img.clone());
+                                }
+                                None => {}
                             }
                         }
                     }
@@ -818,6 +849,21 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                         current_material.material_type = MAT_COATED_DIFFUSE;
                         if let Some(c) = get_param_rgb(params, "reflectance") {
                             current_material.albedo = c;
+                        }
+                        if let Some(tex_name) = get_param_texture_ref(params, "reflectance") {
+                            match textures.get(tex_name) {
+                                Some(SceneTexture::Checker(tex)) => {
+                                    current_material.has_checkerboard = true;
+                                    current_material.checker_scale_u = tex.scale_u;
+                                    current_material.checker_scale_v = tex.scale_v;
+                                    current_material.checker_color1 = tex.color1;
+                                    current_material.checker_color2 = tex.color2;
+                                }
+                                Some(SceneTexture::Image(img)) => {
+                                    current_material.texture = Some(img.clone());
+                                }
+                                None => {}
+                            }
                         }
                         current_material.roughness =
                             get_param_float(params, "roughness").unwrap_or(0.0);
@@ -846,13 +892,34 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                 if class == "checkerboard" {
                     textures.insert(
                         name.clone(),
-                        CheckerTex {
+                        SceneTexture::Checker(CheckerTex {
                             scale_u: get_param_float(params, "uscale").unwrap_or(1.0),
                             scale_v: get_param_float(params, "vscale").unwrap_or(1.0),
                             color1: get_param_rgb(params, "tex1").unwrap_or([1.0, 1.0, 1.0]),
                             color2: get_param_rgb(params, "tex2").unwrap_or([0.0, 0.0, 0.0]),
-                        },
+                        }),
                     );
+                } else if class == "imagemap" {
+                    if let Some(filename) = get_param_string(params, "filename") {
+                        let path = scene_dir.join(filename);
+                        match image::open(&path) {
+                            Ok(img) => {
+                                let rgb = img.to_rgb32f();
+                                let (w, h) = rgb.dimensions();
+                                let data: Vec<f32> = rgb.into_raw();
+                                println!("Loaded texture: {}x{} from {}", w, h, path.display());
+                                textures.insert(
+                                    name.clone(),
+                                    SceneTexture::Image(std::sync::Arc::new(ImageTexture {
+                                        data,
+                                        width: w,
+                                        height: h,
+                                    })),
+                                );
+                            }
+                            Err(e) => eprintln!("Failed to load texture {}: {e}", path.display()),
+                        }
+                    }
                 }
             }
             Directive::Shape { ty, params } => {
