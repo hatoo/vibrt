@@ -174,8 +174,12 @@ fn save_image(path: &str, width: u32, height: u32, pixels: &[u32]) -> Result<()>
         let mut encoder = png::Encoder::new(w, width, height);
         encoder.set_color(png::ColorType::Rgb);
         encoder.set_depth(png::BitDepth::Eight);
-        let mut writer = encoder.write_header().context("Failed to write PNG header")?;
-        writer.write_image_data(&rgb).context("Failed to write PNG data")?;
+        let mut writer = encoder
+            .write_header()
+            .context("Failed to write PNG header")?;
+        writer
+            .write_image_data(&rgb)
+            .context("Failed to write PNG data")?;
     }
     Ok(())
 }
@@ -191,16 +195,30 @@ fn main() -> Result<()> {
         .unwrap_or(std::path::Path::new("."));
     let mut scene = parse_scene(&input, scene_dir);
 
-    if let Some(spp) = cli.spp { scene.spp = spp; }
-    if let Some(depth) = cli.depth { scene.max_depth = depth; }
-    if let Some(w) = cli.width { scene.width = w; }
-    if let Some(h) = cli.height { scene.height = h; }
-    if let Some(ref o) = cli.output { scene.filename = o.clone(); }
+    if let Some(spp) = cli.spp {
+        scene.spp = spp;
+    }
+    if let Some(depth) = cli.depth {
+        scene.max_depth = depth;
+    }
+    if let Some(w) = cli.width {
+        scene.width = w;
+    }
+    if let Some(h) = cli.height {
+        scene.height = h;
+    }
+    if let Some(ref o) = cli.output {
+        scene.filename = o.clone();
+    }
 
     println!(
         "Scene: {}x{}, {} spp, {} objects, {} distant lights, {} sphere lights",
-        scene.width, scene.height, scene.spp,
-        scene.objects.len(), scene.distant_lights.len(), scene.sphere_lights.len()
+        scene.width,
+        scene.height,
+        scene.spp,
+        scene.objects.len(),
+        scene.distant_lights.len(),
+        scene.sphere_lights.len()
     );
 
     // --- CUDA / OptiX init ---
@@ -243,7 +261,10 @@ fn main() -> Result<()> {
     let ptx_src = ptx.to_src();
 
     // --- OptiX pipeline ---
-    let has_spheres = scene.objects.iter().any(|o| matches!(o.shape, SceneShape::Sphere { .. }));
+    let has_spheres = scene
+        .objects
+        .iter()
+        .any(|o| matches!(o.shape, SceneShape::Sphere { .. }));
 
     let mut prim_flags = PrimitiveTypeFlags::TRIANGLE;
     if has_spheres {
@@ -274,8 +295,12 @@ fn main() -> Result<()> {
         None
     };
 
-    let raygen_pg = ProgramGroup::raygen(&ctx, &module, "__raygen__rg").context("raygen")?.value;
-    let miss_pg = ProgramGroup::miss(&ctx, &module, "__miss__ms").context("miss")?.value;
+    let raygen_pg = ProgramGroup::raygen(&ctx, &module, "__raygen__rg")
+        .context("raygen")?
+        .value;
+    let miss_pg = ProgramGroup::miss(&ctx, &module, "__miss__ms")
+        .context("miss")?
+        .value;
 
     let hitgroup_tri_pg = ProgramGroup::hitgroup(&ctx)
         .closest_hit(&module, "__closesthit__ch")
@@ -304,7 +329,9 @@ fn main() -> Result<()> {
     let pipeline = Pipeline::new(
         &ctx,
         &pipeline_options,
-        &PipelineLinkOptions { max_trace_depth: scene.max_depth },
+        &PipelineLinkOptions {
+            max_trace_depth: scene.max_depth,
+        },
         &all_pgs,
     )
     .context("pipeline")?
@@ -360,9 +387,14 @@ fn main() -> Result<()> {
                 let d_output: CudaSlice<u8> = unsafe { stream.alloc(sizes.output_size) }.cuda()?;
 
                 let handle = accel::accel_build(
-                    &ctx, cu_stream, &build_options, &bi,
-                    dptr(&d_temp, &stream), sizes.temp_size,
-                    dptr(&d_output, &stream), sizes.output_size,
+                    &ctx,
+                    cu_stream,
+                    &build_options,
+                    &bi,
+                    dptr(&d_temp, &stream),
+                    sizes.temp_size,
+                    dptr(&d_output, &stream),
+                    sizes.output_size,
                 )
                 .context("sphere accel build")?;
 
@@ -372,18 +404,28 @@ fn main() -> Result<()> {
                     eta: obj.material.eta,
                     emission: obj.material.emission,
                     has_checkerboard: 0,
-                    checker_scale_u: 0.0, checker_scale_v: 0.0,
-                    checker_color1: [0.0; 3], checker_color2: [0.0; 3],
-                    texcoords: 0, normals: 0, indices: 0, vertices: 0, num_vertices: 0,
+                    checker_scale_u: 0.0,
+                    checker_scale_v: 0.0,
+                    checker_color1: [0.0; 3],
+                    checker_color2: [0.0; 3],
+                    texcoords: 0,
+                    normals: 0,
+                    indices: 0,
+                    vertices: 0,
+                    num_vertices: 0,
                 };
 
                 let sbt_offset = sphere_hg_records.len() as u32;
-                sphere_hg_records.push(
-                    SbtRecord::new(hitgroup_sphere_pg.as_ref().context("no sphere hitgroup")?, hg_data)?,
-                );
+                sphere_hg_records.push(SbtRecord::new(
+                    hitgroup_sphere_pg.as_ref().context("no sphere hitgroup")?,
+                    hg_data,
+                )?);
 
                 gas_entries.push(GasEntry {
-                    handle, sbt_offset, transform: obj.transform, is_sphere: true,
+                    handle,
+                    sbt_offset,
+                    transform: obj.transform,
+                    is_sphere: true,
                 });
 
                 _device_buffers.push(unsafe { std::mem::transmute(d_center) });
@@ -391,7 +433,11 @@ fn main() -> Result<()> {
                 _device_buffers.push(d_temp);
                 _device_buffers.push(d_output);
             }
-            SceneShape::TriangleMesh { vertices, indices, texcoords } => {
+            SceneShape::TriangleMesh {
+                vertices,
+                indices,
+                texcoords,
+            } => {
                 let transformed = scene::transform_vertices(vertices, &obj.transform);
                 let d_verts = stream.clone_htod(&transformed).cuda()?;
                 let d_indices: CudaSlice<i32> = stream.clone_htod(indices).cuda()?;
@@ -410,12 +456,17 @@ fn main() -> Result<()> {
                 let num_tris = indices.len() as u32 / 3;
 
                 let tri_input = TriangleArrayInput::new(
-                    &vert_ptrs, num_verts, VertexFormat::Float3,
-                    3 * mem::size_of::<f32>() as u32, &flags,
+                    &vert_ptrs,
+                    num_verts,
+                    VertexFormat::Float3,
+                    3 * mem::size_of::<f32>() as u32,
+                    &flags,
                 )
                 .with_indices(
-                    dptr(&d_indices, &stream), num_tris,
-                    IndicesFormat::UnsignedInt3, 3 * mem::size_of::<i32>() as u32,
+                    dptr(&d_indices, &stream),
+                    num_tris,
+                    IndicesFormat::UnsignedInt3,
+                    3 * mem::size_of::<i32>() as u32,
                 );
 
                 let bi = [BuildInput::Triangles(tri_input)];
@@ -425,9 +476,14 @@ fn main() -> Result<()> {
                 let d_output: CudaSlice<u8> = unsafe { stream.alloc(sizes.output_size) }.cuda()?;
 
                 let handle = accel::accel_build(
-                    &ctx, cu_stream, &build_options, &bi,
-                    dptr(&d_temp, &stream), sizes.temp_size,
-                    dptr(&d_output, &stream), sizes.output_size,
+                    &ctx,
+                    cu_stream,
+                    &build_options,
+                    &bi,
+                    dptr(&d_temp, &stream),
+                    sizes.temp_size,
+                    dptr(&d_output, &stream),
+                    sizes.output_size,
                 )
                 .context("tri accel build")?;
 
@@ -452,7 +508,8 @@ fn main() -> Result<()> {
                 tri_hg_records.push(SbtRecord::new(&hitgroup_tri_pg, hg_data)?);
 
                 gas_entries.push(GasEntry {
-                    handle, sbt_offset,
+                    handle,
+                    sbt_offset,
                     transform: scene::identity_transform(),
                     is_sphere: false,
                 });
@@ -503,9 +560,14 @@ fn main() -> Result<()> {
         let d_output: CudaSlice<u8> = unsafe { stream.alloc(sizes.output_size) }.cuda()?;
 
         let ias_handle = accel::accel_build(
-            &ctx, cu_stream, &build_options, &ias_input,
-            dptr(&d_temp, &stream), sizes.temp_size,
-            dptr(&d_output, &stream), sizes.output_size,
+            &ctx,
+            cu_stream,
+            &build_options,
+            &ias_input,
+            dptr(&d_temp, &stream),
+            sizes.temp_size,
+            dptr(&d_output, &stream),
+            sizes.output_size,
         )
         .context("IAS build")?;
         stream.synchronize().cuda()?;
@@ -520,7 +582,12 @@ fn main() -> Result<()> {
 
     // --- SBT ---
     let raygen_record = SbtRecord::new(&raygen_pg, RayGenData {})?;
-    let miss_record = SbtRecord::new(&miss_pg, MissData { bg_color: [0.0, 0.0, 0.0] })?;
+    let miss_record = SbtRecord::new(
+        &miss_pg,
+        MissData {
+            bg_color: [0.0, 0.0, 0.0],
+        },
+    )?;
 
     let d_rg = alloc_and_copy(&stream, &raygen_record)?;
     let d_ms = alloc_and_copy(&stream, &miss_record)?;
@@ -546,14 +613,23 @@ fn main() -> Result<()> {
 
     // --- Camera & lights ---
     let (cam_u, cam_v, cam_w) = compute_camera(
-        &scene.cam_eye, &scene.cam_look, &scene.cam_up,
-        scene.fov, scene.width as f32 / scene.height as f32,
+        &scene.cam_eye,
+        &scene.cam_look,
+        &scene.cam_up,
+        scene.fov,
+        scene.width as f32 / scene.height as f32,
     );
 
-    let d_distant_lights = if scene.distant_lights.is_empty() { 0 }
-        else { alloc_and_copy_slice(&stream, &scene.distant_lights)? };
-    let d_sphere_lights = if scene.sphere_lights.is_empty() { 0 }
-        else { alloc_and_copy_slice(&stream, &scene.sphere_lights)? };
+    let d_distant_lights = if scene.distant_lights.is_empty() {
+        0
+    } else {
+        alloc_and_copy_slice(&stream, &scene.distant_lights)?
+    };
+    let d_sphere_lights = if scene.sphere_lights.is_empty() {
+        0
+    } else {
+        alloc_and_copy_slice(&stream, &scene.sphere_lights)?
+    };
 
     // --- Launch ---
     let pixel_count = (scene.width * scene.height) as usize;
@@ -561,9 +637,14 @@ fn main() -> Result<()> {
 
     let launch_params = LaunchParams {
         image: dptr(&d_image, &stream),
-        width: scene.width, height: scene.height,
-        samples_per_pixel: scene.spp, max_depth: scene.max_depth,
-        cam_eye: scene.cam_eye, cam_u, cam_v, cam_w,
+        width: scene.width,
+        height: scene.height,
+        samples_per_pixel: scene.spp,
+        max_depth: scene.max_depth,
+        cam_eye: scene.cam_eye,
+        cam_u,
+        cam_v,
+        cam_w,
         traversable,
         ambient_light: scene.ambient_light,
         num_distant_lights: scene.distant_lights.len() as i32,
@@ -573,10 +654,20 @@ fn main() -> Result<()> {
     };
     let d_params = alloc_and_copy(&stream, &launch_params)?;
 
-    println!("Rendering {}x{} @ {} spp...", scene.width, scene.height, scene.spp);
+    println!(
+        "Rendering {}x{} @ {} spp...",
+        scene.width, scene.height, scene.spp
+    );
     pipeline
-        .launch(cu_stream, d_params, mem::size_of::<LaunchParams>(), &sbt,
-            scene.width, scene.height, 1)
+        .launch(
+            cu_stream,
+            d_params,
+            mem::size_of::<LaunchParams>(),
+            &sbt,
+            scene.width,
+            scene.height,
+            1,
+        )
         .context("launch")?;
     stream.synchronize().cuda()?;
 
