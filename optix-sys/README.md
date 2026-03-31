@@ -40,17 +40,7 @@ unsafe {
 
 ## Running the example
 
-The example renders a barycentric-colored triangle to a PPM file.
-
-First, compile the CUDA device code to PTX:
-
-```bash
-nvcc -ptx examples/devicecode.cu -o examples/devicecode.ptx \
-     -I"C:/ProgramData/NVIDIA Corporation/OptiX SDK 9.0.0/include" \
-     -Iexamples --use_fast_math -arch=compute_75
-```
-
-Then run:
+The example compiles CUDA device code at runtime via NVRTC and renders a barycentric-colored triangle.
 
 ```bash
 cargo run --example simple_render -p optix-sys

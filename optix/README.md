@@ -10,6 +10,7 @@ Safe Rust wrapper for the [NVIDIA OptiX 9.0.0](https://developer.nvidia.com/rtx/
 - **Error handling** -- `Result<T, OptixError>` with `?` support and 40+ typed error variants
 - **Compiler log capture** -- `WithLog<T>` exposes compilation warnings/errors even on success
 - **Bitflags** -- `BuildFlags`, `GeometryFlags`, `ExceptionFlags`, etc. via the `bitflags` crate
+- **Built-in sphere intersection** -- `Module::builtin_is()` for hardware-accelerated sphere ray tracing
 
 ## Requirements
 
@@ -23,7 +24,7 @@ Same as `optix-sys`:
 ```toml
 [dependencies]
 optix = { path = "optix" }
-cudarc = { version = "0.19", default-features = false, features = ["driver", "dynamic-loading", "cuda-version-from-build-system"] }
+cudarc = { version = "0.19", default-features = false, features = ["driver", "dynamic-loading", "cuda-version-from-build-system", "nvrtc"] }
 ```
 
 ### Minimal workflow
@@ -36,7 +37,7 @@ use optix::accel::{self, AccelBuildOptions, BuildInput, TriangleArrayInput};
 let optix = optix::init()?;
 let ctx = DeviceContext::new(&optix, cuda_context, &DeviceContextOptions::default())?;
 
-// 2. Compile module from PTX
+// 2. Compile module from PTX (compiled at runtime via NVRTC)
 let pipeline_options = PipelineCompileOptions::new("params")
     .num_payload_values(3)
     .num_attribute_values(3);
@@ -73,15 +74,7 @@ pipeline.launch(stream, d_params, params_size, &sbt, width, height, 1)?;
 
 ## Running the example
 
-Compile the CUDA device code to PTX:
-
-```bash
-nvcc -ptx examples/devicecode.cu -o examples/devicecode.ptx \
-     -I"C:/ProgramData/NVIDIA Corporation/OptiX SDK 9.0.0/include" \
-     -Iexamples --use_fast_math -arch=compute_75
-```
-
-Run:
+The example compiles CUDA device code at runtime via NVRTC:
 
 ```bash
 cargo run --example simple_render -p optix
@@ -97,10 +90,10 @@ This renders a barycentric-colored triangle on a dark blue background and saves 
 | `module` | `Module`, `ModuleCompileOptions` |
 | `program_group` | `ProgramGroup`, `HitgroupBuilder`, `CallablesBuilder` |
 | `pipeline` | `Pipeline`, `PipelineCompileOptions`, `PipelineLinkOptions` |
-| `accel` | `BuildInput`, `TriangleArrayInput`, `accel_build()`, `accel_compact()` |
+| `accel` | `BuildInput`, `TriangleArrayInput`, `SphereArrayInput`, `accel_build()`, `accel_compact()` |
 | `sbt` | `SbtRecord<T>`, `SbtRecordHeader`, `ShaderBindingTableBuilder` |
 | `denoiser` | `Denoiser`, `DenoiserOptions`, `Image2D` |
-| `types` | `BuildFlags`, `GeometryFlags`, `VertexFormat`, `CompileOptimizationLevel`, ... |
+| `types` | `BuildFlags`, `GeometryFlags`, `VertexFormat`, `PrimitiveType`, ... |
 | `error` | `OptixError`, `Result<T>`, `WithLog<T>` |
 
 ## Design notes
