@@ -25,6 +25,8 @@ pub struct SceneMaterial {
     pub checker_color2: [f32; 3],
     pub texture: Option<std::sync::Arc<ImageTexture>>,
     pub bump_map: Option<std::sync::Arc<ImageTexture>>,
+    pub alpha_map: Option<std::sync::Arc<ImageTexture>>,
+    pub roughness_map: Option<std::sync::Arc<ImageTexture>>,
 }
 
 impl Default for SceneMaterial {
@@ -43,6 +45,8 @@ impl Default for SceneMaterial {
             checker_color2: [0.0, 0.0, 0.0],
             texture: None,
             bump_map: None,
+            alpha_map: None,
+            roughness_map: None,
         }
     }
 }
@@ -52,6 +56,8 @@ impl Clone for SceneMaterial {
         Self {
             texture: self.texture.clone(),
             bump_map: self.bump_map.clone(),
+            alpha_map: self.alpha_map.clone(),
+            roughness_map: self.roughness_map.clone(),
             ..*self
         }
     }
@@ -598,6 +604,16 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                         current_material.bump_map = Some(img.clone());
                     }
                 }
+                if let Some(tex_name) = get_param_texture_ref(params, "alpha") {
+                    if let Some(SceneTexture::Image(img)) = textures.get(tex_name) {
+                        current_material.alpha_map = Some(img.clone());
+                    }
+                }
+                if let Some(tex_name) = get_param_texture_ref(params, "roughness") {
+                    if let Some(SceneTexture::Image(img)) = textures.get(tex_name) {
+                        current_material.roughness_map = Some(img.clone());
+                    }
+                }
             }
             Directive::MakeNamedMaterial { name, params } => {
                 let ty = get_param_string(params, "type").unwrap_or("diffuse");
@@ -675,6 +691,16 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                 if let Some(tex_name) = get_param_texture_ref(params, "displacement") {
                     if let Some(SceneTexture::Image(img)) = textures.get(tex_name) {
                         mat.bump_map = Some(img.clone());
+                    }
+                }
+                if let Some(tex_name) = get_param_texture_ref(params, "alpha") {
+                    if let Some(SceneTexture::Image(img)) = textures.get(tex_name) {
+                        mat.alpha_map = Some(img.clone());
+                    }
+                }
+                if let Some(tex_name) = get_param_texture_ref(params, "roughness") {
+                    if let Some(SceneTexture::Image(img)) = textures.get(tex_name) {
+                        mat.roughness_map = Some(img.clone());
                     }
                 }
                 named_materials.insert(name.clone(), mat);

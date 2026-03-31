@@ -857,7 +857,25 @@ extern "C" __global__ void __closesthit__ch()
     optixSetPayload_10(__float_as_uint(data->emission[0]));
     optixSetPayload_11(__float_as_uint(data->emission[1]));
     optixSetPayload_12(__float_as_uint(data->emission[2]));
-    optixSetPayload_13(__float_as_uint(data->coated.roughness));
+
+    // Roughness: sample from texture if available, otherwise use constant
+    float roughness_val = data->coated.roughness;
+    if (data->roughness_data && data->texcoords) {
+        int ri0, ri1, ri2;
+        if (data->indices) {
+            ri0 = data->indices[prim_idx*3]; ri1 = data->indices[prim_idx*3+1]; ri2 = data->indices[prim_idx*3+2];
+        } else {
+            ri0 = prim_idx*3; ri1 = ri0+1; ri2 = ri0+2;
+        }
+        float rw = 1.0f - bary.x - bary.y;
+        float ru = rw*data->texcoords[ri0*2] + bary.x*data->texcoords[ri1*2] + bary.y*data->texcoords[ri2*2];
+        float rv = rw*data->texcoords[ri0*2+1] + bary.x*data->texcoords[ri1*2+1] + bary.y*data->texcoords[ri2*2+1];
+        ru = ru - floorf(ru); rv = rv - floorf(rv);
+        int rx = max(0, min((int)(ru * (data->roughness_width-1)), data->roughness_width-1));
+        int ry = max(0, min((int)((1.0f-rv) * (data->roughness_height-1)), data->roughness_height-1));
+        roughness_val = data->roughness_data[ry * data->roughness_width + rx];
+    }
+    optixSetPayload_13(__float_as_uint(roughness_val));
 }
 
 // Closest hit for sphere (built-in intersection)
@@ -904,4 +922,32 @@ extern "C" __global__ void __closesthit__sphere()
     optixSetPayload_11(__float_as_uint(data->emission[1]));
     optixSetPayload_12(__float_as_uint(data->emission[2]));
     optixSetPayload_13(__float_as_uint(data->coated.roughness));
+}
+
+// Any-hit program for alpha cutout
+extern "C" __global__ void __anyhit__alpha()
+{
+    const HitGroupData* data = reinterpret_cast<const HitGroupData*>(optixGetSbtDataPointer());
+    if (!data->alpha_data || !data->texcoords) return;
+
+    const float2 bary = optixGetTriangleBarycentrics();
+    const int prim_idx = optixGetPrimitiveIndex();
+
+    int i0, i1, i2;
+    if (data->indices) {
+        i0 = data->indices[prim_idx*3]; i1 = data->indices[prim_idx*3+1]; i2 = data->indices[prim_idx*3+2];
+    } else {
+        i0 = prim_idx*3; i1 = i0+1; i2 = i0+2;
+    }
+    float w = 1.0f - bary.x - bary.y;
+    float u = w*data->texcoords[i0*2] + bary.x*data->texcoords[i1*2] + bary.y*data->texcoords[i2*2];
+    float v = w*data->texcoords[i0*2+1] + bary.x*data->texcoords[i1*2+1] + bary.y*data->texcoords[i2*2+1];
+    u = u - floorf(u);
+    v = v - floorf(v);
+    int ix = max(0, min((int)(u * (data->alpha_width - 1)), data->alpha_width - 1));
+    int iy = max(0, min((int)((1.0f - v) * (data->alpha_height - 1)), data->alpha_height - 1));
+    float alpha = data->alpha_data[iy * data->alpha_width + ix];
+    if (alpha < 0.5f) {
+        optixIgnoreIntersection();
+    }
 }

@@ -110,6 +110,12 @@ fn make_hitgroup_data(
     bump_data: optix_sys::CUdeviceptr,
     bump_width: i32,
     bump_height: i32,
+    alpha_data: optix_sys::CUdeviceptr,
+    alpha_width: i32,
+    alpha_height: i32,
+    roughness_data: optix_sys::CUdeviceptr,
+    roughness_width: i32,
+    roughness_height: i32,
     texcoords: optix_sys::CUdeviceptr,
     normals: optix_sys::CUdeviceptr,
     indices: optix_sys::CUdeviceptr,
@@ -149,6 +155,12 @@ fn make_hitgroup_data(
         bump_data,
         bump_width,
         bump_height,
+        alpha_data,
+        alpha_width,
+        alpha_height,
+        roughness_data,
+        roughness_width,
+        roughness_height,
         texcoords,
         normals,
         indices,
@@ -376,6 +388,7 @@ fn main() -> Result<()> {
 
     let hitgroup_tri_pg = ProgramGroup::hitgroup(&ctx)
         .closest_hit(&module, "__closesthit__ch")
+        .any_hit(&module, "__anyhit__alpha")
         .build()
         .context("hitgroup_tri")?
         .value;
@@ -474,7 +487,26 @@ fn main() -> Result<()> {
                 )
                 .context("sphere accel build")?;
 
-                let hg_data = make_hitgroup_data(&obj.material, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+                let hg_data = make_hitgroup_data(
+                    &obj.material,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                );
 
                 let sbt_offset = sphere_hg_records.len() as u32;
                 sphere_hg_records.push(SbtRecord::new(
@@ -582,6 +614,35 @@ fn main() -> Result<()> {
                     (0, 0, 0)
                 };
 
+                // Upload alpha map if present
+                let mut upload_grayscale = |img: &scene::ImageTexture| -> anyhow::Result<(
+                    optix_sys::CUdeviceptr,
+                    i32,
+                    i32,
+                )> {
+                    let gray: Vec<f32> = img
+                        .data
+                        .chunks(3)
+                        .map(|c| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2])
+                        .collect();
+                    let s = stream.clone_htod(&gray).cuda()?;
+                    let ptr = dptr(&s, &stream);
+                    _device_buffers.push(unsafe { std::mem::transmute(s) });
+                    Ok((ptr, img.width as i32, img.height as i32))
+                };
+
+                let (d_alpha, alpha_w, alpha_h) = if let Some(ref a) = obj.material.alpha_map {
+                    upload_grayscale(a)?
+                } else {
+                    (0, 0, 0)
+                };
+
+                let (d_rough, rough_w, rough_h) = if let Some(ref r) = obj.material.roughness_map {
+                    upload_grayscale(r)?
+                } else {
+                    (0, 0, 0)
+                };
+
                 let hg_data = make_hitgroup_data(
                     &obj.material,
                     d_tex,
@@ -590,6 +651,12 @@ fn main() -> Result<()> {
                     d_bump,
                     bump_w,
                     bump_h,
+                    d_alpha,
+                    alpha_w,
+                    alpha_h,
+                    d_rough,
+                    rough_w,
+                    rough_h,
                     d_tc,
                     d_normals,
                     dptr(&d_indices, &stream),

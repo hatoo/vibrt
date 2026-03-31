@@ -66,6 +66,14 @@ struct HitGroupData {
     float*        bump_data;     // single channel float, width*height
     int           bump_width;
     int           bump_height;
+    // Alpha map (NULL if no alpha cutout)
+    float*        alpha_data;    // single channel float, width*height
+    int           alpha_width;
+    int           alpha_height;
+    // Roughness map (NULL if constant roughness)
+    float*        roughness_data; // single channel float, width*height
+    int           roughness_width;
+    int           roughness_height;
     // Geometry data
     float*        texcoords;
     float*        normals;
