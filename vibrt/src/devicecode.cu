@@ -335,16 +335,13 @@ extern "C" __global__ void __raygen__rg()
 
                     float ndotl = dot3(hit_normal, sample_dir);
                     if (ndotl > 0.0f) {
-                        // Distance to sphere surface along sample direction
-                        float t_max = dist_to_center + light_radius;
-
                         // Shadow ray
                         unsigned int shadow_p9 = 0xFFFFFFFF;
                         unsigned int sp10 = 0, sp11 = 0, sp12 = 0, sp13 = 0;
                         optixTrace(
                             params.traversable,
                             hit_pos, sample_dir,
-                            0.001f, t_max, 0.0f,
+                            0.001f, 1e16f, 0.0f,
                             OptixVisibilityMask(255),
                             OPTIX_RAY_FLAG_NONE,
                             0, 1, 0,
@@ -390,7 +387,7 @@ extern "C" __global__ void __raygen__rg()
                         unsigned int shadow_p9 = 0xFFFFFFFF;
                         unsigned int sp10=0,sp11=0,sp12=0,sp13=0;
                         optixTrace(params.traversable, hit_pos, light_dir,
-                            0.001f, dist + 0.01f, 0.0f,
+                            0.001f, 1e16f, 0.0f,
                             OptixVisibilityMask(255), OPTIX_RAY_FLAG_NONE,
                             0, 1, 0,
                             p0,p1,p2,p3,p4,p5,p6,p7,p8,shadow_p9,sp10,sp11,sp12,sp13);
@@ -468,7 +465,7 @@ extern "C" __global__ void __raygen__rg()
                         if (ndotl > 0.0f) {
                             unsigned int shadow_p9 = 0xFFFFFFFF;
                             unsigned int sp10=0,sp11=0,sp12=0,sp13=0;
-                            optixTrace(params.traversable, hit_pos, sample_dir, 0.001f, dist_to_center+light_radius, 0.0f,
+                            optixTrace(params.traversable, hit_pos, sample_dir, 0.001f, 1e16f, 0.0f,
                                 OptixVisibilityMask(255), OPTIX_RAY_FLAG_NONE, 0, 1, 0,
                                 p0,p1,p2,p3,p4,p5,p6,p7,p8,shadow_p9,sp10,sp11,sp12,sp13);
                             float3 shadow_em = make_float3(__uint_as_float(sp10),__uint_as_float(sp11),__uint_as_float(sp12));
@@ -596,7 +593,7 @@ extern "C" __global__ void __raygen__rg()
                     if (NdotL > 0.0f) {
                         unsigned int shadow_p9 = 0xFFFFFFFF;
                         unsigned int sp10=0,sp11=0,sp12=0,sp13=0;
-                        optixTrace(params.traversable, hit_pos, L, 0.001f, dist_to_center+light_radius, 0.0f,
+                        optixTrace(params.traversable, hit_pos, L, 0.001f, 1e16f, 0.0f,
                             OptixVisibilityMask(255), OPTIX_RAY_FLAG_NONE, 0, 1, 0,
                             p0,p1,p2,p3,p4,p5,p6,p7,p8,shadow_p9,sp10,sp11,sp12,sp13);
                         float3 shadow_em = make_float3(__uint_as_float(sp10),__uint_as_float(sp11),__uint_as_float(sp12));
