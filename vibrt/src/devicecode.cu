@@ -390,11 +390,13 @@ extern "C" __global__ void __raygen__rg()
                         unsigned int shadow_p9 = 0xFFFFFFFF;
                         unsigned int sp10=0,sp11=0,sp12=0,sp13=0;
                         optixTrace(params.traversable, hit_pos, light_dir,
-                            0.001f, dist - 0.001f, 0.0f,
-                            OptixVisibilityMask(255), OPTIX_RAY_FLAG_TERMINATE_ON_FIRST_HIT,
+                            0.001f, dist + 0.01f, 0.0f,
+                            OptixVisibilityMask(255), OPTIX_RAY_FLAG_NONE,
                             0, 1, 0,
                             p0,p1,p2,p3,p4,p5,p6,p7,p8,shadow_p9,sp10,sp11,sp12,sp13);
-                        if (shadow_p9 == 0xFFFFFFFF) {
+                        float3 shadow_em = make_float3(__uint_as_float(sp10), __uint_as_float(sp11), __uint_as_float(sp12));
+                        bool unoccluded = (shadow_p9 == 0xFFFFFFFF) || (shadow_em.x > 0 || shadow_em.y > 0 || shadow_em.z > 0);
+                        if (unoccluded) {
                             // PDF = 1/area, geometry factor = cos_light * cos_hit / dist^2
                             float weight = light_area * lndotl * ndotl / (dist2 * M_PIf);
                             radiance = radiance + throughput * hit_albedo * light_em * weight;
@@ -497,10 +499,12 @@ extern "C" __global__ void __raygen__rg()
                         if (ndotl > 0.0f && lndotl > 0.0f) {
                             unsigned int shadow_p9 = 0xFFFFFFFF;
                             unsigned int sp10=0,sp11=0,sp12=0,sp13=0;
-                            optixTrace(params.traversable, hit_pos, ldir, 0.001f, dist-0.001f, 0.0f,
-                                OptixVisibilityMask(255), OPTIX_RAY_FLAG_TERMINATE_ON_FIRST_HIT, 0, 1, 0,
+                            optixTrace(params.traversable, hit_pos, ldir, 0.001f, dist+0.01f, 0.0f,
+                                OptixVisibilityMask(255), OPTIX_RAY_FLAG_NONE, 0, 1, 0,
                                 p0,p1,p2,p3,p4,p5,p6,p7,p8,shadow_p9,sp10,sp11,sp12,sp13);
-                            if (shadow_p9 == 0xFFFFFFFF) {
+                            float3 shadow_em = make_float3(__uint_as_float(sp10), __uint_as_float(sp11), __uint_as_float(sp12));
+                            bool unoccluded = (shadow_p9 == 0xFFFFFFFF) || (shadow_em.x > 0 || shadow_em.y > 0 || shadow_em.z > 0);
+                            if (unoccluded) {
                                 float weight = light_area * lndotl * ndotl / (dist2 * M_PIf);
                                 radiance = radiance + throughput * hit_albedo * light_em * weight;
                             }
@@ -556,10 +560,12 @@ extern "C" __global__ void __raygen__rg()
                     if (NdotL > 0.0f && lndotl > 0.0f) {
                         unsigned int shadow_p9 = 0xFFFFFFFF;
                         unsigned int sp10=0,sp11=0,sp12=0,sp13=0;
-                        optixTrace(params.traversable, hit_pos, L, 0.001f, dist-0.001f, 0.0f,
-                            OptixVisibilityMask(255), OPTIX_RAY_FLAG_TERMINATE_ON_FIRST_HIT,
+                        optixTrace(params.traversable, hit_pos, L, 0.001f, dist+0.01f, 0.0f,
+                            OptixVisibilityMask(255), OPTIX_RAY_FLAG_NONE,
                             0, 1, 0, p0,p1,p2,p3,p4,p5,p6,p7,p8,shadow_p9,sp10,sp11,sp12,sp13);
-                        if (shadow_p9 == 0xFFFFFFFF) {
+                        float3 shadow_em = make_float3(__uint_as_float(sp10), __uint_as_float(sp11), __uint_as_float(sp12));
+                        bool unoccluded = (shadow_p9 == 0xFFFFFFFF) || (shadow_em.x > 0 || shadow_em.y > 0 || shadow_em.z > 0);
+                        if (unoccluded) {
                             float3 brdf = eval_conductor_brdf(V, L, hit_normal, hit_albedo, alpha);
                             float geo = light_area * lndotl / dist2;
                             radiance = radiance + throughput * brdf * light_em * NdotL * geo;
