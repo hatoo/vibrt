@@ -954,3 +954,36 @@ extern "C" __global__ void __anyhit__alpha()
         optixIgnoreIntersection();
     }
 }
+
+// Custom sphere intersection that handles rays from both inside and outside
+extern "C" __global__ void __intersection__sphere()
+{
+    const float3 ray_orig = optixGetObjectRayOrigin();
+    const float3 ray_dir = optixGetObjectRayDirection();
+    const float tmin = optixGetRayTmin();
+    const float tmax = optixGetRayTmax();
+
+    // Sphere at origin, radius from SBT data
+    // We store radius in the first float of vertices ptr (repurposed)
+    const HitGroupData* data = reinterpret_cast<const HitGroupData*>(optixGetSbtDataPointer());
+    float radius = __int_as_float(data->num_vertices); // radius stored here
+
+    // Ray-sphere intersection: |o + t*d|^2 = r^2
+    float a = dot3(ray_dir, ray_dir);
+    float b = 2.0f * dot3(ray_orig, ray_dir);
+    float c = dot3(ray_orig, ray_orig) - radius * radius;
+    float discriminant = b * b - 4.0f * a * c;
+
+    if (discriminant < 0.0f) return;
+
+    float sqrt_disc = sqrtf(discriminant);
+    float t1 = (-b - sqrt_disc) / (2.0f * a);
+    float t2 = (-b + sqrt_disc) / (2.0f * a);
+
+    // Report the nearest valid intersection
+    if (t1 >= tmin && t1 <= tmax) {
+        optixReportIntersection(t1, 0);
+    } else if (t2 >= tmin && t2 <= tmax) {
+        optixReportIntersection(t2, 0);
+    }
+}

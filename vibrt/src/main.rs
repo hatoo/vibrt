@@ -350,9 +350,25 @@ fn main() -> Result<()> {
         .iter()
         .any(|o| matches!(o.shape, SceneShape::Sphere { .. }));
 
+    // Check if any sphere encloses the camera (needs custom intersection)
+    let has_inside_sphere = scene.objects.iter().any(|o| {
+        if let SceneShape::Sphere { radius } = &o.shape {
+            let wc = [o.transform[3], o.transform[7], o.transform[11]];
+            let dx = scene.cam_eye[0] - wc[0];
+            let dy = scene.cam_eye[1] - wc[1];
+            let dz = scene.cam_eye[2] - wc[2];
+            dx * dx + dy * dy + dz * dz < radius * radius
+        } else {
+            false
+        }
+    });
+
     let mut prim_flags = PrimitiveTypeFlags::TRIANGLE;
     if has_spheres {
         prim_flags |= PrimitiveTypeFlags::SPHERE;
+    }
+    if has_inside_sphere {
+        prim_flags |= PrimitiveTypeFlags::CUSTOM;
     }
 
     let pipeline_options = PipelineCompileOptions::new("params")
@@ -406,8 +422,24 @@ fn main() -> Result<()> {
         None
     };
 
+    let hitgroup_custom_sphere_pg = if has_inside_sphere {
+        Some(
+            ProgramGroup::hitgroup(&ctx)
+                .closest_hit(&module, "__closesthit__sphere")
+                .intersection(&module, "__intersection__sphere")
+                .build()
+                .context("hitgroup_custom_sphere")?
+                .value,
+        )
+    } else {
+        None
+    };
+
     let mut all_pgs: Vec<&ProgramGroup> = vec![&raygen_pg, &miss_pg, &hitgroup_tri_pg];
     if let Some(ref pg) = hitgroup_sphere_pg {
+        all_pgs.push(pg);
+    }
+    if let Some(ref pg) = hitgroup_custom_sphere_pg {
         all_pgs.push(pg);
     }
 
@@ -459,35 +491,25 @@ fn main() -> Result<()> {
                 let dist_sq = dx * dx + dy * dy + dz * dz;
 
                 if dist_sq < radius * radius {
-                    // Camera is inside sphere — tessellate and add as triangle mesh
-                    let (verts, normals, indices) = subdivision::make_icosphere(*radius, 4);
-                    let transformed = transform::transform_vertices(&verts, &obj.transform);
-
-                    let d_verts = stream.clone_htod(&transformed).cuda()?;
-                    let d_normals = stream.clone_htod(&normals).cuda()?;
-                    let d_indices: CudaSlice<i32> = stream.clone_htod(&indices).cuda()?;
-                    let vert_ptrs = [dptr(&d_verts, &stream)];
+                    // Camera is inside sphere — use custom intersection program
+                    // (built-in sphere IS doesn't handle inside-out rays)
+                    let aabb = [-*radius, -*radius, -*radius, *radius, *radius, *radius];
+                    let d_aabb = stream.clone_htod(&aabb).cuda()?;
+                    let aabb_ptrs = [dptr(&d_aabb, &stream)];
                     let flags = [GeometryFlags::NONE];
-                    let num_verts = transformed.len() as u32 / 3;
-                    let num_tris = indices.len() as u32 / 3;
 
-                    let tri_input = TriangleArrayInput::new(
-                        &vert_ptrs,
-                        num_verts,
-                        VertexFormat::Float3,
-                        3 * mem::size_of::<f32>() as u32,
-                        &flags,
-                    )
-                    .with_indices(
-                        dptr(&d_indices, &stream),
-                        num_tris,
-                        IndicesFormat::UnsignedInt3,
-                        3 * mem::size_of::<i32>() as u32,
-                    );
+                    let custom_input = accel::CustomPrimitiveInput {
+                        aabb_buffers: &aabb_ptrs,
+                        num_primitives: 1,
+                        stride: 0,
+                        flags: &flags,
+                        num_sbt_records: 1,
+                        primitive_index_offset: 0,
+                    };
 
-                    let bi = [BuildInput::Triangles(tri_input)];
+                    let bi = [BuildInput::CustomPrimitives(custom_input)];
                     let sizes = accel::accel_compute_memory_usage(&ctx, &build_options, &bi)
-                        .context("sphere-as-tri accel memory")?;
+                        .context("sphere-custom accel memory")?;
                     let d_temp: CudaSlice<u8> = unsafe { stream.alloc(sizes.temp_size) }.cuda()?;
                     let d_output: CudaSlice<u8> =
                         unsafe { stream.alloc(sizes.output_size) }.cuda()?;
@@ -502,9 +524,10 @@ fn main() -> Result<()> {
                         dptr(&d_output, &stream),
                         sizes.output_size,
                     )
-                    .context("sphere-as-tri accel build")?;
+                    .context("sphere-custom accel build")?;
 
-                    let hg_data = make_hitgroup_data(
+                    // Store radius in num_vertices field (reinterpreted as float in shader)
+                    let mut hg_data = make_hitgroup_data(
                         &obj.material,
                         0,
                         0,
@@ -518,26 +541,30 @@ fn main() -> Result<()> {
                         0,
                         0,
                         0,
-                        0, // texcoords
-                        dptr(&d_normals, &stream),
-                        dptr(&d_indices, &stream),
-                        dptr(&d_verts, &stream),
-                        num_verts as i32,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
                     );
+                    hg_data.num_vertices = radius.to_bits() as i32;
 
-                    let sbt_offset = tri_hg_records.len() as u32;
-                    tri_hg_records.push(SbtRecord::new(&hitgroup_tri_pg, hg_data)?);
+                    let sbt_offset = sphere_hg_records.len() as u32;
+                    sphere_hg_records.push(SbtRecord::new(
+                        hitgroup_custom_sphere_pg
+                            .as_ref()
+                            .context("no custom sphere hitgroup")?,
+                        hg_data,
+                    )?);
 
                     gas_entries.push(GasEntry {
                         handle,
                         sbt_offset,
-                        transform: transform::identity(),
-                        is_sphere: false,
+                        transform: obj.transform,
+                        is_sphere: true, // uses sphere SBT offset
                     });
 
-                    _device_buffers.push(unsafe { std::mem::transmute(d_verts) });
-                    _device_buffers.push(unsafe { std::mem::transmute(d_normals) });
-                    _device_buffers.push(unsafe { std::mem::transmute(d_indices) });
+                    _device_buffers.push(unsafe { std::mem::transmute(d_aabb) });
                     _device_buffers.push(d_temp);
                     _device_buffers.push(d_output);
                     continue;
