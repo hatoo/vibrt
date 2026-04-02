@@ -523,41 +523,44 @@ extern "C" __global__ void __closesthit__ch()
     const float3 ray_dir = optixGetWorldRayDirection();
     float3 hit_pos = ray_orig + ray_dir * t;
 
-    // Compute face normal from triangle vertices
+    // Compute vertex indices (shared by position, normal, texcoord lookups)
+    int idx0, idx1, idx2;
+    if (data->indices) {
+        idx0 = data->indices[prim_idx * 3 + 0];
+        idx1 = data->indices[prim_idx * 3 + 1];
+        idx2 = data->indices[prim_idx * 3 + 2];
+    } else {
+        idx0 = prim_idx * 3 + 0;
+        idx1 = prim_idx * 3 + 1;
+        idx2 = prim_idx * 3 + 2;
+    }
+
+    // Load triangle vertices
     float3 v0, v1, v2;
     if (data->indices) {
-        int i0 = data->indices[prim_idx * 3 + 0];
-        int i1 = data->indices[prim_idx * 3 + 1];
-        int i2 = data->indices[prim_idx * 3 + 2];
-        v0 = make_float3(data->vertices[i0*3], data->vertices[i0*3+1], data->vertices[i0*3+2]);
-        v1 = make_float3(data->vertices[i1*3], data->vertices[i1*3+1], data->vertices[i1*3+2]);
-        v2 = make_float3(data->vertices[i2*3], data->vertices[i2*3+1], data->vertices[i2*3+2]);
+        v0 = make_float3(data->vertices[idx0*3], data->vertices[idx0*3+1], data->vertices[idx0*3+2]);
+        v1 = make_float3(data->vertices[idx1*3], data->vertices[idx1*3+1], data->vertices[idx1*3+2]);
+        v2 = make_float3(data->vertices[idx2*3], data->vertices[idx2*3+1], data->vertices[idx2*3+2]);
     } else {
         v0 = make_float3(data->vertices[prim_idx*9+0], data->vertices[prim_idx*9+1], data->vertices[prim_idx*9+2]);
         v1 = make_float3(data->vertices[prim_idx*9+3], data->vertices[prim_idx*9+4], data->vertices[prim_idx*9+5]);
         v2 = make_float3(data->vertices[prim_idx*9+6], data->vertices[prim_idx*9+7], data->vertices[prim_idx*9+8]);
     }
 
+    // Load per-vertex normals (if available)
+    float3 n0, n1, n2;
+    bool has_normals = (data->normals != 0);
+    if (has_normals) {
+        n0 = make_float3(data->normals[idx0*3], data->normals[idx0*3+1], data->normals[idx0*3+2]);
+        n1 = make_float3(data->normals[idx1*3], data->normals[idx1*3+1], data->normals[idx1*3+2]);
+        n2 = make_float3(data->normals[idx2*3], data->normals[idx2*3+1], data->normals[idx2*3+2]);
+    }
+
     float3 shading_normal;
-    if (data->normals) {
-        // Smooth shading: interpolate per-vertex normals
-        int i0, i1, i2;
-        if (data->indices) {
-            i0 = data->indices[prim_idx * 3 + 0];
-            i1 = data->indices[prim_idx * 3 + 1];
-            i2 = data->indices[prim_idx * 3 + 2];
-        } else {
-            i0 = prim_idx * 3 + 0;
-            i1 = prim_idx * 3 + 1;
-            i2 = prim_idx * 3 + 2;
-        }
-        float3 n0 = make_float3(data->normals[i0*3], data->normals[i0*3+1], data->normals[i0*3+2]);
-        float3 n1 = make_float3(data->normals[i1*3], data->normals[i1*3+1], data->normals[i1*3+2]);
-        float3 n2 = make_float3(data->normals[i2*3], data->normals[i2*3+1], data->normals[i2*3+2]);
-        float w = 1.0f - bary.x - bary.y;
-        shading_normal = normalize3(n0 * w + n1 * bary.x + n2 * bary.y);
+    float wt = 1.0f - bary.x - bary.y;
+    if (has_normals) {
+        shading_normal = normalize3(n0 * wt + n1 * bary.x + n2 * bary.y);
     } else {
-        // Flat shading: face normal from triangle edges
         float3 edge1 = v1 - v0;
         float3 edge2 = v2 - v0;
         shading_normal = normalize3(cross3(edge1, edge2));
@@ -567,34 +570,36 @@ extern "C" __global__ void __closesthit__ch()
     if (dot3(shading_normal, ray_dir) > 0.0f)
         shading_normal = shading_normal * (-1.0f);
 
-    // Bump mapping (matches PBRT's BumpMap approach)
+    // Bump mapping (matches PBRT's BumpMap)
     if (data->bump_data && data->texcoords) {
-        int bi0, bi1, bi2;
-        if (data->indices) {
-            bi0 = data->indices[prim_idx * 3 + 0];
-            bi1 = data->indices[prim_idx * 3 + 1];
-            bi2 = data->indices[prim_idx * 3 + 2];
-        } else {
-            bi0 = prim_idx * 3; bi1 = bi0 + 1; bi2 = bi0 + 2;
-        }
-        float bw = 1.0f - bary.x - bary.y;
-        float u_coord = bw * data->texcoords[bi0*2] + bary.x * data->texcoords[bi1*2] + bary.y * data->texcoords[bi2*2];
-        float v_coord = bw * data->texcoords[bi0*2+1] + bary.x * data->texcoords[bi1*2+1] + bary.y * data->texcoords[bi2*2+1];
+        // Interpolate UVs
+        float2 uv0 = make_float2(data->texcoords[idx0*2], data->texcoords[idx0*2+1]);
+        float2 uv1 = make_float2(data->texcoords[idx1*2], data->texcoords[idx1*2+1]);
+        float2 uv2 = make_float2(data->texcoords[idx2*2], data->texcoords[idx2*2+1]);
+        float u_coord = wt * uv0.x + bary.x * uv1.x + bary.y * uv2.x;
+        float v_coord = wt * uv0.y + bary.x * uv1.y + bary.y * uv2.y;
 
-        // Compute dpdu/dpdv from triangle vertices and UVs
-        float2 uv0 = make_float2(data->texcoords[bi0*2], data->texcoords[bi0*2+1]);
-        float2 uv1 = make_float2(data->texcoords[bi1*2], data->texcoords[bi1*2+1]);
-        float2 uv2 = make_float2(data->texcoords[bi2*2], data->texcoords[bi2*2+1]);
+        // Compute UV Jacobian (dpdu, dpdv, dndu, dndv)
         float3 dp1 = v1 - v0, dp2 = v2 - v0;
         float duv1_u = uv1.x - uv0.x, duv1_v = uv1.y - uv0.y;
         float duv2_u = uv2.x - uv0.x, duv2_v = uv2.y - uv0.y;
         float det = duv1_u * duv2_v - duv1_v * duv2_u;
 
-        float3 dpdu, dpdv;
-        if (fabsf(det) > 1e-8f) {
+        float3 dpdu, dpdv, dndu, dndv;
+        bool degenerate_uv = (fabsf(det) < 1e-8f);
+        if (!degenerate_uv) {
             float inv_det = 1.0f / det;
             dpdu = (dp1 * duv2_v - dp2 * duv1_v) * inv_det;
             dpdv = (dp2 * duv1_u - dp1 * duv2_u) * inv_det;
+            // Compute dndu/dndv from vertex normals
+            if (has_normals) {
+                float3 dn1 = n1 - n0, dn2 = n2 - n0;
+                dndu = (dn1 * duv2_v - dn2 * duv1_v) * inv_det;
+                dndv = (dn2 * duv1_u - dn1 * duv2_u) * inv_det;
+            } else {
+                dndu = make_float3(0, 0, 0);
+                dndv = make_float3(0, 0, 0);
+            }
         } else {
             // Degenerate UVs: fall back to arbitrary tangent frame
             if (fabsf(shading_normal.x) > 0.9f)
@@ -602,10 +607,69 @@ extern "C" __global__ void __closesthit__ch()
             else
                 dpdu = normalize3(cross3(make_float3(1,0,0), shading_normal));
             dpdv = cross3(shading_normal, dpdu);
+            dndu = make_float3(0, 0, 0);
+            dndv = make_float3(0, 0, 0);
         }
 
-        // Sample displacement with finite differences (PBRT uses du=0.0005 fallback)
+        // Compute ray differentials for adaptive finite-difference step
+        // For primary rays: dpdx/dpdy from camera pixel spacing
+        // For bounced rays: this is an approximation (correct scale, wrong direction)
+        float3 cam_u = make_f3(params.cam_u);
+        float3 cam_v = make_f3(params.cam_v);
+        float3 dDdx = cam_u * (2.0f / (float)params.width);
+        float3 dDdy = cam_v * (2.0f / (float)params.height);
+
+        // Intersect offset rays with tangent plane at hit point to get dpdx/dpdy
+        float3 N = shading_normal;
+        float NdotD = dot3(N, ray_dir);
+        float3 dpdx, dpdy;
+        if (fabsf(NdotD) > 1e-8f) {
+            // Offset ray: origin + t_x * (direction + dDdx) lands on tangent plane
+            float t_x = t * dot3(N, ray_dir) / dot3(N, ray_dir + dDdx);
+            float t_y = t * dot3(N, ray_dir) / dot3(N, ray_dir + dDdy);
+            dpdx = (ray_dir + dDdx) * t_x - ray_dir * t;
+            dpdy = (ray_dir + dDdy) * t_y - ray_dir * t;
+        } else {
+            dpdx = dDdx * t;
+            dpdy = dDdy * t;
+        }
+
+        // Compute dudx/dudy/dvdx/dvdy by projecting dpdx/dpdy onto UV space
+        // Pick 2D plane where normal has smallest component (best-conditioned)
         float du = 0.0005f, dv = 0.0005f;
+        if (!degenerate_uv) {
+            int dim0, dim1;
+            float anx = fabsf(N.x), any = fabsf(N.y), anz = fabsf(N.z);
+            if (anx > any && anx > anz) { dim0 = 1; dim1 = 2; }
+            else if (any > anz)          { dim0 = 0; dim1 = 2; }
+            else                         { dim0 = 0; dim1 = 1; }
+
+            // Access vector components by index
+            float dpdu_d[3] = {dpdu.x, dpdu.y, dpdu.z};
+            float dpdv_d[3] = {dpdv.x, dpdv.y, dpdv.z};
+            float dpdx_d[3] = {dpdx.x, dpdx.y, dpdx.z};
+            float dpdy_d[3] = {dpdy.x, dpdy.y, dpdy.z};
+
+            // Solve 2x2 system: [dpdu dpdv] * [du; dv] = dp  (projected onto dim0, dim1)
+            float a00 = dpdu_d[dim0], a01 = dpdv_d[dim0];
+            float a10 = dpdu_d[dim1], a11 = dpdv_d[dim1];
+            float det2 = a00 * a11 - a01 * a10;
+
+            if (fabsf(det2) > 1e-10f) {
+                float inv2 = 1.0f / det2;
+                float dudx = ( a11 * dpdx_d[dim0] - a01 * dpdx_d[dim1]) * inv2;
+                float dvdx = (-a10 * dpdx_d[dim0] + a00 * dpdx_d[dim1]) * inv2;
+                float dudy = ( a11 * dpdy_d[dim0] - a01 * dpdy_d[dim1]) * inv2;
+                float dvdy = (-a10 * dpdy_d[dim0] + a00 * dpdy_d[dim1]) * inv2;
+
+                du = 0.5f * (fabsf(dudx) + fabsf(dudy));
+                dv = 0.5f * (fabsf(dvdx) + fabsf(dvdy));
+                if (du == 0.0f) du = 0.0005f;
+                if (dv == 0.0f) dv = 0.0005f;
+            }
+        }
+
+        // Sample displacement texture
         int bw_ = data->bump_width;
         int bh_ = data->bump_height;
         auto sample_bump = [&](float su, float sv) -> float {
@@ -622,10 +686,11 @@ extern "C" __global__ void __closesthit__ch()
         float u_displace = sample_bump(u_coord + du, v_coord);
         float v_displace = sample_bump(u_coord, v_coord + dv);
 
-        // PBRT formula: dpdu' = dpdu + (uDisplace - displace) / du * N
-        float3 N = shading_normal;
-        float3 dpdu_bumped = dpdu + N * ((u_displace - displace) / du);
-        float3 dpdv_bumped = dpdv + N * ((v_displace - displace) / dv);
+        // PBRT formula:
+        // dpdu' = dpdu + (uDisplace - displace) / du * N + displace * dndu
+        // dpdv' = dpdv + (vDisplace - displace) / dv * N + displace * dndv
+        float3 dpdu_bumped = dpdu + N * ((u_displace - displace) / du) + dndu * displace;
+        float3 dpdv_bumped = dpdv + N * ((v_displace - displace) / dv) + dndv * displace;
 
         shading_normal = normalize3(cross3(dpdu_bumped, dpdv_bumped));
         if (dot3(shading_normal, ray_dir) > 0.0f)
@@ -637,18 +702,9 @@ extern "C" __global__ void __closesthit__ch()
     // Checkerboard procedural texture
     if (data->material_type == MAT_DIFFUSE && data->diffuse.has_checkerboard) {
         float u_coord = 0.0f, v_coord = 0.0f;
-        if (data->texcoords && data->indices) {
-            int i0 = data->indices[prim_idx * 3 + 0];
-            int i1 = data->indices[prim_idx * 3 + 1];
-            int i2 = data->indices[prim_idx * 3 + 2];
-            float w = 1.0f - bary.x - bary.y;
-            u_coord = w * data->texcoords[i0*2] + bary.x * data->texcoords[i1*2] + bary.y * data->texcoords[i2*2];
-            v_coord = w * data->texcoords[i0*2+1] + bary.x * data->texcoords[i1*2+1] + bary.y * data->texcoords[i2*2+1];
-        } else if (data->texcoords) {
-            int base = prim_idx * 3;
-            float w = 1.0f - bary.x - bary.y;
-            u_coord = w * data->texcoords[base*2] + bary.x * data->texcoords[(base+1)*2] + bary.y * data->texcoords[(base+2)*2];
-            v_coord = w * data->texcoords[base*2+1] + bary.x * data->texcoords[(base+1)*2+1] + bary.y * data->texcoords[(base+2)*2+1];
+        if (data->texcoords) {
+            u_coord = wt * data->texcoords[idx0*2] + bary.x * data->texcoords[idx1*2] + bary.y * data->texcoords[idx2*2];
+            v_coord = wt * data->texcoords[idx0*2+1] + bary.x * data->texcoords[idx1*2+1] + bary.y * data->texcoords[idx2*2+1];
         }
         u_coord *= data->diffuse.checker_scale_u;
         v_coord *= data->diffuse.checker_scale_v;
@@ -662,20 +718,8 @@ extern "C" __global__ void __closesthit__ch()
 
     // Image texture sampling
     if (data->texture_data && data->texcoords) {
-        float u_coord = 0.0f, v_coord = 0.0f;
-        int i0, i1, i2;
-        if (data->indices) {
-            i0 = data->indices[prim_idx * 3 + 0];
-            i1 = data->indices[prim_idx * 3 + 1];
-            i2 = data->indices[prim_idx * 3 + 2];
-        } else {
-            i0 = prim_idx * 3;
-            i1 = prim_idx * 3 + 1;
-            i2 = prim_idx * 3 + 2;
-        }
-        float w = 1.0f - bary.x - bary.y;
-        u_coord = w * data->texcoords[i0*2] + bary.x * data->texcoords[i1*2] + bary.y * data->texcoords[i2*2];
-        v_coord = w * data->texcoords[i0*2+1] + bary.x * data->texcoords[i1*2+1] + bary.y * data->texcoords[i2*2+1];
+        float u_coord = wt * data->texcoords[idx0*2] + bary.x * data->texcoords[idx1*2] + bary.y * data->texcoords[idx2*2];
+        float v_coord = wt * data->texcoords[idx0*2+1] + bary.x * data->texcoords[idx1*2+1] + bary.y * data->texcoords[idx2*2+1];
 
         // Wrap UVs
         u_coord = u_coord - floorf(u_coord);
@@ -726,15 +770,8 @@ extern "C" __global__ void __closesthit__ch()
     // Roughness: sample from texture if available, otherwise use constant
     float roughness_val = data->roughness;
     if (data->roughness_data && data->texcoords) {
-        int ri0, ri1, ri2;
-        if (data->indices) {
-            ri0 = data->indices[prim_idx*3]; ri1 = data->indices[prim_idx*3+1]; ri2 = data->indices[prim_idx*3+2];
-        } else {
-            ri0 = prim_idx*3; ri1 = ri0+1; ri2 = ri0+2;
-        }
-        float rw = 1.0f - bary.x - bary.y;
-        float ru = rw*data->texcoords[ri0*2] + bary.x*data->texcoords[ri1*2] + bary.y*data->texcoords[ri2*2];
-        float rv = rw*data->texcoords[ri0*2+1] + bary.x*data->texcoords[ri1*2+1] + bary.y*data->texcoords[ri2*2+1];
+        float ru = wt*data->texcoords[idx0*2] + bary.x*data->texcoords[idx1*2] + bary.y*data->texcoords[idx2*2];
+        float rv = wt*data->texcoords[idx0*2+1] + bary.x*data->texcoords[idx1*2+1] + bary.y*data->texcoords[idx2*2+1];
         ru = ru - floorf(ru); rv = rv - floorf(rv);
         int rx = max(0, min((int)(ru * (data->roughness_width-1)), data->roughness_width-1));
         int ry = max(0, min((int)((1.0f-rv) * (data->roughness_height-1)), data->roughness_height-1));
