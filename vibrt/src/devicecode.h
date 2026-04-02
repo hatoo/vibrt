@@ -45,37 +45,34 @@ struct DielectricParams {
 };
 
 struct HitGroupData {
+    // Material
     int           material_type;
     float         albedo[3];
     float         emission[3];
     float         roughness;
-    // Material-specific params (union)
     union {
         DiffuseParams       diffuse;
         DielectricParams    dielectric;
     };
-    // Image texture (NULL if no texture)
-    float*        texture_data;  // RGB float, width*height*3
-    int           texture_width;
-    int           texture_height;
-    // Bump map (NULL if no bump)
-    float*        bump_data;     // single channel float, width*height
-    int           bump_width;
-    int           bump_height;
-    // Alpha map (NULL if no alpha cutout)
-    float*        alpha_data;    // single channel float, width*height
-    int           alpha_width;
-    int           alpha_height;
-    // Roughness map (NULL if constant roughness)
-    float*        roughness_data; // single channel float, width*height
-    int           roughness_width;
-    int           roughness_height;
-    // Geometry data
-    float*        texcoords;
+    // Geometry
+    float*        vertices;
     float*        normals;
     int*          indices;
-    float*        vertices;
+    float*        texcoords;
     int           num_vertices;
+    // Texture maps
+    float*        texture_data;
+    int           texture_width;
+    int           texture_height;
+    float*        bump_data;
+    int           bump_width;
+    int           bump_height;
+    float*        alpha_data;
+    int           alpha_width;
+    int           alpha_height;
+    float*        roughness_data;
+    int           roughness_width;
+    int           roughness_height;
 };
 
 struct LaunchParams {

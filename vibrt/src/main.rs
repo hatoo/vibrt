@@ -145,6 +145,11 @@ fn make_hitgroup_data(
         emission: mat.emission,
         roughness: mat.roughness,
         params,
+        vertices,
+        normals,
+        indices,
+        texcoords,
+        num_vertices,
         texture_data,
         texture_width,
         texture_height,
@@ -157,11 +162,6 @@ fn make_hitgroup_data(
         roughness_data,
         roughness_width,
         roughness_height,
-        texcoords,
-        normals,
-        indices,
-        vertices,
-        num_vertices,
     }
 }
 
