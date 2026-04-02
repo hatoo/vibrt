@@ -9,23 +9,19 @@ extern "C" {
 __constant__ LaunchParams params;
 }
 
-// ---- RNG (PCG hash) ----
-
-static __forceinline__ __device__ unsigned int pcg_hash(unsigned int input)
-{
-    unsigned int state = input * 747796405u + 2891336453u;
-    unsigned int word  = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
-    return (word >> 22u) ^ word;
-}
+// ---- RNG (PCG) ----
 
 struct RNG {
     unsigned int state;
     __device__ RNG(unsigned int pixel, unsigned int sample, unsigned int depth) {
-        state = pcg_hash(pixel * 17 + sample * 101 + depth * 1999);
+        state = (pixel * 17u + sample * 101u + depth * 1999u) * 747796405u + 2891336453u;
     }
     __device__ float next() {
-        state = pcg_hash(state);
-        return state / 4294967296.0f;
+        unsigned int old = state;
+        state = old * 747796405u + 2891336453u;
+        unsigned int word = ((old >> ((old >> 28u) + 4u)) ^ old) * 277803737u;
+        unsigned int result = (word >> 22u) ^ word;
+        return result / 4294967296.0f;
     }
 };
 
