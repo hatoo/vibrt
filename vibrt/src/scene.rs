@@ -220,6 +220,18 @@ impl<'a> ParamSet<'a> {
             })
     }
 
+    /// Sample interleaved spectrum [wavelength, value, ...] at R/G/B wavelengths.
+    fn spectrum_rgb(&self, name: &str) -> Option<[f32; 3]> {
+        self.mark(name);
+        self.params
+            .iter()
+            .find(|p| p.name == name && p.ty == ParamType::Spectrum)
+            .and_then(|p| match &p.value {
+                ParamValue::Floats(v) if v.len() >= 4 => Some(sample_spectrum_rgb(v)),
+                _ => None,
+            })
+    }
+
     fn blackbody(&self, name: &str) -> Option<f32> {
         self.mark(name);
         self.params
@@ -262,20 +274,119 @@ impl Drop for ParamSet<'_> {
     }
 }
 
-/// Returns (eta_rgb, k_rgb) for named metal spectra.
-/// Values are approximate RGB conversions of measured spectral data.
-fn metal_ior_from_params(p: &ParamSet) -> Option<([f32; 3], [f32; 3])> {
-    let eta_str = p.spectrum_string("eta");
-    match eta_str {
-        Some(s) if s.contains("Au") => Some(([0.143, 0.374, 1.442], [3.983, 2.380, 1.603])),
-        Some(s) if s.contains("Ag") => Some(([0.050, 0.056, 0.047], [4.484, 3.390, 2.440])),
-        Some(s) if s.contains("Cu") && !s.contains("CuZn") => {
-            Some(([0.271, 0.677, 1.316], [3.610, 2.625, 2.292]))
-        }
-        Some(s) if s.contains("Al") => Some(([1.654, 0.880, 0.521], [9.224, 6.270, 4.837])),
-        Some(s) if s.contains("CuZn") => Some(([0.445, 0.582, 1.100], [3.600, 2.600, 1.900])),
-        _ => None,
+/// Linearly interpolate interleaved [wavelength, value, ...] spectrum at a target wavelength.
+fn sample_spectrum_at(data: &[f64], wavelength: f64) -> f64 {
+    let n = data.len() / 2;
+    if n == 0 {
+        return 0.0;
     }
+    if n == 1 {
+        return data[1];
+    }
+    // Clamp to range
+    if wavelength <= data[0] {
+        return data[1];
+    }
+    if wavelength >= data[(n - 1) * 2] {
+        return data[(n - 1) * 2 + 1];
+    }
+    // Find interval and lerp
+    for i in 0..n - 1 {
+        let w0 = data[i * 2];
+        let v0 = data[i * 2 + 1];
+        let w1 = data[(i + 1) * 2];
+        let v1 = data[(i + 1) * 2 + 1];
+        if wavelength >= w0 && wavelength <= w1 {
+            let t = (wavelength - w0) / (w1 - w0);
+            return v0 + t * (v1 - v0);
+        }
+    }
+    data[(n - 1) * 2 + 1]
+}
+
+/// Sample interleaved spectrum data at representative R/G/B wavelengths.
+fn sample_spectrum_rgb(data: &[f64]) -> [f32; 3] {
+    // Representative wavelengths: R=630nm, G=532nm, B=467nm
+    [
+        sample_spectrum_at(data, 630.0) as f32,
+        sample_spectrum_at(data, 532.0) as f32,
+        sample_spectrum_at(data, 467.0) as f32,
+    ]
+}
+
+/// RGB eta/k for named metal spectra (pre-computed from measured spectral data).
+fn named_metal_eta(name: &str) -> Option<[f32; 3]> {
+    if name.contains("Au") {
+        Some([0.143, 0.374, 1.442])
+    } else if name.contains("Ag") {
+        Some([0.050, 0.056, 0.047])
+    } else if name.contains("Cu") && !name.contains("CuZn") {
+        Some([0.271, 0.677, 1.316])
+    } else if name.contains("Al") {
+        Some([1.654, 0.880, 0.521])
+    } else if name.contains("CuZn") {
+        Some([0.445, 0.582, 1.100])
+    } else {
+        None
+    }
+}
+
+fn named_metal_k(name: &str) -> Option<[f32; 3]> {
+    if name.contains("Au") {
+        Some([3.983, 2.380, 1.603])
+    } else if name.contains("Ag") {
+        Some([4.484, 3.390, 2.440])
+    } else if name.contains("Cu") && !name.contains("CuZn") {
+        Some([3.610, 2.625, 2.292])
+    } else if name.contains("Al") {
+        Some([9.224, 6.270, 4.837])
+    } else if name.contains("CuZn") {
+        Some([3.600, 2.600, 1.900])
+    } else {
+        None
+    }
+}
+
+/// Parse conductor eta from ParamSet: supports "spectrum eta" (named or inline), "rgb eta", "float eta".
+fn parse_conductor_eta(p: &ParamSet) -> Option<[f32; 3]> {
+    // Named spectrum string
+    if let Some(s) = p.spectrum_string("eta") {
+        if let Some(v) = named_metal_eta(s) {
+            return Some(v);
+        }
+    }
+    // Inline spectrum data
+    if let Some(v) = p.spectrum_rgb("eta") {
+        return Some(v);
+    }
+    // RGB
+    if let Some(v) = p.rgb("eta") {
+        return Some(v);
+    }
+    // Single float → uniform across channels
+    if let Some(v) = p.float("eta") {
+        return Some([v, v, v]);
+    }
+    None
+}
+
+/// Parse conductor k from ParamSet: supports "spectrum k" (named or inline), "rgb k", "float k".
+fn parse_conductor_k(p: &ParamSet) -> Option<[f32; 3]> {
+    if let Some(s) = p.spectrum_string("k") {
+        if let Some(v) = named_metal_k(s) {
+            return Some(v);
+        }
+    }
+    if let Some(v) = p.spectrum_rgb("k") {
+        return Some(v);
+    }
+    if let Some(v) = p.rgb("k") {
+        return Some(v);
+    }
+    if let Some(v) = p.float("k") {
+        return Some([v, v, v]);
+    }
+    None
 }
 
 /// Compute normal-incidence reflectance from conductor eta/k.
@@ -698,10 +809,15 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                         current_material.material_type = MAT_CONDUCTOR;
                         if let Some(c) = p.rgb("reflectance") {
                             current_material.albedo = c;
-                        } else if let Some((eta, k)) = metal_ior_from_params(&p) {
+                        } else if let Some(eta) = parse_conductor_eta(&p) {
                             current_material.conductor_eta = eta;
-                            current_material.conductor_k = k;
-                            current_material.albedo = conductor_f0(&eta, &k);
+                            if let Some(k) = parse_conductor_k(&p) {
+                                current_material.conductor_k = k;
+                            }
+                            current_material.albedo = conductor_f0(
+                                &current_material.conductor_eta,
+                                &current_material.conductor_k,
+                            );
                         } else {
                             // Default: gold-like
                             current_material.conductor_eta = [0.143, 0.374, 1.442];
@@ -787,10 +903,12 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                         mat.material_type = MAT_CONDUCTOR;
                         if let Some(c) = p.rgb("reflectance") {
                             mat.albedo = c;
-                        } else if let Some((eta, k)) = metal_ior_from_params(&p) {
+                        } else if let Some(eta) = parse_conductor_eta(&p) {
                             mat.conductor_eta = eta;
-                            mat.conductor_k = k;
-                            mat.albedo = conductor_f0(&eta, &k);
+                            if let Some(k) = parse_conductor_k(&p) {
+                                mat.conductor_k = k;
+                            }
+                            mat.albedo = conductor_f0(&mat.conductor_eta, &mat.conductor_k);
                         } else {
                             mat.conductor_eta = [0.143, 0.374, 1.442];
                             mat.conductor_k = [3.983, 2.380, 1.603];
