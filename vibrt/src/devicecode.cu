@@ -288,34 +288,54 @@ static __forceinline__ __device__ float3 cosine_sample_hemisphere(float u1, floa
     );
 }
 
-// Anisotropic GGX microfacet sampling
-static __forceinline__ __device__ float3 ggx_sample_aniso(
-    float u1, float u2, float alpha_u, float alpha_v, float3 N)
+// GGX Visible Normal Distribution sampling (Heitz 2018)
+// Samples half-vectors proportional to D(H) * max(VdotH, 0), avoiding invisible microfacets.
+// V_world: view direction (toward camera), N: surface normal
+// Returns half-vector in world space
+static __forceinline__ __device__ float3 ggx_sample_vndf(
+    float u1, float u2, float3 V_world, float alpha_u, float alpha_v, float3 N)
 {
     float3 T, B;
     build_tangent_frame(N, T, B);
 
-    // Sample anisotropic GGX: stretch the distribution
-    float phi = atanf(alpha_v / alpha_u * tanf(2.0f * M_PIf * u1 + 0.5f * M_PIf));
-    if (u1 > 0.5f) phi += M_PIf;
-    float cos_phi = cosf(phi), sin_phi = sinf(phi);
-    float alpha2 = 1.0f / (cos_phi * cos_phi / (alpha_u * alpha_u)
-                          + sin_phi * sin_phi / (alpha_v * alpha_v));
-    float cos_theta = sqrtf((1.0f - u2) / (1.0f + (alpha2 - 1.0f) * u2));
-    float sin_theta = sqrtf(fmaxf(0.0f, 1.0f - cos_theta * cos_theta));
+    // Transform V to local frame (T=x, B=y, N=z)
+    float3 Vl = make_float3(dot3(V_world, T), dot3(V_world, B), dot3(V_world, N));
 
-    return normalize3(
-        T * (cos_phi * sin_theta) +
-        B * (sin_phi * sin_theta) +
-        N * cos_theta
-    );
+    // Transform to hemisphere configuration (stretch)
+    float3 Vh = normalize3(make_float3(alpha_u * Vl.x, alpha_v * Vl.y, Vl.z));
+
+    // Orthonormal basis around Vh
+    float lensq = Vh.x * Vh.x + Vh.y * Vh.y;
+    float3 T1 = lensq > 1e-7f
+        ? make_float3(-Vh.y, Vh.x, 0.0f) * (1.0f / sqrtf(lensq))
+        : make_float3(1.0f, 0.0f, 0.0f);
+    float3 T2 = cross3(Vh, T1);
+
+    // Sample point on disk and reproject
+    float r = sqrtf(u1);
+    float phi = 2.0f * M_PIf * u2;
+    float t1 = r * cosf(phi);
+    float t2 = r * sinf(phi);
+    float s = 0.5f * (1.0f + Vh.z);
+    t2 = (1.0f - s) * sqrtf(fmaxf(0.0f, 1.0f - t1 * t1)) + s * t2;
+
+    // Reproject onto hemisphere
+    float3 Nh = T1 * t1 + T2 * t2
+              + Vh * sqrtf(fmaxf(0.0f, 1.0f - t1 * t1 - t2 * t2));
+
+    // Transform back to ellipsoid configuration
+    float3 H_local = normalize3(make_float3(
+        alpha_u * Nh.x, alpha_v * Nh.y, fmaxf(0.0f, Nh.z)));
+
+    // Transform back to world space
+    return normalize3(T * H_local.x + B * H_local.y + N * H_local.z);
 }
 
-// Isotropic convenience wrapper
+// Isotropic convenience wrapper (still uses VNDF)
 static __forceinline__ __device__ float3 ggx_sample(
-    float u1, float u2, float alpha, float3 N)
+    float u1, float u2, float alpha, float3 V_world, float3 N)
 {
-    return ggx_sample_aniso(u1, u2, alpha, alpha, N);
+    return ggx_sample_vndf(u1, u2, V_world, alpha, alpha, N);
 }
 
 // Schlick Fresnel approximation (for coated surfaces, uses F0 = 0.04 for dielectric coat)
@@ -608,8 +628,8 @@ extern "C" __global__ void __raygen__rg()
                 float F = fresnel_schlick_f0(cos_i, 0.04f); // dielectric coat F0 ≈ 0.04
 
                 if (bounce_rng.next() < F) {
-                    // Specular reflection: sample GGX
-                    float3 H = ggx_sample(bounce_rng.next(), bounce_rng.next(), alpha, hit_normal);
+                    // Specular reflection: sample GGX VNDF
+                    float3 H = ggx_sample(bounce_rng.next(), bounce_rng.next(), alpha, view_dir, hit_normal);
                     direction = reflect3(direction, H);
                     if (dot3(direction, hit_normal) <= 0.0f) break;
                     origin = hit_pos;
@@ -642,8 +662,8 @@ extern "C" __global__ void __raygen__rg()
                     hit_pos, hit_normal, view_dir, hit_albedo, alpha_u, alpha_v, true,
                     cond_eta, cond_k, pixel_idx, s, depth);
 
-                // Specular bounce with Fresnel + energy compensation
-                float3 H = ggx_sample_aniso(bounce_rng.next(), bounce_rng.next(), alpha_u, alpha_v, hit_normal);
+                // Specular bounce: VNDF sampling with correct weight = F * G1(L)
+                float3 H = ggx_sample_vndf(bounce_rng.next(), bounce_rng.next(), view_dir, alpha_u, alpha_v, hit_normal);
                 float VdotH = fmaxf(dot3(view_dir, H), 0.001f);
                 float3 Fr;
                 bool has_ior = (cond_eta.x > 0 || cond_eta.y > 0 || cond_eta.z > 0 ||
@@ -655,21 +675,29 @@ extern "C" __global__ void __raygen__rg()
                 }
                 direction = reflect3(direction, H);
                 if (dot3(direction, hit_normal) <= 0.0f) break;
+                float NdotL = dot3(direction, hit_normal);
+                if (NdotL <= 0.0f) break;
                 origin = hit_pos;
-                // Energy compensation: scale throughput to recover multi-scatter energy
+                // VNDF weight = F * G1(L); plus Kulla-Conty energy compensation
+                float G1_L;
+                if (alpha_u == alpha_v) {
+                    G1_L = ggx_G1(NdotL, alpha_u);
+                } else {
+                    float3 T, B;
+                    build_tangent_frame(hit_normal, T, B);
+                    G1_L = ggx_G1_aniso(direction, hit_normal, T, B, alpha_u, alpha_v);
+                }
                 float alpha_avg = 0.5f * (alpha_u + alpha_v);
                 float NdotV = fmaxf(dot3(view_dir, hit_normal), 0.001f);
                 float E_o = ggx_E(NdotV, alpha_avg);
-                float E_a = ggx_E_avg(alpha_avg);
                 float3 F_a = conductor_F_avg(hit_albedo, cond_eta, cond_k);
-                // Scale: F * (1 + F_avg * (1 - E_o) / E_o)
-                float ms_scale = (E_o > 0.001f) ? (1.0f + (1.0f - E_o) / E_o * (E_a > 0.001f ? E_a : 0.001f)) : 1.0f;
-                throughput = throughput * (Fr + F_a * fmaxf(ms_scale - 1.0f, 0.0f));
+                float ms_boost = (E_o > 0.001f) ? (1.0f - E_o) / E_o : 0.0f;
+                throughput = throughput * (Fr * G1_L + F_a * fmaxf(ms_boost * G1_L, 0.0f));
                 specular_bounce = true;
             }
             else if (mat_type == MAT_COATED_CONDUCTOR) {
-                // Dielectric coating over conductor substrate
-                float hit_roughness_u = __uint_as_float(p13); // conductor roughness
+                // Dielectric coating over conductor substrate with inter-layer scattering
+                float hit_roughness_u = __uint_as_float(p13);
                 float hit_roughness_v = __uint_as_float(p22);
                 float coat_rough = __uint_as_float(p20);
                 float coat_eta_val = __uint_as_float(p21);
@@ -689,25 +717,47 @@ extern "C" __global__ void __raygen__rg()
                 float coat_F = fresnel_schlick_f0(cos_i, coat_F0);
 
                 if (bounce_rng.next() < coat_F) {
-                    // Reflected by coating: sample GGX with coating roughness (isotropic)
-                    float3 H = ggx_sample(bounce_rng.next(), bounce_rng.next(), coat_alpha, hit_normal);
+                    // Reflected by coating: VNDF sample
+                    float3 H = ggx_sample(bounce_rng.next(), bounce_rng.next(), coat_alpha, view_dir, hit_normal);
                     direction = reflect3(direction, H);
                     if (dot3(direction, hit_normal) <= 0.0f) break;
                     origin = hit_pos;
                     specular_bounce = true;
                 } else {
-                    // Transmitted through coating: hit conductor underneath
-                    // NEE with conductor BRDF (anisotropic)
-                    radiance = radiance + throughput * compute_nee(
+                    // Transmitted through coating → conductor
+                    // Conductor Fresnel (average for multi-scatter factor)
+                    bool has_ior = (cond_eta.x > 0 || cond_eta.y > 0 || cond_eta.z > 0 ||
+                                    cond_k.x > 0 || cond_k.y > 0 || cond_k.z > 0);
+
+                    // Multi-layer scattering: analytical geometric series
+                    // After transmitting coating, light bounces between conductor and
+                    // coating inner surface. The total throughput factor is:
+                    //   T_coat * Fr_cond * T_coat_inner / (1 - R_coat_inner * Fr_cond_avg)
+                    // where T_coat = (1 - coat_F), T_coat_inner = (1 - coat_F_inner),
+                    //       R_coat_inner = coat_F_inner
+                    float coat_F_inner = coat_F; // same Fresnel at same angle (approximation)
+                    float3 Fr_avg;
+                    if (has_ior) {
+                        Fr_avg = conductor_F_avg(hit_albedo, cond_eta, cond_k);
+                    } else {
+                        Fr_avg = hit_albedo + (make_float3(1,1,1) - hit_albedo) * (1.0f / 21.0f);
+                    }
+                    // Geometric series: 1 / (1 - R_inner * Fr_avg)
+                    float3 ms_factor = make_float3(
+                        1.0f / fmaxf(1.0f - coat_F_inner * Fr_avg.x, 0.01f),
+                        1.0f / fmaxf(1.0f - coat_F_inner * Fr_avg.y, 0.01f),
+                        1.0f / fmaxf(1.0f - coat_F_inner * Fr_avg.z, 0.01f));
+                    float3 coat_throughput = ms_factor * (1.0f - coat_F_inner);
+
+                    // NEE with conductor BRDF, scaled by coating transmission
+                    radiance = radiance + throughput * coat_throughput * compute_nee(
                         hit_pos, hit_normal, view_dir, hit_albedo, cond_alpha_u, cond_alpha_v, true,
                         cond_eta, cond_k, pixel_idx, s, depth);
 
-                    // Specular bounce off conductor with energy compensation
-                    float3 H = ggx_sample_aniso(bounce_rng.next(), bounce_rng.next(), cond_alpha_u, cond_alpha_v, hit_normal);
+                    // Specular bounce off conductor: VNDF with weight = F * G1(L)
+                    float3 H = ggx_sample_vndf(bounce_rng.next(), bounce_rng.next(), view_dir, cond_alpha_u, cond_alpha_v, hit_normal);
                     float VdotH = fmaxf(dot3(view_dir, H), 0.001f);
                     float3 Fr;
-                    bool has_ior = (cond_eta.x > 0 || cond_eta.y > 0 || cond_eta.z > 0 ||
-                                    cond_k.x > 0 || cond_k.y > 0 || cond_k.z > 0);
                     if (has_ior) {
                         Fr = conductor_fresnel(VdotH, cond_eta, cond_k);
                     } else {
@@ -715,14 +765,19 @@ extern "C" __global__ void __raygen__rg()
                     }
                     direction = reflect3(direction, H);
                     if (dot3(direction, hit_normal) <= 0.0f) break;
+                    float NdotL = dot3(direction, hit_normal);
+                    if (NdotL <= 0.0f) break;
                     origin = hit_pos;
-                    float ca = 0.5f * (cond_alpha_u + cond_alpha_v);
-                    float NdV = fmaxf(dot3(view_dir, hit_normal), 0.001f);
-                    float Eo = ggx_E(NdV, ca);
-                    float Ea = ggx_E_avg(ca);
-                    float3 Fa = conductor_F_avg(hit_albedo, cond_eta, cond_k);
-                    float ms_s = (Eo > 0.001f) ? (1.0f + (1.0f - Eo) / Eo * (Ea > 0.001f ? Ea : 0.001f)) : 1.0f;
-                    throughput = throughput * (Fr + Fa * fmaxf(ms_s - 1.0f, 0.0f));
+
+                    float G1_L;
+                    if (cond_alpha_u == cond_alpha_v) {
+                        G1_L = ggx_G1(NdotL, cond_alpha_u);
+                    } else {
+                        float3 T, B;
+                        build_tangent_frame(hit_normal, T, B);
+                        G1_L = ggx_G1_aniso(direction, hit_normal, T, B, cond_alpha_u, cond_alpha_v);
+                    }
+                    throughput = throughput * coat_throughput * Fr * G1_L;
                     specular_bounce = true;
                 }
             }
