@@ -788,7 +788,7 @@ extern "C" __global__ void __raygen__rg()
             }
             else if (mat_type == MAT_COATED_DIFFUSE) {
                 float hit_roughness = __uint_as_float(p13);
-                float alpha = fmaxf(hit_roughness * hit_roughness, 0.001f);
+                float alpha = fmaxf(hit_roughness, 0.001f);
                 RNG bounce_rng(pixel_idx, s, depth + 1);
                 float3 view_dir = direction * (-1.0f);
 
@@ -822,8 +822,8 @@ extern "C" __global__ void __raygen__rg()
             else if (mat_type == MAT_CONDUCTOR) {
                 float hit_roughness_u = __uint_as_float(p13);
                 float hit_roughness_v = __uint_as_float(p22);
-                float alpha_u = fmaxf(hit_roughness_u * hit_roughness_u, 0.001f);
-                float alpha_v = fmaxf(hit_roughness_v * hit_roughness_v, 0.001f);
+                float alpha_u = fmaxf(hit_roughness_u, 0.001f);
+                float alpha_v = fmaxf(hit_roughness_v, 0.001f);
                 RNG bounce_rng(pixel_idx, s, depth + 1);
                 float3 view_dir = direction * (-1.0f);
 
@@ -874,9 +874,9 @@ extern "C" __global__ void __raygen__rg()
                 float hit_roughness_v = __uint_as_float(p22);
                 float coat_rough = __uint_as_float(p20);
                 float coat_eta_val = __uint_as_float(p21);
-                float coat_alpha = fmaxf(coat_rough * coat_rough, 0.001f);
-                float cond_alpha_u = fmaxf(hit_roughness_u * hit_roughness_u, 0.001f);
-                float cond_alpha_v = fmaxf(hit_roughness_v * hit_roughness_v, 0.001f);
+                float coat_alpha = fmaxf(coat_rough, 0.001f);
+                float cond_alpha_u = fmaxf(hit_roughness_u, 0.001f);
+                float cond_alpha_v = fmaxf(hit_roughness_v, 0.001f);
                 RNG bounce_rng(pixel_idx, s, depth + 1);
                 float3 view_dir = direction * (-1.0f);
 

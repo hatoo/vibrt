@@ -176,6 +176,17 @@ impl<'a> ParamSet<'a> {
             })
     }
 
+    fn bool(&self, name: &str) -> Option<bool> {
+        self.mark(name);
+        self.params
+            .iter()
+            .find(|p| p.name == name && p.ty == ParamType::Bool)
+            .and_then(|p| match &p.value {
+                ParamValue::Bools(v) => v.first().copied(),
+                _ => None,
+            })
+    }
+
     fn rgb(&self, name: &str) -> Option<[f32; 3]> {
         self.mark(name);
         self.params
@@ -413,7 +424,10 @@ fn conductor_f0(eta: &[f32; 3], k: &[f32; 3]) -> [f32; 3] {
 
 /// Parse uroughness/vroughness into (roughness_u, roughness_v).
 /// If only "roughness" is given, both are the same (isotropic).
-fn parse_roughness(p: &ParamSet, prefix: &str) -> (f32, f32) {
+/// Parse roughness and apply PBRT's RoughnessToAlpha mapping.
+/// When remap=true (PBRT default): alpha = sqrt(roughness)
+/// When remap=false: alpha = roughness (used directly as GGX alpha)
+fn parse_roughness(p: &ParamSet, prefix: &str, remap: bool) -> (f32, f32) {
     let u_key = if prefix.is_empty() {
         "uroughness".to_string()
     } else {
@@ -434,12 +448,18 @@ fn parse_roughness(p: &ParamSet, prefix: &str) -> (f32, f32) {
     let v = p.float(&v_key);
     let r = p.float(&r_key);
 
-    match (u, v, r) {
+    let (ru, rv) = match (u, v, r) {
         (Some(u), Some(v), _) => (u, v),
         (Some(u), None, _) => (u, u),
         (None, Some(v), _) => (v, v),
         (None, None, Some(r)) => (r, r),
         _ => (0.0, 0.0),
+    };
+
+    if remap {
+        (ru.sqrt(), rv.sqrt())
+    } else {
+        (ru, rv)
     }
 }
 
@@ -998,7 +1018,8 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                                 }
                             }
                         }
-                        let (ru, rv) = parse_roughness(&p, "");
+                        let remap = p.bool("remaproughness").unwrap_or(true);
+                        let (ru, rv) = parse_roughness(&p, "", remap);
                         current_material.roughness = ru;
                         current_material.roughness_v = rv;
                         current_material.coat_eta = p.float("eta").unwrap_or(1.5);
@@ -1030,14 +1051,16 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                                 &current_material.conductor_k,
                             );
                         }
+                        let remap = p.bool("remaproughness").unwrap_or(true);
                         if is_coated {
-                            let (ru, rv) = parse_roughness(&p, "conductor");
+                            let (ru, rv) = parse_roughness(&p, "conductor", remap);
                             current_material.roughness = ru;
                             current_material.roughness_v = rv;
-                            current_material.coat_roughness = parse_roughness(&p, "interface").0;
+                            current_material.coat_roughness =
+                                parse_roughness(&p, "interface", remap).0;
                             current_material.coat_eta = p.float("interface.eta").unwrap_or(1.5);
                         } else {
-                            let (ru, rv) = parse_roughness(&p, "");
+                            let (ru, rv) = parse_roughness(&p, "", remap);
                             current_material.roughness = ru;
                             current_material.roughness_v = rv;
                         }
@@ -1101,7 +1124,8 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                         if let Some(c) = p.rgb("reflectance") {
                             mat.albedo = c;
                         }
-                        let (ru, rv) = parse_roughness(&p, "");
+                        let remap = p.bool("remaproughness").unwrap_or(true);
+                        let (ru, rv) = parse_roughness(&p, "", remap);
                         mat.roughness = ru;
                         mat.roughness_v = rv;
                         mat.coat_eta = p.float("eta").unwrap_or(1.5);
@@ -1131,14 +1155,15 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                             mat.conductor_k = [3.983, 2.380, 1.603];
                             mat.albedo = conductor_f0(&mat.conductor_eta, &mat.conductor_k);
                         }
+                        let remap = p.bool("remaproughness").unwrap_or(true);
                         if is_coated {
-                            let (ru, rv) = parse_roughness(&p, "conductor");
+                            let (ru, rv) = parse_roughness(&p, "conductor", remap);
                             mat.roughness = ru;
                             mat.roughness_v = rv;
-                            mat.coat_roughness = parse_roughness(&p, "interface").0;
+                            mat.coat_roughness = parse_roughness(&p, "interface", remap).0;
                             mat.coat_eta = p.float("interface.eta").unwrap_or(1.5);
                         } else {
-                            let (ru, rv) = parse_roughness(&p, "");
+                            let (ru, rv) = parse_roughness(&p, "", remap);
                             mat.roughness = ru;
                             mat.roughness_v = rv;
                         }
