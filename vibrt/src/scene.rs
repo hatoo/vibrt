@@ -955,6 +955,7 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                         let (ru, rv) = parse_roughness(&p, "");
                         current_material.roughness = ru;
                         current_material.roughness_v = rv;
+                        current_material.coat_eta = p.float("eta").unwrap_or(1.5);
                     }
                     "conductor" | "coatedconductor" => {
                         let is_coated = ty == "coatedconductor";
@@ -1055,6 +1056,7 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                         let (ru, rv) = parse_roughness(&p, "");
                         mat.roughness = ru;
                         mat.roughness_v = rv;
+                        mat.coat_eta = p.float("eta").unwrap_or(1.5);
                         if let Some(tex_name) = p.texture_ref("reflectance") {
                             if let Some(SceneTexture::Image(img)) = textures.get(tex_name) {
                                 mat.texture = Some(img.clone());
@@ -1110,6 +1112,38 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                                     }
                                 }
                             }
+                        }
+                    }
+                    "measured" => {
+                        let filename = p.string("filename").unwrap_or("");
+                        let bsdf_path = scene_dir.join(filename);
+                        if let Some(approx) = crate::bsdf::load_and_approximate(&bsdf_path) {
+                            mat.albedo = approx.albedo;
+                            mat.roughness = approx.roughness;
+                            if approx.is_metallic {
+                                mat.material_type = MAT_CONDUCTOR;
+                                mat.conductor_eta = approx.eta;
+                                mat.conductor_k = approx.k;
+                            } else {
+                                mat.material_type = MAT_COATED_DIFFUSE;
+                                mat.coat_eta = 1.5;
+                            }
+                            eprintln!(
+                                "  Loaded measured BSDF: {} → {} (albedo=[{:.2},{:.2},{:.2}], roughness={:.2})",
+                                filename,
+                                if approx.is_metallic { "conductor" } else { "coateddiffuse" },
+                                approx.albedo[0], approx.albedo[1], approx.albedo[2],
+                                approx.roughness,
+                            );
+                        } else {
+                            // Fallback: coated diffuse
+                            mat.material_type = MAT_COATED_DIFFUSE;
+                            mat.coat_eta = 1.5;
+                            mat.roughness = 0.1;
+                            eprintln!(
+                                "  warning: failed to load measured BSDF: {}, using fallback",
+                                filename,
+                            );
                         }
                     }
                     _ => {

@@ -1,5 +1,6 @@
 #![allow(clippy::missing_transmute_annotations)]
 
+mod bsdf;
 mod gpu_types;
 mod ply;
 mod scene;

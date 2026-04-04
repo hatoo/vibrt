@@ -683,9 +683,13 @@ extern "C" __global__ void __raygen__rg()
                 RNG bounce_rng(pixel_idx, s, depth + 1);
                 float3 view_dir = direction * (-1.0f);
 
-                // Fresnel determines specular vs diffuse probability
+                // Fresnel from coat IOR
+                float coat_eta_val = __uint_as_float(p21);
+                if (coat_eta_val == 0.0f) coat_eta_val = 1.5f;
+                float coat_F0 = (coat_eta_val - 1.0f) * (coat_eta_val - 1.0f)
+                              / ((coat_eta_val + 1.0f) * (coat_eta_val + 1.0f));
                 float cos_i = fmaxf(fabsf(dot3(view_dir, hit_normal)), 0.001f);
-                float F = fresnel_schlick_f0(cos_i, 0.04f); // dielectric coat F0 ≈ 0.04
+                float F = fresnel_schlick_f0(cos_i, coat_F0);
 
                 if (bounce_rng.next() < F) {
                     // Specular reflection: sample GGX VNDF
@@ -1181,7 +1185,7 @@ extern "C" __global__ void __closesthit__ch()
         optixSetPayload_18(__float_as_uint(data->conductor.k[1]));
         optixSetPayload_19(__float_as_uint(data->conductor.k[2]));
     }
-    if (data->material_type == MAT_COATED_CONDUCTOR) {
+    if (data->material_type == MAT_COATED_CONDUCTOR || data->material_type == MAT_COATED_DIFFUSE) {
         optixSetPayload_20(__float_as_uint(data->coat_roughness));
         optixSetPayload_21(__float_as_uint(data->coat_eta));
     }
@@ -1248,7 +1252,7 @@ extern "C" __global__ void __closesthit__sphere()
         optixSetPayload_18(__float_as_uint(data->conductor.k[1]));
         optixSetPayload_19(__float_as_uint(data->conductor.k[2]));
     }
-    if (data->material_type == MAT_COATED_CONDUCTOR) {
+    if (data->material_type == MAT_COATED_CONDUCTOR || data->material_type == MAT_COATED_DIFFUSE) {
         optixSetPayload_20(__float_as_uint(data->coat_roughness));
         optixSetPayload_21(__float_as_uint(data->coat_eta));
     }
