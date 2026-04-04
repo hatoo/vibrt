@@ -687,6 +687,114 @@ static __forceinline__ __device__ float3 compute_nee(
          + nee_envmap(hit_pos, hit_normal, V, albedo, alpha_u, alpha_v, is_conductor, eta, k, geom_tangent, pixel_idx, sample_idx, depth);
 }
 
+// ---- Shared material helpers for raygen ----
+
+static __forceinline__ __device__ float coat_fresnel_f0(float eta)
+{
+    return (eta - 1.0f) * (eta - 1.0f) / ((eta + 1.0f) * (eta + 1.0f));
+}
+
+static __forceinline__ __device__ bool has_complex_ior(float3 eta, float3 k)
+{
+    return (eta.x > 0 || eta.y > 0 || eta.z > 0 ||
+            k.x > 0 || k.y > 0 || k.z > 0);
+}
+
+static __forceinline__ __device__ float3 compute_conductor_fresnel_rgb(
+    float cos_i, float3 albedo, float3 eta, float3 k)
+{
+    if (has_complex_ior(eta, k))
+        return conductor_fresnel(cos_i, eta, k);
+    else
+        return schlick_fresnel_f0_rgb(cos_i, albedo);
+}
+
+// Shared conductor specular bounce with VNDF + G1(L) + energy compensation.
+// Returns false if the bounce is invalid (below horizon).
+static __forceinline__ __device__ bool conductor_specular_bounce(
+    float u1, float u2, float3 view_dir,
+    float alpha_u, float alpha_v, float3 hit_normal, float3 hit_tangent,
+    float3 hit_albedo, float3 cond_eta, float3 cond_k,
+    float3& out_direction, float3& throughput_factor)
+{
+    float3 H = ggx_sample_vndf(u1, u2, view_dir, alpha_u, alpha_v, hit_normal, hit_tangent);
+    float VdotH = fmaxf(dot3(view_dir, H), 0.001f);
+    float3 Fr = compute_conductor_fresnel_rgb(VdotH, hit_albedo, cond_eta, cond_k);
+
+    out_direction = reflect3(view_dir * (-1.0f), H);
+    float NdotL = dot3(out_direction, hit_normal);
+    if (NdotL <= 0.0f) return false;
+
+    // VNDF weight = F * G1(L)
+    float G1_L;
+    if (alpha_u == alpha_v) {
+        G1_L = ggx_G1(NdotL, alpha_u);
+    } else {
+        float3 T, B;
+        build_tangent_frame_geom(hit_normal, hit_tangent, T, B);
+        G1_L = ggx_G1_aniso(out_direction, hit_normal, T, B, alpha_u, alpha_v);
+    }
+
+    // Kulla-Conty energy compensation
+    float alpha_avg = 0.5f * (alpha_u + alpha_v);
+    float NdotV = fmaxf(dot3(view_dir, hit_normal), 0.001f);
+    float E_o = ggx_E(NdotV, alpha_avg);
+    float3 F_a = conductor_F_avg(hit_albedo, cond_eta, cond_k);
+    float ms_boost = (E_o > 0.001f) ? (1.0f - E_o) / E_o : 0.0f;
+    throughput_factor = Fr * G1_L + F_a * fmaxf(ms_boost * G1_L, 0.0f);
+    return true;
+}
+
+// Set material-independent payloads from closesthit data
+static __forceinline__ __device__ void set_common_payloads(
+    const HitGroupData* data, float3 hit_pos, float3 normal, float3 albedo,
+    float roughness, float roughness_v, float3 tangent)
+{
+    if (data->material_type == MAT_DIELECTRIC) {
+        optixSetPayload_0(__float_as_uint(data->dielectric.eta));
+        optixSetPayload_1(__float_as_uint(data->dielectric.tint[0]));
+        optixSetPayload_2(__float_as_uint(data->dielectric.tint[1]));
+        optixSetPayload_13(__float_as_uint(data->dielectric.tint[2]));
+    } else {
+        optixSetPayload_0(__float_as_uint(albedo.x));
+        optixSetPayload_1(__float_as_uint(albedo.y));
+        optixSetPayload_2(__float_as_uint(albedo.z));
+        optixSetPayload_13(__float_as_uint(roughness));
+    }
+
+    optixSetPayload_3(__float_as_uint(hit_pos.x));
+    optixSetPayload_4(__float_as_uint(hit_pos.y));
+    optixSetPayload_5(__float_as_uint(hit_pos.z));
+    optixSetPayload_6(__float_as_uint(normal.x));
+    optixSetPayload_7(__float_as_uint(normal.y));
+    optixSetPayload_8(__float_as_uint(normal.z));
+    optixSetPayload_9((unsigned int)data->material_type);
+    optixSetPayload_10(__float_as_uint(data->emission[0]));
+    optixSetPayload_11(__float_as_uint(data->emission[1]));
+    optixSetPayload_12(__float_as_uint(data->emission[2]));
+
+    float rv = roughness_v;
+    if (rv == 0.0f) rv = roughness;
+    optixSetPayload_22(__float_as_uint(rv));
+
+    if (data->material_type == MAT_CONDUCTOR || data->material_type == MAT_COATED_CONDUCTOR) {
+        optixSetPayload_14(__float_as_uint(data->conductor.eta[0]));
+        optixSetPayload_15(__float_as_uint(data->conductor.eta[1]));
+        optixSetPayload_16(__float_as_uint(data->conductor.eta[2]));
+        optixSetPayload_17(__float_as_uint(data->conductor.k[0]));
+        optixSetPayload_18(__float_as_uint(data->conductor.k[1]));
+        optixSetPayload_19(__float_as_uint(data->conductor.k[2]));
+    }
+    if (data->material_type == MAT_COATED_CONDUCTOR || data->material_type == MAT_COATED_DIFFUSE) {
+        optixSetPayload_20(__float_as_uint(data->coat_roughness));
+        optixSetPayload_21(__float_as_uint(data->coat_eta));
+    }
+
+    optixSetPayload_23(__float_as_uint(tangent.x));
+    optixSetPayload_24(__float_as_uint(tangent.y));
+    optixSetPayload_25(__float_as_uint(tangent.z));
+}
+
 // ---- Pack/unpack color ----
 
 static __forceinline__ __device__ unsigned int packColor(float3 c) {
@@ -773,46 +881,36 @@ extern "C" __global__ void __raygen__rg()
 
             float3 zero3 = make_float3(0, 0, 0);
 
+            // Common setup
+            float3 view_dir = direction * (-1.0f);
+            RNG bounce_rng(pixel_idx, s, depth + 1);
+
             if (mat_type == MAT_DIFFUSE) {
-                float3 view_dir = direction * (-1.0f);
                 radiance = radiance + throughput * compute_nee(
                     hit_pos, hit_normal, view_dir, hit_albedo, 0, 0, false,
                     zero3, zero3, zero3, pixel_idx, s, depth);
-
-                // Indirect: cosine-weighted bounce
-                RNG bounce_rng(pixel_idx, s, depth + 1);
                 direction = cosine_sample_hemisphere(bounce_rng.next(), bounce_rng.next(), hit_normal);
                 origin = hit_pos;
                 throughput = throughput * hit_albedo;
                 specular_bounce = false;
             }
             else if (mat_type == MAT_COATED_DIFFUSE) {
-                float hit_roughness = __uint_as_float(p13);
-                float alpha = fmaxf(hit_roughness, 0.001f);
-                RNG bounce_rng(pixel_idx, s, depth + 1);
-                float3 view_dir = direction * (-1.0f);
-
-                // Fresnel from coat IOR
-                float coat_eta_val = __uint_as_float(p21);
-                if (coat_eta_val == 0.0f) coat_eta_val = 1.5f;
-                float coat_F0 = (coat_eta_val - 1.0f) * (coat_eta_val - 1.0f)
-                              / ((coat_eta_val + 1.0f) * (coat_eta_val + 1.0f));
+                float alpha = fmaxf(__uint_as_float(p13), 0.001f);
+                float ceta = __uint_as_float(p21);
+                if (ceta == 0.0f) ceta = 1.5f;
                 float cos_i = fmaxf(fabsf(dot3(view_dir, hit_normal)), 0.001f);
-                float F = fresnel_schlick_f0(cos_i, coat_F0);
+                float F = fresnel_schlick_f0(cos_i, coat_fresnel_f0(ceta));
 
                 if (bounce_rng.next() < F) {
-                    // Specular reflection: sample GGX VNDF
                     float3 H = ggx_sample(bounce_rng.next(), bounce_rng.next(), alpha, view_dir, hit_normal);
                     direction = reflect3(direction, H);
                     if (dot3(direction, hit_normal) <= 0.0f) break;
                     origin = hit_pos;
                     specular_bounce = true;
                 } else {
-                    // Diffuse path with NEE
                     radiance = radiance + throughput * compute_nee(
                         hit_pos, hit_normal, view_dir, hit_albedo, 0, 0, false,
                         zero3, zero3, zero3, pixel_idx, s, depth);
-
                     direction = cosine_sample_hemisphere(bounce_rng.next(), bounce_rng.next(), hit_normal);
                     origin = hit_pos;
                     throughput = throughput * hit_albedo;
@@ -820,137 +918,67 @@ extern "C" __global__ void __raygen__rg()
                 }
             }
             else if (mat_type == MAT_CONDUCTOR) {
-                float hit_roughness_u = __uint_as_float(p13);
-                float hit_roughness_v = __uint_as_float(p22);
-                float alpha_u = fmaxf(hit_roughness_u, 0.001f);
-                float alpha_v = fmaxf(hit_roughness_v, 0.001f);
-                RNG bounce_rng(pixel_idx, s, depth + 1);
-                float3 view_dir = direction * (-1.0f);
-
+                float alpha_u = fmaxf(__uint_as_float(p13), 0.001f);
+                float alpha_v = fmaxf(__uint_as_float(p22), 0.001f);
                 float3 cond_eta = make_float3(__uint_as_float(p14), __uint_as_float(p15), __uint_as_float(p16));
                 float3 cond_k = make_float3(__uint_as_float(p17), __uint_as_float(p18), __uint_as_float(p19));
 
-                // NEE for conductor
                 radiance = radiance + throughput * compute_nee(
                     hit_pos, hit_normal, view_dir, hit_albedo, alpha_u, alpha_v, true,
                     cond_eta, cond_k, hit_tangent, pixel_idx, s, depth);
 
-                // Specular bounce: VNDF sampling with correct weight = F * G1(L)
-                float3 H = ggx_sample_vndf(bounce_rng.next(), bounce_rng.next(), view_dir, alpha_u, alpha_v, hit_normal, hit_tangent);
-                float VdotH = fmaxf(dot3(view_dir, H), 0.001f);
-                float3 Fr;
-                bool has_ior = (cond_eta.x > 0 || cond_eta.y > 0 || cond_eta.z > 0 ||
-                                cond_k.x > 0 || cond_k.y > 0 || cond_k.z > 0);
-                if (has_ior) {
-                    Fr = conductor_fresnel(VdotH, cond_eta, cond_k);
-                } else {
-                    Fr = schlick_fresnel_f0_rgb(VdotH, hit_albedo);
-                }
-                direction = reflect3(direction, H);
-                if (dot3(direction, hit_normal) <= 0.0f) break;
-                float NdotL = dot3(direction, hit_normal);
-                if (NdotL <= 0.0f) break;
+                float3 bounce_dir, bounce_weight;
+                if (!conductor_specular_bounce(
+                        bounce_rng.next(), bounce_rng.next(), view_dir,
+                        alpha_u, alpha_v, hit_normal, hit_tangent,
+                        hit_albedo, cond_eta, cond_k,
+                        bounce_dir, bounce_weight))
+                    break;
+                direction = bounce_dir;
                 origin = hit_pos;
-                // VNDF weight = F * G1(L); plus Kulla-Conty energy compensation
-                float G1_L;
-                if (alpha_u == alpha_v) {
-                    G1_L = ggx_G1(NdotL, alpha_u);
-                } else {
-                    float3 T, B;
-                    build_tangent_frame_geom(hit_normal, hit_tangent, T, B);
-                    G1_L = ggx_G1_aniso(direction, hit_normal, T, B, alpha_u, alpha_v);
-                }
-                float alpha_avg = 0.5f * (alpha_u + alpha_v);
-                float NdotV = fmaxf(dot3(view_dir, hit_normal), 0.001f);
-                float E_o = ggx_E(NdotV, alpha_avg);
-                float3 F_a = conductor_F_avg(hit_albedo, cond_eta, cond_k);
-                float ms_boost = (E_o > 0.001f) ? (1.0f - E_o) / E_o : 0.0f;
-                throughput = throughput * (Fr * G1_L + F_a * fmaxf(ms_boost * G1_L, 0.0f));
+                throughput = throughput * bounce_weight;
                 specular_bounce = true;
             }
             else if (mat_type == MAT_COATED_CONDUCTOR) {
-                // Dielectric coating over conductor substrate with inter-layer scattering
-                float hit_roughness_u = __uint_as_float(p13);
-                float hit_roughness_v = __uint_as_float(p22);
-                float coat_rough = __uint_as_float(p20);
+                float cond_alpha_u = fmaxf(__uint_as_float(p13), 0.001f);
+                float cond_alpha_v = fmaxf(__uint_as_float(p22), 0.001f);
+                float coat_alpha = fmaxf(__uint_as_float(p20), 0.001f);
                 float coat_eta_val = __uint_as_float(p21);
-                float coat_alpha = fmaxf(coat_rough, 0.001f);
-                float cond_alpha_u = fmaxf(hit_roughness_u, 0.001f);
-                float cond_alpha_v = fmaxf(hit_roughness_v, 0.001f);
-                RNG bounce_rng(pixel_idx, s, depth + 1);
-                float3 view_dir = direction * (-1.0f);
-
                 float3 cond_eta = make_float3(__uint_as_float(p14), __uint_as_float(p15), __uint_as_float(p16));
                 float3 cond_k = make_float3(__uint_as_float(p17), __uint_as_float(p18), __uint_as_float(p19));
 
-                // Coating Fresnel (dielectric)
                 float cos_i = fmaxf(fabsf(dot3(view_dir, hit_normal)), 0.001f);
-                float coat_F0 = (coat_eta_val - 1.0f) * (coat_eta_val - 1.0f)
-                              / ((coat_eta_val + 1.0f) * (coat_eta_val + 1.0f));
-                float coat_F = fresnel_schlick_f0(cos_i, coat_F0);
+                float coat_F = fresnel_schlick_f0(cos_i, coat_fresnel_f0(coat_eta_val));
 
                 if (bounce_rng.next() < coat_F) {
-                    // Reflected by coating: VNDF sample
                     float3 H = ggx_sample(bounce_rng.next(), bounce_rng.next(), coat_alpha, view_dir, hit_normal);
                     direction = reflect3(direction, H);
                     if (dot3(direction, hit_normal) <= 0.0f) break;
                     origin = hit_pos;
                     specular_bounce = true;
                 } else {
-                    // Transmitted through coating → conductor
-                    // Conductor Fresnel (average for multi-scatter factor)
-                    bool has_ior = (cond_eta.x > 0 || cond_eta.y > 0 || cond_eta.z > 0 ||
-                                    cond_k.x > 0 || cond_k.y > 0 || cond_k.z > 0);
+                    // Multi-layer scattering: geometric series for inter-layer bounces
+                    float coat_F_inner = coat_F;
+                    float3 Fr_avg = conductor_F_avg(hit_albedo, cond_eta, cond_k);
+                    float3 coat_tp = make_float3(
+                        (1.0f - coat_F_inner) / fmaxf(1.0f - coat_F_inner * Fr_avg.x, 0.01f),
+                        (1.0f - coat_F_inner) / fmaxf(1.0f - coat_F_inner * Fr_avg.y, 0.01f),
+                        (1.0f - coat_F_inner) / fmaxf(1.0f - coat_F_inner * Fr_avg.z, 0.01f));
 
-                    // Multi-layer scattering: analytical geometric series
-                    // After transmitting coating, light bounces between conductor and
-                    // coating inner surface. The total throughput factor is:
-                    //   T_coat * Fr_cond * T_coat_inner / (1 - R_coat_inner * Fr_cond_avg)
-                    // where T_coat = (1 - coat_F), T_coat_inner = (1 - coat_F_inner),
-                    //       R_coat_inner = coat_F_inner
-                    float coat_F_inner = coat_F; // same Fresnel at same angle (approximation)
-                    float3 Fr_avg;
-                    if (has_ior) {
-                        Fr_avg = conductor_F_avg(hit_albedo, cond_eta, cond_k);
-                    } else {
-                        Fr_avg = hit_albedo + (make_float3(1,1,1) - hit_albedo) * (1.0f / 21.0f);
-                    }
-                    // Geometric series: 1 / (1 - R_inner * Fr_avg)
-                    float3 ms_factor = make_float3(
-                        1.0f / fmaxf(1.0f - coat_F_inner * Fr_avg.x, 0.01f),
-                        1.0f / fmaxf(1.0f - coat_F_inner * Fr_avg.y, 0.01f),
-                        1.0f / fmaxf(1.0f - coat_F_inner * Fr_avg.z, 0.01f));
-                    float3 coat_throughput = ms_factor * (1.0f - coat_F_inner);
-
-                    // NEE with conductor BRDF, scaled by coating transmission
-                    radiance = radiance + throughput * coat_throughput * compute_nee(
+                    radiance = radiance + throughput * coat_tp * compute_nee(
                         hit_pos, hit_normal, view_dir, hit_albedo, cond_alpha_u, cond_alpha_v, true,
                         cond_eta, cond_k, hit_tangent, pixel_idx, s, depth);
 
-                    // Specular bounce off conductor: VNDF with weight = F * G1(L)
-                    float3 H = ggx_sample_vndf(bounce_rng.next(), bounce_rng.next(), view_dir, cond_alpha_u, cond_alpha_v, hit_normal, hit_tangent);
-                    float VdotH = fmaxf(dot3(view_dir, H), 0.001f);
-                    float3 Fr;
-                    if (has_ior) {
-                        Fr = conductor_fresnel(VdotH, cond_eta, cond_k);
-                    } else {
-                        Fr = schlick_fresnel_f0_rgb(VdotH, hit_albedo);
-                    }
-                    direction = reflect3(direction, H);
-                    if (dot3(direction, hit_normal) <= 0.0f) break;
-                    float NdotL = dot3(direction, hit_normal);
-                    if (NdotL <= 0.0f) break;
+                    float3 bounce_dir, bounce_weight;
+                    if (!conductor_specular_bounce(
+                            bounce_rng.next(), bounce_rng.next(), view_dir,
+                            cond_alpha_u, cond_alpha_v, hit_normal, hit_tangent,
+                            hit_albedo, cond_eta, cond_k,
+                            bounce_dir, bounce_weight))
+                        break;
+                    direction = bounce_dir;
                     origin = hit_pos;
-
-                    float G1_L;
-                    if (cond_alpha_u == cond_alpha_v) {
-                        G1_L = ggx_G1(NdotL, cond_alpha_u);
-                    } else {
-                        float3 T, B;
-                        build_tangent_frame_geom(hit_normal, hit_tangent, T, B);
-                        G1_L = ggx_G1_aniso(direction, hit_normal, T, B, cond_alpha_u, cond_alpha_v);
-                    }
-                    throughput = throughput * coat_throughput * Fr * G1_L;
+                    throughput = throughput * coat_tp * bounce_weight;
                     specular_bounce = true;
                 }
             }
@@ -1245,29 +1273,6 @@ extern "C" __global__ void __closesthit__ch()
         albedo = c00*(1-dx)*(1-dy) + c10*dx*(1-dy) + c01*(1-dx)*dy + c11*dx*dy;
     }
 
-    if (data->material_type == MAT_DIELECTRIC) {
-        optixSetPayload_0(__float_as_uint(data->dielectric.eta));
-        optixSetPayload_1(__float_as_uint(data->dielectric.tint[0]));
-        optixSetPayload_2(__float_as_uint(data->dielectric.tint[1]));
-        // Use payload 13 for tint.z (reuse roughness slot since dielectric doesn't use it)
-        optixSetPayload_13(__float_as_uint(data->dielectric.tint[2]));
-    } else {
-        optixSetPayload_0(__float_as_uint(albedo.x));
-        optixSetPayload_1(__float_as_uint(albedo.y));
-        optixSetPayload_2(__float_as_uint(albedo.z));
-    }
-
-    optixSetPayload_3(__float_as_uint(hit_pos.x));
-    optixSetPayload_4(__float_as_uint(hit_pos.y));
-    optixSetPayload_5(__float_as_uint(hit_pos.z));
-    optixSetPayload_6(__float_as_uint(shading_normal.x));
-    optixSetPayload_7(__float_as_uint(shading_normal.y));
-    optixSetPayload_8(__float_as_uint(shading_normal.z));
-    optixSetPayload_9((unsigned int)data->material_type);
-    optixSetPayload_10(__float_as_uint(data->emission[0]));
-    optixSetPayload_11(__float_as_uint(data->emission[1]));
-    optixSetPayload_12(__float_as_uint(data->emission[2]));
-
     // Roughness: sample from texture if available, otherwise use constant
     float roughness_val = data->roughness;
     if (data->roughness_data && data->texcoords) {
@@ -1278,98 +1283,28 @@ extern "C" __global__ void __closesthit__ch()
         int ry = max(0, min((int)((1.0f-rv) * (data->roughness_height-1)), data->roughness_height-1));
         roughness_val = data->roughness_data[ry * data->roughness_width + rx];
     }
-    optixSetPayload_13(__float_as_uint(roughness_val));
 
-    // Roughness V (payload 22) - for anisotropic GGX
-    float roughness_v_val = data->roughness_v;
-    if (roughness_v_val == 0.0f) roughness_v_val = roughness_val; // isotropic fallback
-    optixSetPayload_22(__float_as_uint(roughness_v_val));
-
-    // Conductor eta/k (payloads 14-19), coat params (payloads 20-21)
-    if (data->material_type == MAT_CONDUCTOR || data->material_type == MAT_COATED_CONDUCTOR) {
-        optixSetPayload_14(__float_as_uint(data->conductor.eta[0]));
-        optixSetPayload_15(__float_as_uint(data->conductor.eta[1]));
-        optixSetPayload_16(__float_as_uint(data->conductor.eta[2]));
-        optixSetPayload_17(__float_as_uint(data->conductor.k[0]));
-        optixSetPayload_18(__float_as_uint(data->conductor.k[1]));
-        optixSetPayload_19(__float_as_uint(data->conductor.k[2]));
-    }
-    if (data->material_type == MAT_COATED_CONDUCTOR || data->material_type == MAT_COATED_DIFFUSE) {
-        optixSetPayload_20(__float_as_uint(data->coat_roughness));
-        optixSetPayload_21(__float_as_uint(data->coat_eta));
-    }
-
-    // Geometry tangent (payloads 23-25) for anisotropic GGX alignment
-    optixSetPayload_23(__float_as_uint(geom_tangent.x));
-    optixSetPayload_24(__float_as_uint(geom_tangent.y));
-    optixSetPayload_25(__float_as_uint(geom_tangent.z));
+    set_common_payloads(data, hit_pos, shading_normal, albedo,
+                        roughness_val, data->roughness_v, geom_tangent);
 }
 
-// Closest hit for sphere (built-in intersection)
+// Closest hit for sphere
 extern "C" __global__ void __closesthit__sphere()
 {
     const HitGroupData* data = reinterpret_cast<const HitGroupData*>(optixGetSbtDataPointer());
-
     const float t = optixGetRayTmax();
     const float3 ray_orig = optixGetWorldRayOrigin();
     const float3 ray_dir = optixGetWorldRayDirection();
     float3 hit_pos = ray_orig + ray_dir * t;
 
-    // For a unit sphere at the object origin, the normal is the hit point in object space
-    // Use world-space hit position since sphere is at world origin in this simple case
-    // We get the object-space hit point from the transform
     float3 obj_hit = optixTransformPointFromWorldToObjectSpace(hit_pos);
-    float3 obj_normal = normalize3(obj_hit); // sphere normal = normalized position
+    float3 obj_normal = normalize3(obj_hit);
     float3 world_normal = normalize3(optixTransformNormalFromObjectToWorldSpace(obj_normal));
-
     if (dot3(world_normal, ray_dir) > 0.0f)
         world_normal = world_normal * (-1.0f);
 
-    if (data->material_type == MAT_DIELECTRIC) {
-        optixSetPayload_0(__float_as_uint(data->dielectric.eta));
-        optixSetPayload_1(__float_as_uint(data->dielectric.tint[0]));
-        optixSetPayload_2(__float_as_uint(data->dielectric.tint[1]));
-        // Use payload 13 for tint.z (reuse roughness slot since dielectric doesn't use it)
-        optixSetPayload_13(__float_as_uint(data->dielectric.tint[2]));
-    } else {
-        float3 albedo = make_f3(data->albedo);
-        optixSetPayload_0(__float_as_uint(albedo.x));
-        optixSetPayload_1(__float_as_uint(albedo.y));
-        optixSetPayload_2(__float_as_uint(albedo.z));
-    }
-
-    optixSetPayload_3(__float_as_uint(hit_pos.x));
-    optixSetPayload_4(__float_as_uint(hit_pos.y));
-    optixSetPayload_5(__float_as_uint(hit_pos.z));
-    optixSetPayload_6(__float_as_uint(world_normal.x));
-    optixSetPayload_7(__float_as_uint(world_normal.y));
-    optixSetPayload_8(__float_as_uint(world_normal.z));
-    optixSetPayload_9((unsigned int)data->material_type);
-    optixSetPayload_10(__float_as_uint(data->emission[0]));
-    optixSetPayload_11(__float_as_uint(data->emission[1]));
-    optixSetPayload_12(__float_as_uint(data->emission[2]));
-    optixSetPayload_13(__float_as_uint(data->roughness));
-    float rv = data->roughness_v;
-    if (rv == 0.0f) rv = data->roughness;
-    optixSetPayload_22(__float_as_uint(rv));
-
-    if (data->material_type == MAT_CONDUCTOR || data->material_type == MAT_COATED_CONDUCTOR) {
-        optixSetPayload_14(__float_as_uint(data->conductor.eta[0]));
-        optixSetPayload_15(__float_as_uint(data->conductor.eta[1]));
-        optixSetPayload_16(__float_as_uint(data->conductor.eta[2]));
-        optixSetPayload_17(__float_as_uint(data->conductor.k[0]));
-        optixSetPayload_18(__float_as_uint(data->conductor.k[1]));
-        optixSetPayload_19(__float_as_uint(data->conductor.k[2]));
-    }
-    if (data->material_type == MAT_COATED_CONDUCTOR || data->material_type == MAT_COATED_DIFFUSE) {
-        optixSetPayload_20(__float_as_uint(data->coat_roughness));
-        optixSetPayload_21(__float_as_uint(data->coat_eta));
-    }
-
-    // Sphere has no UV tangent — use zero (arbitrary frame fallback)
-    optixSetPayload_23(0);
-    optixSetPayload_24(0);
-    optixSetPayload_25(0);
+    set_common_payloads(data, hit_pos, world_normal, make_f3(data->albedo),
+                        data->roughness, data->roughness_v, make_float3(0, 0, 0));
 }
 
 // Any-hit program for alpha cutout
