@@ -104,6 +104,7 @@ struct LaunchParams {
     SphereLight*  sphere_lights;
     int           num_triangle_lights;
     TriangleLight* triangle_lights;
+    float*        triangle_light_cdf;  // float[num_triangle_lights+1], area-weighted
 
     // Environment map (IBL)
     float*        envmap_data;

@@ -121,6 +121,7 @@ pub struct LaunchParams {
     pub sphere_lights: optix_sys::CUdeviceptr,
     pub num_triangle_lights: i32,
     pub triangle_lights: optix_sys::CUdeviceptr,
+    pub triangle_light_cdf: optix_sys::CUdeviceptr, // float[num_triangle_lights+1], area-weighted CDF
     // Environment map (IBL)
     pub envmap_data: optix_sys::CUdeviceptr, // RGB float, width*height*3 (0 = no envmap)
     pub envmap_width: i32,

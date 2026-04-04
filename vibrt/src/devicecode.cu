@@ -596,21 +596,33 @@ static __forceinline__ __device__ float3 nee_triangle_lights(
     int n = params.num_triangle_lights;
     if (n == 0) return make_float3(0, 0, 0);
 
-    // Sample a subset of lights: all if few, random selection if many
     const int max_samples = 8;
     int n_samples = min(n, max_samples);
-    float weight = (float)n / (float)n_samples;
+    bool use_cdf = (n_samples < n) && params.triangle_light_cdf;
 
     RNG light_select_rng(pixel_idx * 37, sample_idx, depth + 200);
     float3 result = make_float3(0, 0, 0);
 
     for (int s = 0; s < n_samples; s++) {
         int i;
+        float pdf_select;  // probability of selecting this light
+
         if (n_samples == n) {
-            i = s; // sample all lights
+            // Few lights: sample all, each with probability 1
+            i = s;
+            pdf_select = 1.0f;
+        } else if (use_cdf) {
+            // Many lights: importance sample by area × luminance via CDF
+            float xi = light_select_rng.next();
+            i = cdf_search(params.triangle_light_cdf, n, xi);
+            float cdf0 = params.triangle_light_cdf[i];
+            float cdf1 = params.triangle_light_cdf[i + 1];
+            pdf_select = (cdf1 - cdf0) * n_samples; // probability × n_samples for unbiased estimate
         } else {
+            // Fallback: uniform random
             i = (int)(light_select_rng.next() * n);
             if (i >= n) i = n - 1;
+            pdf_select = (float)n_samples / (float)n;
         }
 
         RNG light_rng(pixel_idx * 37 + i, sample_idx, depth + 201);
@@ -641,7 +653,7 @@ static __forceinline__ __device__ float3 nee_triangle_lights(
         bool unoccluded = !sr.hit || (sr.emission.x > 0 || sr.emission.y > 0 || sr.emission.z > 0);
         if (unoccluded) {
             float geo = light_area * lndotl / dist2;
-            result = result + bw * light_em * (geo * weight);
+            result = result + bw * light_em * (geo / fmaxf(pdf_select, 1e-8f));
         }
     }
     return result;
