@@ -1084,13 +1084,30 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                             height: 1,
                         })),
                     );
-                } else if class == "scale" || class == "mix" {
+                } else if class == "scale" {
+                    let scale_val = p.float("scale").unwrap_or(1.0);
+                    if let Some(tex_ref) = p.texture_ref("tex") {
+                        if let Some(SceneTexture::Image(base)) = textures.get(tex_ref) {
+                            let scaled_data: Vec<f32> =
+                                base.data.iter().map(|v| v * scale_val).collect();
+                            textures.insert(
+                                name.clone(),
+                                SceneTexture::Image(std::sync::Arc::new(ImageTexture {
+                                    data: scaled_data,
+                                    width: base.width,
+                                    height: base.height,
+                                })),
+                            );
+                        } else if let Some(base) = textures.get(tex_ref) {
+                            textures.insert(name.clone(), base.clone());
+                        }
+                    }
+                } else if class == "mix" {
                     if let Some(tex_ref) = p.texture_ref("tex") {
                         if let Some(base) = textures.get(tex_ref) {
                             textures.insert(name.clone(), base.clone());
                         }
                     }
-                    // Also check tex1/tex2 for mix
                     if let Some(tex_ref) = p.texture_ref("tex1") {
                         if let Some(base) = textures.get(tex_ref) {
                             textures.insert(name.clone(), base.clone());

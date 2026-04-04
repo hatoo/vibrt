@@ -68,7 +68,7 @@ static __forceinline__ __device__ float3 reflect3(float3 I, float3 N) {
     return I - 2.0f * dot3(I, N) * N;
 }
 
-// Build tangent frame from normal
+// Build tangent frame from normal, using geometry tangent if available
 static __forceinline__ __device__ void build_tangent_frame(
     float3 N, float3& tangent, float3& bitangent)
 {
@@ -77,6 +77,26 @@ static __forceinline__ __device__ void build_tangent_frame(
     else
         tangent = normalize3(cross3(make_float3(1,0,0), N));
     bitangent = cross3(N, tangent);
+}
+
+// Build tangent frame from normal and geometry dpdu tangent
+// Falls back to arbitrary frame if geom_tangent is zero
+static __forceinline__ __device__ void build_tangent_frame_geom(
+    float3 N, float3 geom_tangent, float3& tangent, float3& bitangent)
+{
+    float len2 = dot3(geom_tangent, geom_tangent);
+    if (len2 > 1e-6f) {
+        // Orthogonalize tangent against normal (Gram-Schmidt)
+        float3 t = geom_tangent - N * dot3(geom_tangent, N);
+        float tlen2 = dot3(t, t);
+        if (tlen2 > 1e-6f) {
+            tangent = t * (1.0f / sqrtf(tlen2));
+            bitangent = cross3(N, tangent);
+            return;
+        }
+    }
+    // Fallback to arbitrary frame
+    build_tangent_frame(N, tangent, bitangent);
 }
 
 // Anisotropic GGX NDF
@@ -222,9 +242,10 @@ static __forceinline__ __device__ float3 conductor_F_avg(
 // Evaluate Cook-Torrance specular BRDF with Kulla-Conty energy compensation
 // eta/k = (0,0,0) means use Schlick with albedo as F0
 // alpha_u/alpha_v: anisotropic roughness (set equal for isotropic)
+// geom_tangent: geometry dpdu for anisotropy alignment (zero = arbitrary)
 static __forceinline__ __device__ float3 eval_conductor_brdf(
     float3 V, float3 L, float3 N, float3 albedo, float alpha_u, float alpha_v,
-    float3 eta, float3 k)
+    float3 eta, float3 k, float3 geom_tangent = make_float3(0,0,0))
 {
     float NdotV = fmaxf(dot3(N, V), 0.001f);
     float NdotL = fmaxf(dot3(N, L), 0.001f);
@@ -238,7 +259,7 @@ static __forceinline__ __device__ float3 eval_conductor_brdf(
         G = ggx_G1(NdotV, alpha_u) * ggx_G1(NdotL, alpha_u);
     } else {
         float3 T, B;
-        build_tangent_frame(N, T, B);
+        build_tangent_frame_geom(N, geom_tangent, T, B);
         D = ggx_D_aniso(H, N, T, B, alpha_u, alpha_v);
         G = ggx_G1_aniso(V, N, T, B, alpha_u, alpha_v) *
             ggx_G1_aniso(L, N, T, B, alpha_u, alpha_v);
@@ -291,12 +312,14 @@ static __forceinline__ __device__ float3 cosine_sample_hemisphere(float u1, floa
 // GGX Visible Normal Distribution sampling (Heitz 2018)
 // Samples half-vectors proportional to D(H) * max(VdotH, 0), avoiding invisible microfacets.
 // V_world: view direction (toward camera), N: surface normal
+// geom_tangent: geometry dpdu for anisotropy alignment (zero = arbitrary frame)
 // Returns half-vector in world space
 static __forceinline__ __device__ float3 ggx_sample_vndf(
-    float u1, float u2, float3 V_world, float alpha_u, float alpha_v, float3 N)
+    float u1, float u2, float3 V_world, float alpha_u, float alpha_v, float3 N,
+    float3 geom_tangent = make_float3(0,0,0))
 {
     float3 T, B;
-    build_tangent_frame(N, T, B);
+    build_tangent_frame_geom(N, geom_tangent, T, B);
 
     // Transform V to local frame (T=x, B=y, N=z)
     float3 Vl = make_float3(dot3(V_world, T), dot3(V_world, B), dot3(V_world, N));
@@ -333,9 +356,10 @@ static __forceinline__ __device__ float3 ggx_sample_vndf(
 
 // Isotropic convenience wrapper (still uses VNDF)
 static __forceinline__ __device__ float3 ggx_sample(
-    float u1, float u2, float alpha, float3 V_world, float3 N)
+    float u1, float u2, float alpha, float3 V_world, float3 N,
+    float3 geom_tangent = make_float3(0,0,0))
 {
-    return ggx_sample_vndf(u1, u2, V_world, alpha, alpha, N);
+    return ggx_sample_vndf(u1, u2, V_world, alpha, alpha, N, geom_tangent);
 }
 
 // Schlick Fresnel approximation (for coated surfaces, uses F0 = 0.04 for dielectric coat)
@@ -374,14 +398,14 @@ static __forceinline__ __device__ ShadowResult trace_shadow(
     unsigned int sp9 = 0xFFFFFFFF;
     unsigned int sp10 = 0, sp11 = 0, sp12 = 0, sp13 = 0;
     unsigned int sp14 = 0, sp15 = 0, sp16 = 0, sp17 = 0, sp18 = 0, sp19 = 0;
-    unsigned int sp20 = 0, sp21 = 0, sp22 = 0;
+    unsigned int sp20 = 0, sp21 = 0, sp22 = 0, sp23 = 0, sp24 = 0, sp25 = 0;
     optixTrace(
         params.traversable, origin, dir,
         0.001f, tmax, 0.0f,
         OptixVisibilityMask(255), ray_flags,
         0, 1, 0,
         p0, p1, p2, p3, p4, p5, p6, p7, p8, sp9, sp10, sp11, sp12, sp13,
-        sp14, sp15, sp16, sp17, sp18, sp19, sp20, sp21, sp22);
+        sp14, sp15, sp16, sp17, sp18, sp19, sp20, sp21, sp22, sp23, sp24, sp25);
     ShadowResult res;
     res.hit = (sp9 != 0xFFFFFFFF);
     res.emission = make_float3(__uint_as_float(sp10), __uint_as_float(sp11), __uint_as_float(sp12));
@@ -396,12 +420,12 @@ static __forceinline__ __device__ ShadowResult trace_shadow(
 static __forceinline__ __device__ float3 eval_brdf_cosine(
     float3 V, float3 L, float3 N, float3 albedo,
     float alpha_u, float alpha_v, bool is_conductor,
-    float3 eta, float3 k)
+    float3 eta, float3 k, float3 geom_tangent = make_float3(0,0,0))
 {
     float NdotL = dot3(N, L);
     if (NdotL <= 0.0f) return make_float3(0, 0, 0);
     if (is_conductor) {
-        return eval_conductor_brdf(V, L, N, albedo, alpha_u, alpha_v, eta, k) * NdotL;
+        return eval_conductor_brdf(V, L, N, albedo, alpha_u, alpha_v, eta, k, geom_tangent) * NdotL;
     } else {
         return albedo * (NdotL / M_PIf);
     }
@@ -409,12 +433,12 @@ static __forceinline__ __device__ float3 eval_brdf_cosine(
 
 static __forceinline__ __device__ float3 nee_distant_lights(
     float3 hit_pos, float3 hit_normal, float3 V, float3 albedo, float alpha_u, float alpha_v, bool is_conductor,
-    float3 eta, float3 k)
+    float3 eta, float3 k, float3 geom_tangent = make_float3(0,0,0))
 {
     float3 result = make_float3(0, 0, 0);
     for (int i = 0; i < params.num_distant_lights; i++) {
         float3 L = make_f3(params.distant_lights[i].direction);
-        float3 bw = eval_brdf_cosine(V, L, hit_normal, albedo, alpha_u, alpha_v, is_conductor, eta, k);
+        float3 bw = eval_brdf_cosine(V, L, hit_normal, albedo, alpha_u, alpha_v, is_conductor, eta, k, geom_tangent);
         if (bw.x <= 0 && bw.y <= 0 && bw.z <= 0) continue;
         ShadowResult sr = trace_shadow(hit_pos, L, 1e16f, OPTIX_RAY_FLAG_TERMINATE_ON_FIRST_HIT);
         if (!sr.hit) {
@@ -426,7 +450,7 @@ static __forceinline__ __device__ float3 nee_distant_lights(
 
 static __forceinline__ __device__ float3 nee_sphere_lights(
     float3 hit_pos, float3 hit_normal, float3 V, float3 albedo, float alpha_u, float alpha_v, bool is_conductor,
-    float3 eta, float3 k,
+    float3 eta, float3 k, float3 geom_tangent,
     unsigned int pixel_idx, unsigned int sample_idx, unsigned int depth)
 {
     float3 result = make_float3(0, 0, 0);
@@ -459,7 +483,7 @@ static __forceinline__ __device__ float3 nee_sphere_lights(
             bitangent * (sinf(phi) * sin_theta) +
             light_dir_norm * cos_theta);
 
-        float3 bw = eval_brdf_cosine(V, L, hit_normal, albedo, alpha_u, alpha_v, is_conductor, eta, k);
+        float3 bw = eval_brdf_cosine(V, L, hit_normal, albedo, alpha_u, alpha_v, is_conductor, eta, k, geom_tangent);
         if (bw.x <= 0 && bw.y <= 0 && bw.z <= 0) continue;
 
         ShadowResult sr = trace_shadow(hit_pos, L, 1e16f, OPTIX_RAY_FLAG_NONE);
@@ -473,7 +497,7 @@ static __forceinline__ __device__ float3 nee_sphere_lights(
 
 static __forceinline__ __device__ float3 nee_triangle_lights(
     float3 hit_pos, float3 hit_normal, float3 V, float3 albedo, float alpha_u, float alpha_v, bool is_conductor,
-    float3 eta, float3 k,
+    float3 eta, float3 k, float3 geom_tangent,
     unsigned int pixel_idx, unsigned int sample_idx, unsigned int depth)
 {
     float3 result = make_float3(0, 0, 0);
@@ -499,7 +523,7 @@ static __forceinline__ __device__ float3 nee_triangle_lights(
         float lndotl = -dot3(light_normal, L);
         if (lndotl <= 0.0f) continue;
 
-        float3 bw = eval_brdf_cosine(V, L, hit_normal, albedo, alpha_u, alpha_v, is_conductor, eta, k);
+        float3 bw = eval_brdf_cosine(V, L, hit_normal, albedo, alpha_u, alpha_v, is_conductor, eta, k, geom_tangent);
         if (bw.x <= 0 && bw.y <= 0 && bw.z <= 0) continue;
 
         ShadowResult sr = trace_shadow(hit_pos, L, 1e16f, OPTIX_RAY_FLAG_NONE);
@@ -515,12 +539,12 @@ static __forceinline__ __device__ float3 nee_triangle_lights(
 static __forceinline__ __device__ float3 compute_nee(
     float3 hit_pos, float3 hit_normal, float3 V, float3 albedo,
     float alpha_u, float alpha_v, bool is_conductor,
-    float3 eta, float3 k,
+    float3 eta, float3 k, float3 geom_tangent,
     unsigned int pixel_idx, unsigned int sample_idx, unsigned int depth)
 {
-    return nee_distant_lights(hit_pos, hit_normal, V, albedo, alpha_u, alpha_v, is_conductor, eta, k)
-         + nee_sphere_lights(hit_pos, hit_normal, V, albedo, alpha_u, alpha_v, is_conductor, eta, k, pixel_idx, sample_idx, depth)
-         + nee_triangle_lights(hit_pos, hit_normal, V, albedo, alpha_u, alpha_v, is_conductor, eta, k, pixel_idx, sample_idx, depth);
+    return nee_distant_lights(hit_pos, hit_normal, V, albedo, alpha_u, alpha_v, is_conductor, eta, k, geom_tangent)
+         + nee_sphere_lights(hit_pos, hit_normal, V, albedo, alpha_u, alpha_v, is_conductor, eta, k, geom_tangent, pixel_idx, sample_idx, depth)
+         + nee_triangle_lights(hit_pos, hit_normal, V, albedo, alpha_u, alpha_v, is_conductor, eta, k, geom_tangent, pixel_idx, sample_idx, depth);
 }
 
 // ---- Pack/unpack color ----
@@ -568,7 +592,7 @@ extern "C" __global__ void __raygen__rg()
         for (unsigned int depth = 0; depth < params.max_depth; depth++) {
             unsigned int p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12, p13;
             unsigned int p14 = 0, p15 = 0, p16 = 0, p17 = 0, p18 = 0, p19 = 0;
-            unsigned int p20 = 0, p21 = 0, p22 = 0;
+            unsigned int p20 = 0, p21 = 0, p22 = 0, p23 = 0, p24 = 0, p25 = 0;
             p9 = 0xFFFFFFFF; // miss sentinel
             p10 = p11 = p12 = p13 = 0;
 
@@ -580,7 +604,7 @@ extern "C" __global__ void __raygen__rg()
                 OPTIX_RAY_FLAG_NONE,
                 0, 1, 0,
                 p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12, p13,
-                p14, p15, p16, p17, p18, p19, p20, p21, p22
+                p14, p15, p16, p17, p18, p19, p20, p21, p22, p23, p24, p25
             );
 
             if (p9 == 0xFFFFFFFF) {
@@ -595,6 +619,7 @@ extern "C" __global__ void __raygen__rg()
             float3 hit_albedo = make_float3(__uint_as_float(p0), __uint_as_float(p1), __uint_as_float(p2));
             float3 hit_emission = make_float3(__uint_as_float(p10), __uint_as_float(p11), __uint_as_float(p12));
             int mat_type = (int)p9;
+            float3 hit_tangent = make_float3(__uint_as_float(p23), __uint_as_float(p24), __uint_as_float(p25));
 
             // Add emission on camera ray or after specular bounces.
             // Diffuse NEE already accounts for lights, so skip after diffuse bounce.
@@ -608,7 +633,7 @@ extern "C" __global__ void __raygen__rg()
                 float3 view_dir = direction * (-1.0f);
                 radiance = radiance + throughput * compute_nee(
                     hit_pos, hit_normal, view_dir, hit_albedo, 0, 0, false,
-                    zero3, zero3, pixel_idx, s, depth);
+                    zero3, zero3, zero3, pixel_idx, s, depth);
 
                 // Indirect: cosine-weighted bounce
                 RNG bounce_rng(pixel_idx, s, depth + 1);
@@ -638,7 +663,7 @@ extern "C" __global__ void __raygen__rg()
                     // Diffuse path with NEE
                     radiance = radiance + throughput * compute_nee(
                         hit_pos, hit_normal, view_dir, hit_albedo, 0, 0, false,
-                        zero3, zero3, pixel_idx, s, depth);
+                        zero3, zero3, zero3, pixel_idx, s, depth);
 
                     direction = cosine_sample_hemisphere(bounce_rng.next(), bounce_rng.next(), hit_normal);
                     origin = hit_pos;
@@ -660,10 +685,10 @@ extern "C" __global__ void __raygen__rg()
                 // NEE for conductor
                 radiance = radiance + throughput * compute_nee(
                     hit_pos, hit_normal, view_dir, hit_albedo, alpha_u, alpha_v, true,
-                    cond_eta, cond_k, pixel_idx, s, depth);
+                    cond_eta, cond_k, hit_tangent, pixel_idx, s, depth);
 
                 // Specular bounce: VNDF sampling with correct weight = F * G1(L)
-                float3 H = ggx_sample_vndf(bounce_rng.next(), bounce_rng.next(), view_dir, alpha_u, alpha_v, hit_normal);
+                float3 H = ggx_sample_vndf(bounce_rng.next(), bounce_rng.next(), view_dir, alpha_u, alpha_v, hit_normal, hit_tangent);
                 float VdotH = fmaxf(dot3(view_dir, H), 0.001f);
                 float3 Fr;
                 bool has_ior = (cond_eta.x > 0 || cond_eta.y > 0 || cond_eta.z > 0 ||
@@ -684,7 +709,7 @@ extern "C" __global__ void __raygen__rg()
                     G1_L = ggx_G1(NdotL, alpha_u);
                 } else {
                     float3 T, B;
-                    build_tangent_frame(hit_normal, T, B);
+                    build_tangent_frame_geom(hit_normal, hit_tangent, T, B);
                     G1_L = ggx_G1_aniso(direction, hit_normal, T, B, alpha_u, alpha_v);
                 }
                 float alpha_avg = 0.5f * (alpha_u + alpha_v);
@@ -752,10 +777,10 @@ extern "C" __global__ void __raygen__rg()
                     // NEE with conductor BRDF, scaled by coating transmission
                     radiance = radiance + throughput * coat_throughput * compute_nee(
                         hit_pos, hit_normal, view_dir, hit_albedo, cond_alpha_u, cond_alpha_v, true,
-                        cond_eta, cond_k, pixel_idx, s, depth);
+                        cond_eta, cond_k, hit_tangent, pixel_idx, s, depth);
 
                     // Specular bounce off conductor: VNDF with weight = F * G1(L)
-                    float3 H = ggx_sample_vndf(bounce_rng.next(), bounce_rng.next(), view_dir, cond_alpha_u, cond_alpha_v, hit_normal);
+                    float3 H = ggx_sample_vndf(bounce_rng.next(), bounce_rng.next(), view_dir, cond_alpha_u, cond_alpha_v, hit_normal, hit_tangent);
                     float VdotH = fmaxf(dot3(view_dir, H), 0.001f);
                     float3 Fr;
                     if (has_ior) {
@@ -774,7 +799,7 @@ extern "C" __global__ void __raygen__rg()
                         G1_L = ggx_G1(NdotL, cond_alpha_u);
                     } else {
                         float3 T, B;
-                        build_tangent_frame(hit_normal, T, B);
+                        build_tangent_frame_geom(hit_normal, hit_tangent, T, B);
                         G1_L = ggx_G1_aniso(direction, hit_normal, T, B, cond_alpha_u, cond_alpha_v);
                     }
                     throughput = throughput * coat_throughput * Fr * G1_L;
@@ -881,6 +906,22 @@ extern "C" __global__ void __closesthit__ch()
     // Ensure normal faces the ray
     if (dot3(shading_normal, ray_dir) > 0.0f)
         shading_normal = shading_normal * (-1.0f);
+
+    // Compute tangent (dpdu) from triangle UVs for anisotropic GGX
+    float3 geom_tangent = make_float3(0, 0, 0);
+    if (data->texcoords) {
+        float2 uv0 = make_float2(data->texcoords[idx0*2], data->texcoords[idx0*2+1]);
+        float2 uv1 = make_float2(data->texcoords[idx1*2], data->texcoords[idx1*2+1]);
+        float2 uv2 = make_float2(data->texcoords[idx2*2], data->texcoords[idx2*2+1]);
+        float3 dp1 = v1 - v0, dp2 = v2 - v0;
+        float duv1_u = uv1.x - uv0.x, duv1_v = uv1.y - uv0.y;
+        float duv2_u = uv2.x - uv0.x, duv2_v = uv2.y - uv0.y;
+        float det = duv1_u * duv2_v - duv1_v * duv2_u;
+        if (fabsf(det) > 1e-8f) {
+            float inv_det = 1.0f / det;
+            geom_tangent = normalize3((dp1 * duv2_v - dp2 * duv1_v) * inv_det);
+        }
+    }
 
     // Bump mapping (matches PBRT's BumpMap)
     if (data->bump_data && data->texcoords) {
@@ -1109,6 +1150,11 @@ extern "C" __global__ void __closesthit__ch()
         optixSetPayload_20(__float_as_uint(data->coat_roughness));
         optixSetPayload_21(__float_as_uint(data->coat_eta));
     }
+
+    // Geometry tangent (payloads 23-25) for anisotropic GGX alignment
+    optixSetPayload_23(__float_as_uint(geom_tangent.x));
+    optixSetPayload_24(__float_as_uint(geom_tangent.y));
+    optixSetPayload_25(__float_as_uint(geom_tangent.z));
 }
 
 // Closest hit for sphere (built-in intersection)
@@ -1171,6 +1217,11 @@ extern "C" __global__ void __closesthit__sphere()
         optixSetPayload_20(__float_as_uint(data->coat_roughness));
         optixSetPayload_21(__float_as_uint(data->coat_eta));
     }
+
+    // Sphere has no UV tangent — use zero (arbitrary frame fallback)
+    optixSetPayload_23(0);
+    optixSetPayload_24(0);
+    optixSetPayload_25(0);
 }
 
 // Any-hit program for alpha cutout
