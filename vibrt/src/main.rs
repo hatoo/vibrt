@@ -308,6 +308,82 @@ fn compute_camera(
     )
 }
 
+struct GasEntry {
+    handle: optix_sys::OptixTraversableHandle,
+    sbt_offset: u32,
+    transform: [f32; 12],
+    is_sphere: bool,
+}
+
+fn compile_ptx() -> Result<String> {
+    let cu_src = include_str!("devicecode.cu");
+    let header_src = include_str!("devicecode.h");
+
+    let optix_include = find_optix_include();
+    let opts = cudarc::nvrtc::CompileOptions {
+        include_paths: vec![optix_include],
+        use_fast_math: Some(true),
+        options: vec![format!(
+            "--include-path={}",
+            std::env::current_dir()?.join("renderer/src").display()
+        )],
+        ..Default::default()
+    };
+
+    let full_src = format!(
+        "// Inlined devicecode.h\n{}\n// devicecode.cu\n{}",
+        header_src,
+        cu_src.replace("#include \"devicecode.h\"", "// (inlined above)")
+    );
+
+    println!("Compiling device code with NVRTC...");
+    let ptx = cudarc::nvrtc::compile_ptx_with_opts(&full_src, opts)
+        .map_err(|e| anyhow::anyhow!("NVRTC compilation failed: {e:?}"))?;
+    Ok(ptx.to_src().to_string())
+}
+
+/// Build marginal + conditional CDFs for envmap importance sampling.
+fn build_envmap_cdf(env: &scene::ImageTexture) -> (Vec<f32>, Vec<f32>, f32) {
+    let w = env.width as usize;
+    let h = env.height as usize;
+
+    let mut conditional_cdf = vec![0.0f32; h * (w + 1)];
+    let mut row_integrals = vec![0.0f32; h];
+
+    for y in 0..h {
+        let sin_theta = (std::f32::consts::PI * (y as f32 + 0.5) / h as f32).sin();
+        let row_offset = y * (w + 1);
+        conditional_cdf[row_offset] = 0.0;
+        for x in 0..w {
+            let idx = (y * w + x) * 3;
+            let lum =
+                0.2126 * env.data[idx] + 0.7152 * env.data[idx + 1] + 0.0722 * env.data[idx + 2];
+            conditional_cdf[row_offset + x + 1] = conditional_cdf[row_offset + x] + lum * sin_theta;
+        }
+        row_integrals[y] = conditional_cdf[row_offset + w];
+        if row_integrals[y] > 0.0 {
+            let inv = 1.0 / row_integrals[y];
+            for x in 1..=w {
+                conditional_cdf[row_offset + x] *= inv;
+            }
+        }
+    }
+
+    let mut marginal_cdf = vec![0.0f32; h + 1];
+    for y in 0..h {
+        marginal_cdf[y + 1] = marginal_cdf[y] + row_integrals[y];
+    }
+    let total = marginal_cdf[h];
+    if total > 0.0 {
+        let inv = 1.0 / total;
+        for y in 1..=h {
+            marginal_cdf[y] *= inv;
+        }
+    }
+
+    (marginal_cdf, conditional_cdf, total)
+}
+
 fn find_optix_include() -> String {
     if let Ok(root) = std::env::var("OPTIX_ROOT") {
         return format!("{root}/include");
@@ -415,30 +491,7 @@ fn main() -> Result<()> {
     .context("OptiX context")?;
 
     // --- Compile PTX ---
-    let cu_src = include_str!("devicecode.cu");
-    let header_src = include_str!("devicecode.h");
-
-    let optix_include = find_optix_include();
-    let opts = cudarc::nvrtc::CompileOptions {
-        include_paths: vec![optix_include],
-        use_fast_math: Some(true),
-        options: vec![format!(
-            "--include-path={}",
-            std::env::current_dir()?.join("renderer/src").display()
-        )],
-        ..Default::default()
-    };
-
-    let full_src = format!(
-        "// Inlined devicecode.h\n{}\n// devicecode.cu\n{}",
-        header_src,
-        cu_src.replace("#include \"devicecode.h\"", "// (inlined above)")
-    );
-
-    println!("Compiling device code with NVRTC...");
-    let ptx = cudarc::nvrtc::compile_ptx_with_opts(&full_src, opts)
-        .map_err(|e| anyhow::anyhow!("NVRTC compilation failed: {e:?}"))?;
-    let ptx_src = ptx.to_src();
+    let ptx_src = compile_ptx()?;
 
     // --- OptiX pipeline ---
     let has_spheres = scene
@@ -517,13 +570,6 @@ fn main() -> Result<()> {
 
     // --- Build geometry ---
     let mut _device_buffers: Vec<CudaSlice<u8>> = Vec::new();
-
-    struct GasEntry {
-        handle: optix_sys::OptixTraversableHandle,
-        sbt_offset: u32,
-        transform: [f32; 12],
-        is_sphere: bool,
-    }
     let mut gas_entries: Vec<GasEntry> = Vec::new();
     let mut tri_hg_records: Vec<SbtRecord<HitGroupData>> = Vec::new();
     let mut sphere_hg_records: Vec<SbtRecord<HitGroupData>> = Vec::new();
@@ -907,52 +953,10 @@ fn main() -> Result<()> {
     let (d_envmap, envmap_w, envmap_h, d_marginal_cdf, d_conditional_cdf, envmap_integral) =
         if let Some(ref env) = scene.envmap {
             let d = alloc_and_copy_slice(&stream, &env.data)?;
-            let w = env.width as usize;
-            let h = env.height as usize;
-
-            // Build conditional CDFs (per-row) and marginal CDF
-            let mut conditional_cdf = vec![0.0f32; h * (w + 1)];
-            let mut row_integrals = vec![0.0f32; h];
-
-            for y in 0..h {
-                let sin_theta = (std::f32::consts::PI * (y as f32 + 0.5) / h as f32).sin();
-                let row_offset = y * (w + 1);
-                conditional_cdf[row_offset] = 0.0;
-                for x in 0..w {
-                    let idx = (y * w + x) * 3;
-                    let lum = 0.2126 * env.data[idx]
-                        + 0.7152 * env.data[idx + 1]
-                        + 0.0722 * env.data[idx + 2];
-                    conditional_cdf[row_offset + x + 1] =
-                        conditional_cdf[row_offset + x] + lum * sin_theta;
-                }
-                row_integrals[y] = conditional_cdf[row_offset + w];
-                // Normalize conditional CDF
-                if row_integrals[y] > 0.0 {
-                    let inv = 1.0 / row_integrals[y];
-                    for x in 1..=w {
-                        conditional_cdf[row_offset + x] *= inv;
-                    }
-                }
-            }
-
-            // Build marginal CDF
-            let mut marginal_cdf = vec![0.0f32; h + 1];
-            marginal_cdf[0] = 0.0;
-            for y in 0..h {
-                marginal_cdf[y + 1] = marginal_cdf[y] + row_integrals[y];
-            }
-            let total = marginal_cdf[h];
-            if total > 0.0 {
-                let inv = 1.0 / total;
-                for y in 1..=h {
-                    marginal_cdf[y] *= inv;
-                }
-            }
-
-            let d_m = alloc_and_copy_slice(&stream, &marginal_cdf)?;
-            let d_c = alloc_and_copy_slice(&stream, &conditional_cdf)?;
-            (d, w as i32, h as i32, d_m, d_c, total)
+            let (marginal, conditional, total) = build_envmap_cdf(env);
+            let d_m = alloc_and_copy_slice(&stream, &marginal)?;
+            let d_c = alloc_and_copy_slice(&stream, &conditional)?;
+            (d, env.width as i32, env.height as i32, d_m, d_c, total)
         } else {
             (0, 0, 0, 0, 0, 0.0)
         };
