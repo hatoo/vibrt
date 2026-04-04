@@ -529,9 +529,26 @@ static __forceinline__ __device__ float3 nee_sphere_lights(
     float3 eta, float3 k, float3 geom_tangent,
     unsigned int pixel_idx, unsigned int sample_idx, unsigned int depth)
 {
+    int n = params.num_sphere_lights;
+    if (n == 0) return make_float3(0, 0, 0);
+
+    const int max_samples = 8;
+    int n_samples = min(n, max_samples);
+    float weight = (float)n / (float)n_samples;
+
+    RNG sphere_select_rng(pixel_idx * 31, sample_idx, depth + 100);
     float3 result = make_float3(0, 0, 0);
-    for (int i = 0; i < params.num_sphere_lights; i++) {
-        RNG light_rng(pixel_idx * 31 + i, sample_idx, depth + 100);
+
+    for (int s = 0; s < n_samples; s++) {
+        int i;
+        if (n_samples == n) {
+            i = s;
+        } else {
+            i = (int)(sphere_select_rng.next() * n);
+            if (i >= n) i = n - 1;
+        }
+
+        RNG light_rng(pixel_idx * 31 + i, sample_idx, depth + 101);
         float3 light_center = make_f3(params.sphere_lights[i].center);
         float light_radius = params.sphere_lights[i].radius;
         float3 to_light = light_center - hit_pos;
@@ -565,7 +582,7 @@ static __forceinline__ __device__ float3 nee_sphere_lights(
         ShadowResult sr = trace_shadow(hit_pos, L, 1e16f, OPTIX_RAY_FLAG_NONE);
         if (sr.emission.x > 0 || sr.emission.y > 0 || sr.emission.z > 0) {
             float pdf = 1.0f / (2.0f * M_PIf * (1.0f - cos_theta_max));
-            result = result + bw * sr.emission * (1.0f / pdf);
+            result = result + bw * sr.emission * (weight / pdf);
         }
     }
     return result;
@@ -576,9 +593,27 @@ static __forceinline__ __device__ float3 nee_triangle_lights(
     float3 eta, float3 k, float3 geom_tangent,
     unsigned int pixel_idx, unsigned int sample_idx, unsigned int depth)
 {
+    int n = params.num_triangle_lights;
+    if (n == 0) return make_float3(0, 0, 0);
+
+    // Sample a subset of lights: all if few, random selection if many
+    const int max_samples = 8;
+    int n_samples = min(n, max_samples);
+    float weight = (float)n / (float)n_samples;
+
+    RNG light_select_rng(pixel_idx * 37, sample_idx, depth + 200);
     float3 result = make_float3(0, 0, 0);
-    for (int i = 0; i < params.num_triangle_lights; i++) {
-        RNG light_rng(pixel_idx * 37 + i, sample_idx, depth + 200);
+
+    for (int s = 0; s < n_samples; s++) {
+        int i;
+        if (n_samples == n) {
+            i = s; // sample all lights
+        } else {
+            i = (int)(light_select_rng.next() * n);
+            if (i >= n) i = n - 1;
+        }
+
+        RNG light_rng(pixel_idx * 37 + i, sample_idx, depth + 201);
         float3 lv0 = make_f3(params.triangle_lights[i].v0);
         float3 lv1 = make_f3(params.triangle_lights[i].v1);
         float3 lv2 = make_f3(params.triangle_lights[i].v2);
@@ -606,7 +641,7 @@ static __forceinline__ __device__ float3 nee_triangle_lights(
         bool unoccluded = !sr.hit || (sr.emission.x > 0 || sr.emission.y > 0 || sr.emission.z > 0);
         if (unoccluded) {
             float geo = light_area * lndotl / dist2;
-            result = result + bw * light_em * geo;
+            result = result + bw * light_em * (geo * weight);
         }
     }
     return result;
