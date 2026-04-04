@@ -1076,18 +1076,30 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                 }
                 // Mark known-but-unhandled params so they don't trigger warnings
                 if let Some(tex_name) = p.texture_ref("displacement") {
-                    if let Some(SceneTexture::Image(img)) = textures.get(tex_name) {
-                        current_material.bump_map = Some(img.clone());
+                    match textures.get(tex_name) {
+                        Some(SceneTexture::Image(img)) => {
+                            current_material.bump_map = Some(img.clone())
+                        }
+                        Some(_) => {}
+                        None => eprintln!("  warning: displacement texture not found: {tex_name}"),
                     }
                 }
                 if let Some(tex_name) = p.texture_ref("alpha") {
-                    if let Some(SceneTexture::Image(img)) = textures.get(tex_name) {
-                        current_material.alpha_map = Some(img.clone());
+                    match textures.get(tex_name) {
+                        Some(SceneTexture::Image(img)) => {
+                            current_material.alpha_map = Some(img.clone())
+                        }
+                        Some(_) => {}
+                        None => eprintln!("  warning: alpha texture not found: {tex_name}"),
                     }
                 }
                 if let Some(tex_name) = p.texture_ref("roughness") {
-                    if let Some(SceneTexture::Image(img)) = textures.get(tex_name) {
-                        current_material.roughness_map = Some(img.clone());
+                    match textures.get(tex_name) {
+                        Some(SceneTexture::Image(img)) => {
+                            current_material.roughness_map = Some(img.clone())
+                        }
+                        Some(_) => {}
+                        None => eprintln!("  warning: roughness texture not found: {tex_name}"),
                     }
                 }
             }
@@ -1223,21 +1235,25 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                         eprintln!("  warning: unsupported MakeNamedMaterial type: {ty}");
                     }
                 }
-                // Mark known-but-unhandled params so they don't trigger warnings
-                // Bind displacement/bump map for any material type
                 if let Some(tex_name) = p.texture_ref("displacement") {
-                    if let Some(SceneTexture::Image(img)) = textures.get(tex_name) {
-                        mat.bump_map = Some(img.clone());
+                    match textures.get(tex_name) {
+                        Some(SceneTexture::Image(img)) => mat.bump_map = Some(img.clone()),
+                        Some(_) => {}
+                        None => eprintln!("  warning: displacement texture not found: {tex_name}"),
                     }
                 }
                 if let Some(tex_name) = p.texture_ref("alpha") {
-                    if let Some(SceneTexture::Image(img)) = textures.get(tex_name) {
-                        mat.alpha_map = Some(img.clone());
+                    match textures.get(tex_name) {
+                        Some(SceneTexture::Image(img)) => mat.alpha_map = Some(img.clone()),
+                        Some(_) => {}
+                        None => eprintln!("  warning: alpha texture not found: {tex_name}"),
                     }
                 }
                 if let Some(tex_name) = p.texture_ref("roughness") {
-                    if let Some(SceneTexture::Image(img)) = textures.get(tex_name) {
-                        mat.roughness_map = Some(img.clone());
+                    match textures.get(tex_name) {
+                        Some(SceneTexture::Image(img)) => mat.roughness_map = Some(img.clone()),
+                        Some(_) => {}
+                        None => eprintln!("  warning: roughness texture not found: {tex_name}"),
                     }
                 }
                 named_materials.insert(name.clone(), mat);
