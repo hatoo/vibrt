@@ -33,6 +33,8 @@ cargo run --release -p vibrt -- scene.pbrt --spp 64 --width 800 --height 600
 
 ### Example renders
 
+![crown](crown.png)
+
 ```bash
 # Simple glass sphere on checkerboard
 cargo run --release -p vibrt -- test.pbrt

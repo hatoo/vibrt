@@ -1,4 +1,5 @@
 /target
 *.ppm
 *.png
+!crown.png
 *.pbrt
