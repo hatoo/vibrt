@@ -542,6 +542,62 @@ fn parse_shape(ty: &str, params: &[pbrt_parser::Param], scene_dir: &Path) -> Opt
                 normals: Vec::new(),
             })
         }
+        "disk" => {
+            let radius = p.float("radius").unwrap_or(1.0);
+            let inner_radius = p.float("innerradius").unwrap_or(0.0);
+            let height = p.float("height").unwrap_or(0.0);
+            let n_segments = 64;
+            let mut verts = Vec::new();
+            let mut indices = Vec::new();
+
+            if inner_radius > 0.0 {
+                for i in 0..n_segments {
+                    let t0 = 2.0 * std::f32::consts::PI * i as f32 / n_segments as f32;
+                    let t1 = 2.0 * std::f32::consts::PI * (i + 1) as f32 / n_segments as f32;
+                    let base = verts.len() as i32 / 3;
+                    verts.extend_from_slice(&[
+                        inner_radius * t0.cos(),
+                        inner_radius * t0.sin(),
+                        height,
+                        radius * t0.cos(),
+                        radius * t0.sin(),
+                        height,
+                        radius * t1.cos(),
+                        radius * t1.sin(),
+                        height,
+                        inner_radius * t1.cos(),
+                        inner_radius * t1.sin(),
+                        height,
+                    ]);
+                    indices.extend_from_slice(&[
+                        base,
+                        base + 1,
+                        base + 2,
+                        base,
+                        base + 2,
+                        base + 3,
+                    ]);
+                }
+            } else {
+                verts.extend_from_slice(&[0.0, 0.0, height]);
+                for i in 0..=n_segments {
+                    let theta = 2.0 * std::f32::consts::PI * i as f32 / n_segments as f32;
+                    verts.extend_from_slice(&[radius * theta.cos(), radius * theta.sin(), height]);
+                }
+                for i in 0..n_segments {
+                    indices.extend_from_slice(&[0, (i + 1) as i32, (i + 2) as i32]);
+                }
+            }
+            let n_verts = verts.len() / 3;
+            let normals = vec![0.0f32, 0.0, 1.0].repeat(n_verts);
+
+            Some(SceneShape::TriangleMesh {
+                vertices: verts,
+                indices,
+                texcoords: Vec::new(),
+                normals,
+            })
+        }
         "plymesh" => {
             let filename = p.string("filename")?;
             let path = scene_dir.join(filename);
