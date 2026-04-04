@@ -881,7 +881,13 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
             Directive::LightSource { ty, params } => match ty.as_str() {
                 "infinite" => {
                     let p = ParamSet::new(params, "LightSource \"infinite\"");
+                    let float_scale = p.float("scale").unwrap_or(1.0);
                     let scale = p.rgb("L").unwrap_or([1.0, 1.0, 1.0]);
+                    let scale = [
+                        scale[0] * float_scale,
+                        scale[1] * float_scale,
+                        scale[2] * float_scale,
+                    ];
                     if let Some(filename) = p.string("filename") {
                         let path = scene_dir.join(filename);
                         match image::open(&path) {
