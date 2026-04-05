@@ -1100,7 +1100,9 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                         Some(SceneTexture::Image(img)) => {
                             current_material.bump_map = Some(img.clone())
                         }
-                        Some(_) => {}
+                        Some(_) => eprintln!(
+                            "  warning: non-image texture type not supported for: {tex_name}"
+                        ),
                         None => eprintln!("  warning: displacement texture not found: {tex_name}"),
                     }
                 }
@@ -1109,7 +1111,9 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                         Some(SceneTexture::Image(img)) => {
                             current_material.alpha_map = Some(img.clone())
                         }
-                        Some(_) => {}
+                        Some(_) => eprintln!(
+                            "  warning: non-image texture type not supported for: {tex_name}"
+                        ),
                         None => eprintln!("  warning: alpha texture not found: {tex_name}"),
                     }
                 }
@@ -1118,7 +1122,9 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                         Some(SceneTexture::Image(img)) => {
                             current_material.roughness_map = Some(img.clone())
                         }
-                        Some(_) => {}
+                        Some(_) => eprintln!(
+                            "  warning: non-image texture type not supported for: {tex_name}"
+                        ),
                         None => eprintln!("  warning: roughness texture not found: {tex_name}"),
                     }
                 }
@@ -1300,21 +1306,27 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                 if let Some(tex_name) = p.texture_ref("displacement") {
                     match textures.get(tex_name) {
                         Some(SceneTexture::Image(img)) => mat.bump_map = Some(img.clone()),
-                        Some(_) => {}
+                        Some(_) => eprintln!(
+                            "  warning: non-image texture type not supported for: {tex_name}"
+                        ),
                         None => eprintln!("  warning: displacement texture not found: {tex_name}"),
                     }
                 }
                 if let Some(tex_name) = p.texture_ref("alpha") {
                     match textures.get(tex_name) {
                         Some(SceneTexture::Image(img)) => mat.alpha_map = Some(img.clone()),
-                        Some(_) => {}
+                        Some(_) => eprintln!(
+                            "  warning: non-image texture type not supported for: {tex_name}"
+                        ),
                         None => eprintln!("  warning: alpha texture not found: {tex_name}"),
                     }
                 }
                 if let Some(tex_name) = p.texture_ref("roughness") {
                     match textures.get(tex_name) {
                         Some(SceneTexture::Image(img)) => mat.roughness_map = Some(img.clone()),
-                        Some(_) => {}
+                        Some(_) => eprintln!(
+                            "  warning: non-image texture type not supported for: {tex_name}"
+                        ),
                         None => eprintln!("  warning: roughness texture not found: {tex_name}"),
                     }
                 }
