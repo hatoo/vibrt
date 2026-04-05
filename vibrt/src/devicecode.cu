@@ -40,7 +40,10 @@ static __forceinline__ __device__ float dot3(float3 a, float3 b) {
 
 static __forceinline__ __device__ float3 normalize3(float3 v) {
   float len = sqrtf(dot3(v, v));
-  return make_float3(v.x / len, v.y / len, v.z / len);
+  if (len < 1e-20f)
+    return make_float3(0, 0, 1);
+  float inv = 1.0f / len;
+  return make_float3(v.x * inv, v.y * inv, v.z * inv);
 }
 
 static __forceinline__ __device__ float3 cross3(float3 a, float3 b) {
@@ -1148,7 +1151,6 @@ extern "C" __global__ void __raygen__rg() {
         float eta_val = __uint_as_float(p0);
         float3 tint = make_float3(__uint_as_float(p1), __uint_as_float(p2),
                                   __uint_as_float(p13));
-        RNG bounce_rng(pixel_idx, s, depth + 1);
 
         bool front_face = dot3(direction, hit_normal) < 0.0f;
         float3 outward_normal = front_face ? hit_normal : hit_normal * (-1.0f);
