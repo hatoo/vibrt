@@ -1034,15 +1034,8 @@ extern "C" __global__ void __raygen__rg() {
         // double-counting with NEE (envmap or portal) on diffuse paths
         bool has_env_nee = params.envmap_data || params.has_portal;
         if (specular_bounce || !has_env_nee) {
-          if (params.has_portal && !params.envmap_data) {
-            // Portal with no envmap image: only see ambient through portal
-            if (ray_hits_portal(origin, direction)) {
-              radiance = radiance + throughput * make_f3(params.ambient_light);
-            }
-          } else {
-            float3 bg = sample_envmap(direction);
-            radiance = radiance + throughput * bg;
-          }
+          float3 bg = sample_envmap(direction);
+          radiance = radiance + throughput * bg;
         }
         break;
       }
