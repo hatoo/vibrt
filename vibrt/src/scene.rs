@@ -1185,8 +1185,10 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                         mat.roughness_v = rv;
                         mat.coat_eta = p.float("eta").unwrap_or(1.5);
                         if let Some(tex_name) = p.texture_ref("reflectance") {
-                            if let Some(SceneTexture::Image(img)) = textures.get(tex_name) {
-                                mat.texture = Some(img.clone());
+                            match textures.get(tex_name) {
+                                Some(SceneTexture::Image(img)) => mat.texture = Some(img.clone()),
+                                Some(_) => eprintln!("  warning: non-image texture type not supported for: {tex_name}"),
+                                None => eprintln!("  warning: unknown texture reference: {tex_name}"),
                             }
                         }
                     }
@@ -1430,11 +1432,15 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                     if let Some(tex_ref) = p.texture_ref("tex") {
                         if let Some(base) = textures.get(tex_ref) {
                             textures.insert(name.clone(), base.clone());
+                        } else {
+                            eprintln!("  warning: mix texture ref not found: {tex_ref}");
                         }
                     }
                     if let Some(tex_ref) = p.texture_ref("tex1") {
                         if let Some(base) = textures.get(tex_ref) {
                             textures.insert(name.clone(), base.clone());
+                        } else {
+                            eprintln!("  warning: mix texture ref not found: {tex_ref}");
                         }
                     }
                 } else {
@@ -1445,8 +1451,10 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                 if let Some((mut shape, alpha_tex)) = parse_shape(ty, params, scene_dir) {
                     let mut mat_override = current_material.clone();
                     if let Some(ref tex_name) = alpha_tex {
-                        if let Some(SceneTexture::Image(img)) = textures.get(tex_name.as_str()) {
-                            mat_override.alpha_map = Some(img.clone());
+                        match textures.get(tex_name.as_str()) {
+                            Some(SceneTexture::Image(img)) => mat_override.alpha_map = Some(img.clone()),
+                            Some(_) => eprintln!("  warning: non-image texture type not supported for alpha: {tex_name}"),
+                            None => eprintln!("  warning: alpha texture not found: {tex_name}"),
                         }
                     }
                     if reverse_orientation {
