@@ -24,7 +24,7 @@ use std::sync::Arc;
 )]
 struct Args {
     /// Input .pbrt scene file
-    input: String,
+    input: Option<String>,
 
     /// Output image file (.png)
     #[arg(short, long)]
@@ -45,6 +45,10 @@ struct Args {
     /// Override image height
     #[arg(long)]
     height: Option<u32>,
+
+    /// Only compile the CUDA kernel (no scene loading or rendering)
+    #[arg(long)]
+    compile_only: bool,
 }
 
 /// Extension trait to convert cudarc's DriverError to anyhow::Error.
@@ -440,10 +444,20 @@ fn save_image(path: &str, width: u32, height: u32, pixels: &[u32]) -> Result<()>
 fn main() -> Result<()> {
     let cli = Args::parse();
 
-    let input =
-        std::fs::read_to_string(&cli.input).context(format!("Failed to read {}", cli.input))?;
+    if cli.compile_only {
+        compile_ptx()?;
+        println!("Kernel compilation successful.");
+        return Ok(());
+    }
 
-    let scene_dir = std::path::Path::new(&cli.input)
+    let input_path = cli
+        .input
+        .as_ref()
+        .context("Input file required (use --compile-only to skip)")?;
+    let input =
+        std::fs::read_to_string(input_path).context(format!("Failed to read {}", input_path))?;
+
+    let scene_dir = std::path::Path::new(input_path)
         .parent()
         .unwrap_or(std::path::Path::new("."));
     let mut scene = parse_scene(&input, scene_dir);
