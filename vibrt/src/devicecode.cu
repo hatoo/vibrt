@@ -1172,6 +1172,15 @@ extern "C" __global__ void __raygen__rg() {
         origin = hit_pos;
         specular_bounce = true;
       }
+
+      // Russian roulette path termination after depth 3
+      if (depth >= 3) {
+        float p_survive = fminf(
+            fmaxf(throughput.x, fmaxf(throughput.y, throughput.z)), 0.95f);
+        if (bounce_rng.next() >= p_survive)
+          break;
+        throughput = throughput * (1.0f / p_survive);
+      }
     }
 
     accum = accum + radiance;
