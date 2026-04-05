@@ -21,7 +21,8 @@ struct RNG {
         state = old * 747796405u + 2891336453u;
         unsigned int word = ((old >> ((old >> 28u) + 4u)) ^ old) * 277803737u;
         unsigned int result = (word >> 22u) ^ word;
-        return result / 4294967296.0f;
+        // Use upper 23 bits to avoid float precision loss for large u32 values
+        return (result >> 9) * (1.0f / 8388608.0f); // result >> 9 fits in 23-bit mantissa
     }
 };
 
