@@ -1772,26 +1772,80 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                     );
                 } else if class == "scale" {
                     let scale_val = p.float("scale").unwrap_or(1.0);
-                    let scale_rgb = p.rgb("scale").or_else(|| p.rgb("tex"));
-                    // Try texture ref for "scale" or "tex"
-                    let tex_ref = p.texture_ref("scale").or_else(|| p.texture_ref("tex"));
-                    if let Some(tex_ref) = tex_ref {
-                        if let Some(SceneTexture::Image(base)) = textures.get(tex_ref) {
-                            let scaled_data: Vec<f32> =
-                                base.data.iter().map(|v| v * scale_val).collect();
-                            textures.insert(
-                                name.clone(),
-                                SceneTexture::Image(std::sync::Arc::new(ImageTexture::new(
-                                    scaled_data,
-                                    base.width,
-                                    base.height,
-                                ))),
-                            );
-                        } else if let Some(base) = textures.get(tex_ref) {
-                            textures.insert(name.clone(), base.clone());
+                    // "tex" is the base texture, "scale" is the multiplier (texture or float)
+                    let tex_img = p.texture_ref("tex").and_then(|r| match textures.get(r) {
+                        Some(SceneTexture::Image(img)) => Some(img.clone()),
+                        _ => None,
+                    });
+                    let scale_img = p.texture_ref("scale").and_then(|r| match textures.get(r) {
+                        Some(SceneTexture::Image(img)) => Some(img.clone()),
+                        _ => None,
+                    });
+                    let scale_rgb = p.rgb("scale");
+
+                    if let (Some(tex), Some(scale_tex)) = (&tex_img, &scale_img) {
+                        // Per-pixel multiply: resample scale_tex to tex size, multiply
+                        let w = tex.width as usize;
+                        let h = tex.height as usize;
+                        let sw = scale_tex.width as usize;
+                        let sh = scale_tex.height as usize;
+                        let mut data = Vec::with_capacity(w * h * 3);
+                        for y in 0..h {
+                            for x in 0..w {
+                                let si = (y * w + x) * 3;
+                                let sx = x * sw / w;
+                                let sy = y * sh / h;
+                                let ssi = (sy * sw + sx) * 3;
+                                // scale texture is grayscale (all channels same) or RGB
+                                let s = if ssi < scale_tex.data.len() {
+                                    scale_tex.data[ssi]
+                                } else {
+                                    1.0
+                                };
+                                data.push(tex.data[si] * s);
+                                data.push(tex.data[si + 1] * s);
+                                data.push(tex.data[si + 2] * s);
+                            }
                         }
+                        textures.insert(
+                            name.clone(),
+                            SceneTexture::Image(std::sync::Arc::new(ImageTexture::new(
+                                data, tex.width, tex.height,
+                            ))),
+                        );
+                    } else if let Some(tex) = &tex_img {
+                        // Scale base texture by float or rgb constant
+                        let s = if let Some(c) = scale_rgb {
+                            c
+                        } else {
+                            [scale_val, scale_val, scale_val]
+                        };
+                        let scaled_data: Vec<f32> = tex
+                            .data
+                            .chunks(3)
+                            .flat_map(|px| [px[0] * s[0], px[1] * s[1], px[2] * s[2]])
+                            .collect();
+                        textures.insert(
+                            name.clone(),
+                            SceneTexture::Image(std::sync::Arc::new(ImageTexture::new(
+                                scaled_data,
+                                tex.width,
+                                tex.height,
+                            ))),
+                        );
+                    } else if let Some(scale_tex) = &scale_img {
+                        // scale_tex used as-is (no base tex)
+                        let scaled_data: Vec<f32> =
+                            scale_tex.data.iter().map(|v| v * scale_val).collect();
+                        textures.insert(
+                            name.clone(),
+                            SceneTexture::Image(std::sync::Arc::new(ImageTexture::new(
+                                scaled_data,
+                                scale_tex.width,
+                                scale_tex.height,
+                            ))),
+                        );
                     } else if let Some(c) = scale_rgb {
-                        // Inline RGB color scaled by float
                         let sc = [c[0] * scale_val, c[1] * scale_val, c[2] * scale_val];
                         textures.insert(
                             name.clone(),
