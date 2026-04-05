@@ -106,6 +106,9 @@ pub struct HitGroupData {
     pub roughness_data: optix_sys::CUdeviceptr,
     pub roughness_width: i32,
     pub roughness_height: i32,
+    pub normalmap_data: optix_sys::CUdeviceptr,
+    pub normalmap_width: i32,
+    pub normalmap_height: i32,
 }
 
 #[repr(C)]

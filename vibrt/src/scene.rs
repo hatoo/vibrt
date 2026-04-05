@@ -32,6 +32,7 @@ pub struct SceneMaterial {
     pub bump_map: Option<std::sync::Arc<ImageTexture>>,
     pub alpha_map: Option<std::sync::Arc<ImageTexture>>,
     pub roughness_map: Option<std::sync::Arc<ImageTexture>>,
+    pub normal_map: Option<std::sync::Arc<ImageTexture>>,
 }
 
 impl Default for SceneMaterial {
@@ -57,6 +58,7 @@ impl Default for SceneMaterial {
             bump_map: None,
             alpha_map: None,
             roughness_map: None,
+            normal_map: None,
         }
     }
 }
@@ -66,6 +68,7 @@ impl Clone for SceneMaterial {
         Self {
             texture: self.texture.clone(),
             bump_map: self.bump_map.clone(),
+            normal_map: self.normal_map.clone(),
             alpha_map: self.alpha_map.clone(),
             roughness_map: self.roughness_map.clone(),
             ..*self
@@ -1113,7 +1116,22 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                     }
                 }
                 // Acknowledge normalmap (not yet implemented but suppress warning)
-                let _ = p.string("normalmap");
+                if let Some(nm_path) = p.string("normalmap") {
+                    let path = scene_dir.join(nm_path);
+                    match image::open(&path) {
+                        Ok(img) => {
+                            let rgb = img.to_rgb32f();
+                            let (w, h) = rgb.dimensions();
+                            let data: Vec<f32> = rgb.into_raw();
+                            current_material.normal_map = Some(std::sync::Arc::new(ImageTexture {
+                                data,
+                                width: w,
+                                height: h,
+                            }));
+                        }
+                        Err(e) => eprintln!("Failed to load normalmap {}: {e}", path.display()),
+                    }
+                }
             }
             Directive::MakeNamedMaterial { name, params } => {
                 let p = ParamSet::new(params, format!("MakeNamedMaterial \"{name}\""));
@@ -1295,7 +1313,22 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                         None => eprintln!("  warning: roughness texture not found: {tex_name}"),
                     }
                 }
-                let _ = p.string("normalmap");
+                if let Some(nm_path) = p.string("normalmap") {
+                    let path = scene_dir.join(nm_path);
+                    match image::open(&path) {
+                        Ok(img) => {
+                            let rgb = img.to_rgb32f();
+                            let (w, h) = rgb.dimensions();
+                            let data: Vec<f32> = rgb.into_raw();
+                            mat.normal_map = Some(std::sync::Arc::new(ImageTexture {
+                                data,
+                                width: w,
+                                height: h,
+                            }));
+                        }
+                        Err(e) => eprintln!("Failed to load normalmap {}: {e}", path.display()),
+                    }
+                }
                 named_materials.insert(name.clone(), mat);
             }
             Directive::NamedMaterial(name) => {

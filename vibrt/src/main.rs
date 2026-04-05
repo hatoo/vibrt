@@ -211,6 +211,9 @@ fn make_hitgroup_data(
     roughness_data: optix_sys::CUdeviceptr,
     roughness_width: i32,
     roughness_height: i32,
+    normalmap_data: optix_sys::CUdeviceptr,
+    normalmap_width: i32,
+    normalmap_height: i32,
     texcoords: optix_sys::CUdeviceptr,
     normals: optix_sys::CUdeviceptr,
     indices: optix_sys::CUdeviceptr,
@@ -266,6 +269,9 @@ fn make_hitgroup_data(
         roughness_data,
         roughness_width,
         roughness_height,
+        normalmap_data,
+        normalmap_width,
+        normalmap_height,
     }
 }
 
@@ -694,6 +700,9 @@ fn main() -> Result<()> {
                     0,
                     0,
                     0,
+                    0,
+                    0,
+                    0,
                 );
                 hg_data.num_vertices = radius.to_bits() as i32;
 
@@ -801,6 +810,12 @@ fn main() -> Result<()> {
                     (0, 0, 0)
                 };
 
+                let (d_nmap, nmap_w, nmap_h) = if let Some(ref nm) = obj.material.normal_map {
+                    upload_texture(nm, &stream, &mut _device_buffers)?
+                } else {
+                    (0, 0, 0)
+                };
+
                 let hg_data = make_hitgroup_data(
                     &obj.material,
                     d_tex,
@@ -815,6 +830,9 @@ fn main() -> Result<()> {
                     d_rough,
                     rough_w,
                     rough_h,
+                    d_nmap,
+                    nmap_w,
+                    nmap_h,
                     d_tc,
                     d_normals,
                     dptr(&d_indices, &stream),

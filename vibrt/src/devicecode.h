@@ -88,6 +88,9 @@ struct HitGroupData {
   float *roughness_data;
   int roughness_width;
   int roughness_height;
+  float *normalmap_data;
+  int normalmap_width;
+  int normalmap_height;
 };
 
 struct LaunchParams {

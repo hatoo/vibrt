@@ -1409,6 +1409,61 @@ extern "C" __global__ void __closesthit__ch() {
     roughness_val = data->roughness_data[ry * data->roughness_width + rx];
   }
 
+  // Normal mapping: perturb shading normal using tangent-space normal map
+  if (data->normalmap_data && data->texcoords) {
+    float nu = wt * data->texcoords[idx0 * 2] +
+               bary.x * data->texcoords[idx1 * 2] +
+               bary.y * data->texcoords[idx2 * 2];
+    float nv = wt * data->texcoords[idx0 * 2 + 1] +
+               bary.x * data->texcoords[idx1 * 2 + 1] +
+               bary.y * data->texcoords[idx2 * 2 + 1];
+    nu = nu - floorf(nu);
+    nv = nv - floorf(nv);
+
+    // Bilinear sample normal map
+    int nw = data->normalmap_width;
+    int nh = data->normalmap_height;
+    float nfx = nu * (nw - 1);
+    float nfy = (1.0f - nv) * (nh - 1);
+    int nix = max(0, min((int)nfx, nw - 1));
+    int niy = max(0, min((int)nfy, nh - 1));
+    int nix1 = min(nix + 1, nw - 1);
+    int niy1 = min(niy + 1, nh - 1);
+    float ndx = nfx - nix;
+    float ndy = nfy - niy;
+    const float *nd = data->normalmap_data;
+    float3 nm00 =
+        make_float3(nd[(niy * nw + nix) * 3], nd[(niy * nw + nix) * 3 + 1],
+                    nd[(niy * nw + nix) * 3 + 2]);
+    float3 nm10 =
+        make_float3(nd[(niy * nw + nix1) * 3], nd[(niy * nw + nix1) * 3 + 1],
+                    nd[(niy * nw + nix1) * 3 + 2]);
+    float3 nm01 =
+        make_float3(nd[(niy1 * nw + nix) * 3], nd[(niy1 * nw + nix) * 3 + 1],
+                    nd[(niy1 * nw + nix) * 3 + 2]);
+    float3 nm11 =
+        make_float3(nd[(niy1 * nw + nix1) * 3], nd[(niy1 * nw + nix1) * 3 + 1],
+                    nd[(niy1 * nw + nix1) * 3 + 2]);
+    float3 nm_sample = nm00 * (1 - ndx) * (1 - ndy) + nm10 * ndx * (1 - ndy) +
+                       nm01 * (1 - ndx) * ndy + nm11 * ndx * ndy;
+
+    // Remap [0,1] → [-1,1]
+    float3 ts_normal = normalize3(make_float3(nm_sample.x * 2.0f - 1.0f,
+                                              nm_sample.y * 2.0f - 1.0f,
+                                              nm_sample.z * 2.0f - 1.0f));
+
+    // Build TBN from geom_tangent and shading_normal
+    float3 T, B;
+    build_tangent_frame_geom(shading_normal, geom_tangent, T, B);
+
+    // Transform tangent-space normal to world space
+    shading_normal = normalize3(T * ts_normal.x + B * ts_normal.y +
+                                shading_normal * ts_normal.z);
+
+    if (dot3(shading_normal, ray_dir) > 0.0f)
+      shading_normal = shading_normal * (-1.0f);
+  }
+
   set_common_payloads(data, hit_pos, shading_normal, albedo, roughness_val,
                       data->roughness_v, geom_tangent);
 }
