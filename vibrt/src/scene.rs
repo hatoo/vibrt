@@ -20,6 +20,11 @@ pub struct ImageTexture {
     pub height: u32,
     /// Planar mapping: if Some, UVs are computed as dot(pos, v1)+udelta, dot(pos, v2)+vdelta
     pub planar: Option<PlanarMapping>,
+    /// UV scale and offset (applied to mesh UVs before texture lookup)
+    pub uscale: f32,
+    pub vscale: f32,
+    pub udelta: f32,
+    pub vdelta: f32,
 }
 
 impl ImageTexture {
@@ -29,6 +34,10 @@ impl ImageTexture {
             width,
             height,
             planar: None,
+            uscale: 1.0,
+            vscale: 1.0,
+            udelta: 0.0,
+            vdelta: 0.0,
         }
     }
 }
@@ -37,8 +46,6 @@ impl ImageTexture {
 pub struct PlanarMapping {
     pub v1: [f32; 3],
     pub v2: [f32; 3],
-    pub udelta: f32,
-    pub vdelta: f32,
 }
 
 pub struct SceneMaterial {
@@ -1529,8 +1536,32 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                                         raw.into_iter().map(srgb_to_linear).collect()
                                     }
                                 };
+                                // Apply scale multiplier
+                                let tex_scale = p.float("scale").unwrap_or(1.0);
+                                let mut data = if tex_scale != 1.0 {
+                                    data.into_iter().map(|v| v * tex_scale).collect()
+                                } else {
+                                    data
+                                };
+
+                                // Apply invert
+                                if p.bool("invert").unwrap_or(false) {
+                                    for v in data.iter_mut() {
+                                        *v = 1.0 - *v;
+                                    }
+                                }
+
                                 println!("Loaded texture: {}x{} from {}", w, h, path.display());
                                 let mut tex = ImageTexture::new(data, w, h);
+
+                                // UV scale/offset (for non-planar mapping)
+                                tex.uscale = p.float("uscale").unwrap_or(1.0);
+                                tex.vscale = p.float("vscale").unwrap_or(1.0);
+
+                                // UV offset (applies to both planar and UV mapping)
+                                tex.udelta = p.float("udelta").unwrap_or(0.0);
+                                tex.vdelta = p.float("vdelta").unwrap_or(0.0);
+
                                 // Check for planar mapping
                                 let mapping = p.string("mapping").unwrap_or("uv");
                                 if mapping == "planar" {
@@ -1542,14 +1573,7 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                                         .floats("v2")
                                         .map(|v| [v[0] as f32, v[1] as f32, v[2] as f32])
                                         .unwrap_or([0.0, 1.0, 0.0]);
-                                    let udelta = p.float("udelta").unwrap_or(0.0);
-                                    let vdelta = p.float("vdelta").unwrap_or(0.0);
-                                    tex.planar = Some(PlanarMapping {
-                                        v1,
-                                        v2,
-                                        udelta,
-                                        vdelta,
-                                    });
+                                    tex.planar = Some(PlanarMapping { v1, v2 });
                                 }
                                 textures.insert(
                                     name.clone(),
@@ -1701,15 +1725,16 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                             }
                         }
                     }
-                    // If the reflectance texture uses planar mapping, compute projected UVs
+                    // Apply texture UV mapping to mesh texcoords
                     if let Some(ref tex) = mat_override.texture {
-                        if let Some(ref planar) = tex.planar {
-                            if let SceneShape::TriangleMesh {
-                                ref vertices,
-                                ref mut texcoords,
-                                ..
-                            } = shape
-                            {
+                        if let SceneShape::TriangleMesh {
+                            ref vertices,
+                            ref mut texcoords,
+                            ..
+                        } = shape
+                        {
+                            if let Some(ref planar) = tex.planar {
+                                // Planar mapping: project vertices to UVs
                                 let transformed =
                                     transform::transform_vertices(vertices, &current_transform);
                                 let n_verts = transformed.len() / 3;
@@ -1721,15 +1746,25 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                                     let u = px * planar.v1[0]
                                         + py * planar.v1[1]
                                         + pz * planar.v1[2]
-                                        + planar.udelta;
+                                        + tex.udelta;
                                     let v = px * planar.v2[0]
                                         + py * planar.v2[1]
                                         + pz * planar.v2[2]
-                                        + planar.vdelta;
+                                        + tex.vdelta;
                                     new_uv.push(u);
                                     new_uv.push(v);
                                 }
                                 *texcoords = new_uv;
+                            } else if tex.uscale != 1.0
+                                || tex.vscale != 1.0
+                                || tex.udelta != 0.0
+                                || tex.vdelta != 0.0
+                            {
+                                // Apply UV scale/offset to existing mesh UVs
+                                for uv in texcoords.chunks_exact_mut(2) {
+                                    uv[0] = uv[0] * tex.uscale + tex.udelta;
+                                    uv[1] = uv[1] * tex.vscale + tex.vdelta;
+                                }
                             }
                         }
                     }
