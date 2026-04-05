@@ -419,6 +419,30 @@ trace_shadow(float3 origin, float3 dir, float tmax, unsigned int ray_flags) {
 
 // ---- Environment map sampling ----
 
+// Test if a ray from origin in direction dir passes through the portal quad
+static __forceinline__ __device__ bool ray_hits_portal(float3 origin,
+                                                       float3 dir) {
+  if (!params.has_portal)
+    return false;
+  float3 p0 = make_float3(params.portal[0], params.portal[1], params.portal[2]);
+  float3 p1 = make_float3(params.portal[3], params.portal[4], params.portal[5]);
+  float3 p3 =
+      make_float3(params.portal[9], params.portal[10], params.portal[11]);
+  float3 e1 = p1 - p0;
+  float3 e2 = p3 - p0;
+  float3 n = cross3(e1, e2);
+  float denom = dot3(n, dir);
+  if (fabsf(denom) < 1e-8f)
+    return false;
+  float t = dot3(n, p0 - origin) / denom;
+  if (t < 0.0f)
+    return false;
+  float3 hit = origin + dir * t - p0;
+  float u = dot3(hit, e1) / dot3(e1, e1);
+  float v = dot3(hit, e2) / dot3(e2, e2);
+  return u >= 0.0f && u <= 1.0f && v >= 0.0f && v <= 1.0f;
+}
+
 static __forceinline__ __device__ float3 sample_envmap(float3 dir) {
   if (!params.envmap_data)
     return make_f3(params.ambient_light);
@@ -993,8 +1017,15 @@ extern "C" __global__ void __raygen__rg() {
         // double-counting with NEE (envmap or portal) on diffuse paths
         bool has_env_nee = params.envmap_data || params.has_portal;
         if (specular_bounce || !has_env_nee) {
-          float3 bg = sample_envmap(direction);
-          radiance = radiance + throughput * bg;
+          if (params.has_portal && !params.envmap_data) {
+            // Portal with no envmap image: only see ambient through portal
+            if (ray_hits_portal(origin, direction)) {
+              radiance = radiance + throughput * make_f3(params.ambient_light);
+            }
+          } else {
+            float3 bg = sample_envmap(direction);
+            radiance = radiance + throughput * bg;
+          }
         }
         break;
       }
