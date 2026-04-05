@@ -86,15 +86,17 @@ struct MaterialData {
   float *normalmap_data;
   int normalmap_width;
   int normalmap_height;
-};
-
-struct HitGroupData {
-  MaterialData *mat;
-  MaterialData *mat2; // second material for mix (NULL if not mix)
+  // Mix material (recursive tree)
+  MaterialData *mix_mat1; // first sub-material (NULL if leaf)
+  MaterialData *mix_mat2; // second sub-material (NULL if leaf)
   float *mix_amount_data;
   int mix_amount_width;
   int mix_amount_height;
   float mix_amount_value;
+};
+
+struct HitGroupData {
+  MaterialData *mat;
   // Geometry
   float *vertices;
   float *normals;

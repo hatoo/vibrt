@@ -72,7 +72,8 @@ pub struct SceneMaterial {
     pub alpha_map: Option<std::sync::Arc<ImageTexture>>,
     pub roughness_map: Option<std::sync::Arc<ImageTexture>>,
     pub normal_map: Option<std::sync::Arc<ImageTexture>>,
-    // Mix material
+    // Mix material (recursive tree)
+    pub mix_mat1: Option<Box<SceneMaterial>>,
     pub mix_mat2: Option<Box<SceneMaterial>>,
     pub mix_amount: Option<std::sync::Arc<ImageTexture>>,
     pub mix_amount_value: f32,
@@ -104,6 +105,7 @@ impl Default for SceneMaterial {
             alpha_map: None,
             roughness_map: None,
             normal_map: None,
+            mix_mat1: None,
             mix_mat2: None,
             mix_amount: None,
             mix_amount_value: 0.5,
@@ -119,6 +121,7 @@ impl Clone for SceneMaterial {
             normal_map: self.normal_map.clone(),
             alpha_map: self.alpha_map.clone(),
             roughness_map: self.roughness_map.clone(),
+            mix_mat1: self.mix_mat1.clone(),
             mix_mat2: self.mix_mat2.clone(),
             mix_amount: self.mix_amount.clone(),
             ..*self
@@ -1384,10 +1387,9 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                     }
                     "mix" => {
                         if let Some(names) = p.strings("materials") {
-                            // First material is the base (amount=0), second is mat2 (amount=1)
                             if let Some(first) = names.first() {
-                                if let Some(base) = named_materials.get(first.as_str()) {
-                                    mat = base.clone();
+                                if let Some(m1) = named_materials.get(first.as_str()) {
+                                    mat.mix_mat1 = Some(Box::new(m1.clone()));
                                 }
                             }
                             if let Some(second) = names.get(1) {

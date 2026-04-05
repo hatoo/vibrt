@@ -264,6 +264,12 @@ fn make_material_data(
         normalmap_data,
         normalmap_width,
         normalmap_height,
+        mix_mat1: 0,
+        mix_mat2: 0,
+        mix_amount_data: 0,
+        mix_amount_width: 0,
+        mix_amount_height: 0,
+        mix_amount_value: 0.5,
     }
 }
 
@@ -272,6 +278,112 @@ fn upload_material(
     stream: &Arc<cudarc::driver::CudaStream>,
 ) -> Result<optix_sys::CUdeviceptr> {
     alloc_and_copy(stream, mat_data)
+}
+
+/// Recursively upload a SceneMaterial (including mix sub-materials) to GPU.
+fn upload_scene_material(
+    mat: &scene::SceneMaterial,
+    stream: &Arc<cudarc::driver::CudaStream>,
+    bufs: &mut Vec<CudaSlice<u8>>,
+    tex_cache: &mut std::collections::HashMap<
+        *const scene::ImageTexture,
+        (optix_sys::CUdeviceptr, i32, i32),
+    >,
+    bump_cache: &mut std::collections::HashMap<
+        *const scene::ImageTexture,
+        (optix_sys::CUdeviceptr, i32, i32),
+    >,
+) -> Result<optix_sys::CUdeviceptr> {
+    let upload_tex = |tex: &std::sync::Arc<scene::ImageTexture>,
+                      stream: &Arc<cudarc::driver::CudaStream>,
+                      bufs: &mut Vec<CudaSlice<u8>>,
+                      cache: &mut std::collections::HashMap<
+        *const scene::ImageTexture,
+        (optix_sys::CUdeviceptr, i32, i32),
+    >|
+     -> Result<(optix_sys::CUdeviceptr, i32, i32)> {
+        let key = std::sync::Arc::as_ptr(tex);
+        if let Some(&cached) = cache.get(&key) {
+            return Ok(cached);
+        }
+        let s = stream.clone_htod(&tex.data).cuda()?;
+        let ptr = dptr(&s, stream);
+        bufs.push(unsafe { std::mem::transmute(s) });
+        let result = (ptr, tex.width as i32, tex.height as i32);
+        cache.insert(key, result);
+        Ok(result)
+    };
+    let upload_gray = |tex: &std::sync::Arc<scene::ImageTexture>,
+                       stream: &Arc<cudarc::driver::CudaStream>,
+                       bufs: &mut Vec<CudaSlice<u8>>,
+                       cache: &mut std::collections::HashMap<
+        *const scene::ImageTexture,
+        (optix_sys::CUdeviceptr, i32, i32),
+    >|
+     -> Result<(optix_sys::CUdeviceptr, i32, i32)> {
+        let key = std::sync::Arc::as_ptr(tex);
+        if let Some(&cached) = cache.get(&key) {
+            return Ok(cached);
+        }
+        let gray: Vec<f32> = tex
+            .data
+            .chunks(3)
+            .map(|c| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2])
+            .collect();
+        let s = stream.clone_htod(&gray).cuda()?;
+        let ptr = dptr(&s, stream);
+        bufs.push(unsafe { std::mem::transmute(s) });
+        let result = (ptr, tex.width as i32, tex.height as i32);
+        cache.insert(key, result);
+        Ok(result)
+    };
+
+    let (d_tex, tw, th) = if let Some(ref t) = mat.texture {
+        upload_tex(t, stream, bufs, tex_cache)?
+    } else {
+        (0, 0, 0)
+    };
+    let (d_bump, bw, bh) = if let Some(ref b) = mat.bump_map {
+        upload_gray(b, stream, bufs, bump_cache)?
+    } else {
+        (0, 0, 0)
+    };
+    let (d_alpha, aw, ah) = if let Some(ref a) = mat.alpha_map {
+        upload_gray(a, stream, bufs, bump_cache)?
+    } else {
+        (0, 0, 0)
+    };
+    let (d_rough, rw, rh) = if let Some(ref r) = mat.roughness_map {
+        upload_gray(r, stream, bufs, bump_cache)?
+    } else {
+        (0, 0, 0)
+    };
+    let (d_nmap, nw, nh) = if let Some(ref n) = mat.normal_map {
+        upload_tex(n, stream, bufs, tex_cache)?
+    } else {
+        (0, 0, 0)
+    };
+
+    let mut mat_data = make_material_data(
+        mat, d_tex, tw, th, d_bump, bw, bh, d_alpha, aw, ah, d_rough, rw, rh, d_nmap, nw, nh,
+    );
+
+    // Recursively upload mix sub-materials
+    if let Some(ref m1) = mat.mix_mat1 {
+        mat_data.mix_mat1 = upload_scene_material(m1, stream, bufs, tex_cache, bump_cache)?;
+    }
+    if let Some(ref m2) = mat.mix_mat2 {
+        mat_data.mix_mat2 = upload_scene_material(m2, stream, bufs, tex_cache, bump_cache)?;
+    }
+    if let Some(ref amt) = mat.mix_amount {
+        let (d, w, h) = upload_gray(amt, stream, bufs, bump_cache)?;
+        mat_data.mix_amount_data = d;
+        mat_data.mix_amount_width = w;
+        mat_data.mix_amount_height = h;
+    }
+    mat_data.mix_amount_value = mat.mix_amount_value;
+
+    upload_material(&mat_data, stream)
 }
 
 fn compute_camera(
@@ -607,43 +719,6 @@ fn main() -> Result<()> {
     let mut bump_cache: HashMap<*const ImageTexture, (optix_sys::CUdeviceptr, i32, i32)> =
         HashMap::new();
 
-    let mut upload_texture = |tex: &std::sync::Arc<ImageTexture>,
-                              stream: &Arc<cudarc::driver::CudaStream>,
-                              bufs: &mut Vec<CudaSlice<u8>>|
-     -> Result<(optix_sys::CUdeviceptr, i32, i32)> {
-        let key = std::sync::Arc::as_ptr(tex);
-        if let Some(&cached) = tex_cache.get(&key) {
-            return Ok(cached);
-        }
-        let s = stream.clone_htod(&tex.data).cuda()?;
-        let ptr = dptr(&s, stream);
-        bufs.push(unsafe { std::mem::transmute(s) });
-        let result = (ptr, tex.width as i32, tex.height as i32);
-        tex_cache.insert(key, result);
-        Ok(result)
-    };
-
-    let mut upload_bump = |tex: &std::sync::Arc<ImageTexture>,
-                           stream: &Arc<cudarc::driver::CudaStream>,
-                           bufs: &mut Vec<CudaSlice<u8>>|
-     -> Result<(optix_sys::CUdeviceptr, i32, i32)> {
-        let key = std::sync::Arc::as_ptr(tex);
-        if let Some(&cached) = bump_cache.get(&key) {
-            return Ok(cached);
-        }
-        let gray: Vec<f32> = tex
-            .data
-            .chunks(3)
-            .map(|c| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2])
-            .collect();
-        let s = stream.clone_htod(&gray).cuda()?;
-        let ptr = dptr(&s, stream);
-        bufs.push(unsafe { std::mem::transmute(s) });
-        let result = (ptr, tex.width as i32, tex.height as i32);
-        bump_cache.insert(key, result);
-        Ok(result)
-    };
-
     for obj in &scene.objects {
         match &obj.shape {
             SceneShape::Sphere { radius } => {
@@ -680,16 +755,15 @@ fn main() -> Result<()> {
                 .context("sphere accel build")?;
 
                 // Store radius in num_vertices field (reinterpreted as float in shader)
-                let mat_data =
-                    make_material_data(&obj.material, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
-                let d_mat_ptr = upload_material(&mat_data, &stream)?;
+                let d_mat_ptr = upload_scene_material(
+                    &obj.material,
+                    &stream,
+                    &mut _device_buffers,
+                    &mut tex_cache,
+                    &mut bump_cache,
+                )?;
                 let mut hg_data = HitGroupData {
                     mat: d_mat_ptr,
-                    mat2: 0,
-                    mix_amount_data: 0,
-                    mix_amount_width: 0,
-                    mix_amount_height: 0,
-                    mix_amount_value: 0.5,
                     vertices: 0,
                     normals: 0,
                     indices: 0,
@@ -778,106 +852,16 @@ fn main() -> Result<()> {
                 )
                 .context("tri accel build")?;
 
-                let (d_tex, tex_w, tex_h) = if let Some(ref tex) = obj.material.texture {
-                    upload_texture(tex, &stream, &mut _device_buffers)?
-                } else {
-                    (0, 0, 0)
-                };
-
-                let (d_bump, bump_w, bump_h) = if let Some(ref bmp) = obj.material.bump_map {
-                    upload_bump(bmp, &stream, &mut _device_buffers)?
-                } else {
-                    (0, 0, 0)
-                };
-
-                let (d_alpha, alpha_w, alpha_h) = if let Some(ref a) = obj.material.alpha_map {
-                    upload_bump(a, &stream, &mut _device_buffers)?
-                } else {
-                    (0, 0, 0)
-                };
-
-                let (d_rough, rough_w, rough_h) = if let Some(ref r) = obj.material.roughness_map {
-                    upload_bump(r, &stream, &mut _device_buffers)?
-                } else {
-                    (0, 0, 0)
-                };
-
-                let (d_nmap, nmap_w, nmap_h) = if let Some(ref nm) = obj.material.normal_map {
-                    upload_texture(nm, &stream, &mut _device_buffers)?
-                } else {
-                    (0, 0, 0)
-                };
-
-                let mat_data = make_material_data(
+                let d_mat_ptr = upload_scene_material(
                     &obj.material,
-                    d_tex,
-                    tex_w,
-                    tex_h,
-                    d_bump,
-                    bump_w,
-                    bump_h,
-                    d_alpha,
-                    alpha_w,
-                    alpha_h,
-                    d_rough,
-                    rough_w,
-                    rough_h,
-                    d_nmap,
-                    nmap_w,
-                    nmap_h,
-                );
-                let d_mat_ptr = upload_material(&mat_data, &stream)?;
-
-                // Mix material: upload second material and amount texture
-                let (d_mat2, d_mix_amt, mix_amt_w, mix_amt_h) =
-                    if let Some(ref m2) = obj.material.mix_mat2 {
-                        let (m2_tex, m2_tw, m2_th) = if let Some(ref tex) = m2.texture {
-                            upload_texture(tex, &stream, &mut _device_buffers)?
-                        } else {
-                            (0, 0, 0)
-                        };
-                        let (m2_bump, m2_bw, m2_bh) = if let Some(ref bmp) = m2.bump_map {
-                            upload_bump(bmp, &stream, &mut _device_buffers)?
-                        } else {
-                            (0, 0, 0)
-                        };
-                        let (m2_alpha, m2_aw, m2_ah) = if let Some(ref a) = m2.alpha_map {
-                            upload_bump(a, &stream, &mut _device_buffers)?
-                        } else {
-                            (0, 0, 0)
-                        };
-                        let (m2_rough, m2_rw, m2_rh) = if let Some(ref r) = m2.roughness_map {
-                            upload_bump(r, &stream, &mut _device_buffers)?
-                        } else {
-                            (0, 0, 0)
-                        };
-                        let (m2_nmap, m2_nw, m2_nh) = if let Some(ref nm) = m2.normal_map {
-                            upload_texture(nm, &stream, &mut _device_buffers)?
-                        } else {
-                            (0, 0, 0)
-                        };
-                        let mat2_data = make_material_data(
-                            m2, m2_tex, m2_tw, m2_th, m2_bump, m2_bw, m2_bh, m2_alpha, m2_aw,
-                            m2_ah, m2_rough, m2_rw, m2_rh, m2_nmap, m2_nw, m2_nh,
-                        );
-                        let d_m2 = upload_material(&mat2_data, &stream)?;
-                        let (d_amt, aw, ah) = if let Some(ref amt) = obj.material.mix_amount {
-                            upload_bump(amt, &stream, &mut _device_buffers)?
-                        } else {
-                            (0, 0, 0)
-                        };
-                        (d_m2, d_amt, aw, ah)
-                    } else {
-                        (0, 0, 0, 0)
-                    };
+                    &stream,
+                    &mut _device_buffers,
+                    &mut tex_cache,
+                    &mut bump_cache,
+                )?;
 
                 let hg_data = HitGroupData {
                     mat: d_mat_ptr,
-                    mat2: d_mat2,
-                    mix_amount_data: d_mix_amt,
-                    mix_amount_width: mix_amt_w,
-                    mix_amount_height: mix_amt_h,
-                    mix_amount_value: obj.material.mix_amount_value,
                     vertices: dptr(&d_verts, &stream),
                     normals: d_normals,
                     indices: dptr(&d_indices, &stream),

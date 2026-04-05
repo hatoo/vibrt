@@ -104,17 +104,19 @@ pub struct MaterialData {
     pub normalmap_data: optix_sys::CUdeviceptr,
     pub normalmap_width: i32,
     pub normalmap_height: i32,
+    // Mix material (recursive tree)
+    pub mix_mat1: optix_sys::CUdeviceptr, // first sub-material (0 if leaf)
+    pub mix_mat2: optix_sys::CUdeviceptr, // second sub-material (0 if leaf)
+    pub mix_amount_data: optix_sys::CUdeviceptr,
+    pub mix_amount_width: i32,
+    pub mix_amount_height: i32,
+    pub mix_amount_value: f32,
 }
 
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct HitGroupData {
-    pub mat: optix_sys::CUdeviceptr,  // pointer to MaterialData on device
-    pub mat2: optix_sys::CUdeviceptr, // second material for mix (0 if not mix)
-    pub mix_amount_data: optix_sys::CUdeviceptr,
-    pub mix_amount_width: i32,
-    pub mix_amount_height: i32,
-    pub mix_amount_value: f32,
+    pub mat: optix_sys::CUdeviceptr, // pointer to MaterialData on device
     // Geometry
     pub vertices: optix_sys::CUdeviceptr,
     pub normals: optix_sys::CUdeviceptr,
