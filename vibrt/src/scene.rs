@@ -511,13 +511,17 @@ fn blackbody_to_rgb(kelvin: f32) -> [f32; 3] {
 
 // ---- Shape parsing helper ----
 
+/// Returns (shape, alpha_texture_name, displacement_texture_name)
 fn parse_shape(
     ty: &str,
     params: &[pbrt_parser::Param],
     scene_dir: &Path,
-) -> Option<(SceneShape, Option<String>)> {
+) -> Option<(SceneShape, Option<String>, Option<String>)> {
     let p = ParamSet::new(params, format!("Shape \"{ty}\""));
     let alpha_tex = p.texture_ref("alpha").map(|s| s.to_string());
+    let disp_tex = p.texture_ref("displacement").map(|s| s.to_string());
+    // edgelength controls subdivision for displacement (not implemented)
+    let _ = p.float("edgelength");
     // Known but not fully used
     match ty {
         "sphere" => {
@@ -668,7 +672,7 @@ fn parse_shape(
             None
         }
     }
-    .map(|shape| (shape, alpha_tex))
+    .map(|shape| (shape, alpha_tex, disp_tex))
 }
 
 // ---- Main scene parser ----
@@ -1310,6 +1314,28 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                             );
                         }
                     }
+                    "diffusetransmission" => {
+                        // Approximate as diffuse (ignore transmittance)
+                        mat.material_type = MAT_DIFFUSE;
+                        if let Some(c) = p.rgb("reflectance") {
+                            mat.albedo = c;
+                        }
+                        // Acknowledge transmittance param
+                        let _ = p.rgb("transmittance");
+                        if let Some(tex_name) = p.texture_ref("reflectance") {
+                            match textures.get(tex_name) {
+                                Some(SceneTexture::Image(img)) => {
+                                    mat.texture = Some(img.clone())
+                                }
+                                Some(_) => eprintln!(
+                                    "  warning: non-image texture type not supported for: {tex_name}"
+                                ),
+                                None => eprintln!(
+                                    "  warning: unknown texture reference: {tex_name}"
+                                ),
+                            }
+                        }
+                    }
                     _ => {
                         eprintln!("  warning: unsupported MakeNamedMaterial type: {ty}");
                     }
@@ -1451,7 +1477,10 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                     );
                 } else if class == "scale" {
                     let scale_val = p.float("scale").unwrap_or(1.0);
-                    if let Some(tex_ref) = p.texture_ref("tex") {
+                    let scale_rgb = p.rgb("scale").or_else(|| p.rgb("tex"));
+                    // Try texture ref for "scale" or "tex"
+                    let tex_ref = p.texture_ref("scale").or_else(|| p.texture_ref("tex"));
+                    if let Some(tex_ref) = tex_ref {
                         if let Some(SceneTexture::Image(base)) = textures.get(tex_ref) {
                             let scaled_data: Vec<f32> =
                                 base.data.iter().map(|v| v * scale_val).collect();
@@ -1466,20 +1495,50 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                         } else if let Some(base) = textures.get(tex_ref) {
                             textures.insert(name.clone(), base.clone());
                         }
+                    } else if let Some(c) = scale_rgb {
+                        // Inline RGB color scaled by float
+                        let sc = [c[0] * scale_val, c[1] * scale_val, c[2] * scale_val];
+                        textures.insert(
+                            name.clone(),
+                            SceneTexture::Image(std::sync::Arc::new(ImageTexture {
+                                data: vec![sc[0], sc[1], sc[2]],
+                                width: 1,
+                                height: 1,
+                            })),
+                        );
                     }
                 } else if class == "mix" {
-                    if let Some(tex_ref) = p.texture_ref("tex") {
-                        if let Some(base) = textures.get(tex_ref) {
-                            textures.insert(name.clone(), base.clone());
-                        } else {
-                            eprintln!("  warning: mix texture ref not found: {tex_ref}");
+                    // Try tex/tex1 as texture refs first, then fall back to inline rgb
+                    let mut inserted = false;
+                    for key in &["tex", "tex1"] {
+                        if let Some(tex_ref) = p.texture_ref(key) {
+                            if let Some(base) = textures.get(tex_ref) {
+                                textures.insert(name.clone(), base.clone());
+                                inserted = true;
+                                break;
+                            }
                         }
                     }
+                    if !inserted {
+                        // Try inline RGB values
+                        if let Some(c) = p.rgb("tex1").or_else(|| p.rgb("tex2")) {
+                            textures.insert(
+                                name.clone(),
+                                SceneTexture::Image(std::sync::Arc::new(ImageTexture {
+                                    data: vec![c[0], c[1], c[2]],
+                                    width: 1,
+                                    height: 1,
+                                })),
+                            );
+                        }
+                    }
+                } else if class == "directionmix" {
+                    // Approximate by using tex1 (ignore viewing-direction blend)
                     if let Some(tex_ref) = p.texture_ref("tex1") {
                         if let Some(base) = textures.get(tex_ref) {
                             textures.insert(name.clone(), base.clone());
                         } else {
-                            eprintln!("  warning: mix texture ref not found: {tex_ref}");
+                            eprintln!("  warning: directionmix tex1 not found: {tex_ref}");
                         }
                     }
                 } else {
@@ -1487,13 +1546,20 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                 }
             }
             Directive::Shape { ty, params } => {
-                if let Some((mut shape, alpha_tex)) = parse_shape(ty, params, scene_dir) {
+                if let Some((mut shape, alpha_tex, disp_tex)) = parse_shape(ty, params, scene_dir) {
                     let mut mat_override = current_material.clone();
                     if let Some(ref tex_name) = alpha_tex {
                         match textures.get(tex_name.as_str()) {
                             Some(SceneTexture::Image(img)) => mat_override.alpha_map = Some(img.clone()),
                             Some(_) => eprintln!("  warning: non-image texture type not supported for alpha: {tex_name}"),
                             None => eprintln!("  warning: alpha texture not found: {tex_name}"),
+                        }
+                    }
+                    if let Some(ref tex_name) = disp_tex {
+                        match textures.get(tex_name.as_str()) {
+                            Some(SceneTexture::Image(img)) => mat_override.bump_map = Some(img.clone()),
+                            Some(_) => eprintln!("  warning: non-image texture type not supported for displacement: {tex_name}"),
+                            None => eprintln!("  warning: displacement texture not found: {tex_name}"),
                         }
                     }
                     if reverse_orientation {
