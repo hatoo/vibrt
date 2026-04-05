@@ -1359,9 +1359,9 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
             }
             Directive::Texture {
                 name,
+                ty,
                 class,
                 params,
-                ..
             } => {
                 let p = ParamSet::new(params, format!("Texture \"{name}\" \"{class}\""));
                 if class == "checkerboard" {
@@ -1379,9 +1379,29 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                         let path = scene_dir.join(filename);
                         match image::open(&path) {
                             Ok(img) => {
-                                let rgb = img.to_rgb32f();
-                                let (w, h) = rgb.dimensions();
-                                let data: Vec<f32> = rgb.into_raw();
+                                let (w, h) = (img.width(), img.height());
+                                let data: Vec<f32> = if ty == "float" {
+                                    // Float texture: extract alpha channel, or use luminance if no alpha
+                                    let rgba = img.to_rgba32f();
+                                    let raw = rgba.into_raw();
+                                    let has_alpha = raw.chunks(4).any(|px| px[3] < 0.99);
+                                    if has_alpha {
+                                        // Use alpha channel, store as single-channel RGB (replicated)
+                                        raw.chunks(4).flat_map(|px| [px[3], px[3], px[3]]).collect()
+                                    } else {
+                                        // No alpha — use luminance
+                                        raw.chunks(4)
+                                            .flat_map(|px| {
+                                                let l = 0.2126 * px[0]
+                                                    + 0.7152 * px[1]
+                                                    + 0.0722 * px[2];
+                                                [l, l, l]
+                                            })
+                                            .collect()
+                                    }
+                                } else {
+                                    img.to_rgb32f().into_raw()
+                                };
                                 println!("Loaded texture: {}x{} from {}", w, h, path.display());
                                 textures.insert(
                                     name.clone(),
