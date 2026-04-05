@@ -55,8 +55,7 @@ struct ConductorParams {
   float k[3];
 };
 
-struct HitGroupData {
-  // Material
+struct MaterialData {
   int material_type;
   float albedo[3];
   float emission[3];
@@ -71,12 +70,6 @@ struct HitGroupData {
     DielectricParams dielectric;
     ConductorParams conductor;
   };
-  // Geometry
-  float *vertices;
-  float *normals;
-  int *indices;
-  float *texcoords;
-  int num_vertices;
   // Texture maps
   float *texture_data;
   int texture_width;
@@ -93,6 +86,16 @@ struct HitGroupData {
   float *normalmap_data;
   int normalmap_width;
   int normalmap_height;
+};
+
+struct HitGroupData {
+  MaterialData *mat;
+  // Geometry
+  float *vertices;
+  float *normals;
+  int *indices;
+  float *texcoords;
+  int num_vertices;
 };
 
 struct LaunchParams {

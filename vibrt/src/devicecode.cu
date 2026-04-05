@@ -799,14 +799,14 @@ conductor_specular_bounce(float u1, float u2, float3 view_dir, float alpha_u,
 
 // Set material-independent payloads from closesthit data
 static __forceinline__ __device__ void
-set_common_payloads(const HitGroupData *data, float3 hit_pos, float3 normal,
+set_common_payloads(const MaterialData *mat, float3 hit_pos, float3 normal,
                     float3 albedo, float roughness, float roughness_v,
                     float3 tangent) {
-  if (data->material_type == MAT_DIELECTRIC) {
-    optixSetPayload_0(__float_as_uint(data->dielectric.eta));
-    optixSetPayload_1(__float_as_uint(data->dielectric.tint[0]));
-    optixSetPayload_2(__float_as_uint(data->dielectric.tint[1]));
-    optixSetPayload_13(__float_as_uint(data->dielectric.tint[2]));
+  if (mat->material_type == MAT_DIELECTRIC) {
+    optixSetPayload_0(__float_as_uint(mat->dielectric.eta));
+    optixSetPayload_1(__float_as_uint(mat->dielectric.tint[0]));
+    optixSetPayload_2(__float_as_uint(mat->dielectric.tint[1]));
+    optixSetPayload_13(__float_as_uint(mat->dielectric.tint[2]));
   } else {
     optixSetPayload_0(__float_as_uint(albedo.x));
     optixSetPayload_1(__float_as_uint(albedo.y));
@@ -820,35 +820,35 @@ set_common_payloads(const HitGroupData *data, float3 hit_pos, float3 normal,
   optixSetPayload_6(__float_as_uint(normal.x));
   optixSetPayload_7(__float_as_uint(normal.y));
   optixSetPayload_8(__float_as_uint(normal.z));
-  optixSetPayload_9((unsigned int)data->material_type);
-  optixSetPayload_10(__float_as_uint(data->emission[0]));
-  optixSetPayload_11(__float_as_uint(data->emission[1]));
-  optixSetPayload_12(__float_as_uint(data->emission[2]));
+  optixSetPayload_9((unsigned int)mat->material_type);
+  optixSetPayload_10(__float_as_uint(mat->emission[0]));
+  optixSetPayload_11(__float_as_uint(mat->emission[1]));
+  optixSetPayload_12(__float_as_uint(mat->emission[2]));
 
   float rv = roughness_v;
   if (rv == 0.0f)
     rv = roughness;
   optixSetPayload_22(__float_as_uint(rv));
 
-  if (data->material_type == MAT_CONDUCTOR ||
-      data->material_type == MAT_COATED_CONDUCTOR) {
-    optixSetPayload_14(__float_as_uint(data->conductor.eta[0]));
-    optixSetPayload_15(__float_as_uint(data->conductor.eta[1]));
-    optixSetPayload_16(__float_as_uint(data->conductor.eta[2]));
-    optixSetPayload_17(__float_as_uint(data->conductor.k[0]));
-    optixSetPayload_18(__float_as_uint(data->conductor.k[1]));
-    optixSetPayload_19(__float_as_uint(data->conductor.k[2]));
+  if (mat->material_type == MAT_CONDUCTOR ||
+      mat->material_type == MAT_COATED_CONDUCTOR) {
+    optixSetPayload_14(__float_as_uint(mat->conductor.eta[0]));
+    optixSetPayload_15(__float_as_uint(mat->conductor.eta[1]));
+    optixSetPayload_16(__float_as_uint(mat->conductor.eta[2]));
+    optixSetPayload_17(__float_as_uint(mat->conductor.k[0]));
+    optixSetPayload_18(__float_as_uint(mat->conductor.k[1]));
+    optixSetPayload_19(__float_as_uint(mat->conductor.k[2]));
   }
-  if (data->material_type == MAT_COATED_CONDUCTOR ||
-      data->material_type == MAT_COATED_DIFFUSE) {
-    optixSetPayload_20(__float_as_uint(data->coat_roughness));
-    optixSetPayload_21(__float_as_uint(data->coat_eta));
+  if (mat->material_type == MAT_COATED_CONDUCTOR ||
+      mat->material_type == MAT_COATED_DIFFUSE) {
+    optixSetPayload_20(__float_as_uint(mat->coat_roughness));
+    optixSetPayload_21(__float_as_uint(mat->coat_eta));
   }
-  if (data->material_type == MAT_COATED_CONDUCTOR) {
-    optixSetPayload_26(__float_as_uint(data->coat_thickness));
-    optixSetPayload_27(__float_as_uint(data->coat_albedo[0]));
-    optixSetPayload_28(__float_as_uint(data->coat_albedo[1]));
-    optixSetPayload_29(__float_as_uint(data->coat_albedo[2]));
+  if (mat->material_type == MAT_COATED_CONDUCTOR) {
+    optixSetPayload_26(__float_as_uint(mat->coat_thickness));
+    optixSetPayload_27(__float_as_uint(mat->coat_albedo[0]));
+    optixSetPayload_28(__float_as_uint(mat->coat_albedo[1]));
+    optixSetPayload_29(__float_as_uint(mat->coat_albedo[2]));
   }
 
   optixSetPayload_23(__float_as_uint(tangent.x));
@@ -1122,6 +1122,7 @@ extern "C" __global__ void __miss__ms() {
 extern "C" __global__ void __closesthit__ch() {
   const HitGroupData *data =
       reinterpret_cast<const HitGroupData *>(optixGetSbtDataPointer());
+  const MaterialData *mat = data->mat;
   const float2 bary = optixGetTriangleBarycentrics();
   const int prim_idx = optixGetPrimitiveIndex();
 
@@ -1210,7 +1211,7 @@ extern "C" __global__ void __closesthit__ch() {
   }
 
   // Bump mapping (matches PBRT's BumpMap)
-  if (data->bump_data && data->texcoords) {
+  if (mat->bump_data && data->texcoords) {
     // Interpolate UVs
     float2 uv0 =
         make_float2(data->texcoords[idx0 * 2], data->texcoords[idx0 * 2 + 1]);
@@ -1323,8 +1324,8 @@ extern "C" __global__ void __closesthit__ch() {
     }
 
     // Sample displacement texture
-    int bw_ = data->bump_width;
-    int bh_ = data->bump_height;
+    int bw_ = mat->bump_width;
+    int bh_ = mat->bump_height;
     auto sample_bump = [&](float su, float sv) -> float {
       su = su - floorf(su);
       sv = sv - floorf(sv);
@@ -1332,7 +1333,7 @@ extern "C" __global__ void __closesthit__ch() {
       int iy = (int)((1.0f - sv) * (bh_ - 1));
       ix = max(0, min(ix, bw_ - 1));
       iy = max(0, min(iy, bh_ - 1));
-      return data->bump_data[iy * bw_ + ix];
+      return mat->bump_data[iy * bw_ + ix];
     };
 
     float displace = sample_bump(u_coord, v_coord);
@@ -1352,10 +1353,10 @@ extern "C" __global__ void __closesthit__ch() {
       shading_normal = shading_normal * (-1.0f);
   }
 
-  float3 albedo = make_f3(data->albedo);
+  float3 albedo = make_f3(mat->albedo);
 
   // Checkerboard procedural texture
-  if (data->material_type == MAT_DIFFUSE && data->diffuse.has_checkerboard) {
+  if (mat->material_type == MAT_DIFFUSE && mat->diffuse.has_checkerboard) {
     float u_coord = 0.0f, v_coord = 0.0f;
     if (data->texcoords) {
       u_coord = wt * data->texcoords[idx0 * 2] +
@@ -1365,18 +1366,18 @@ extern "C" __global__ void __closesthit__ch() {
                 bary.x * data->texcoords[idx1 * 2 + 1] +
                 bary.y * data->texcoords[idx2 * 2 + 1];
     }
-    u_coord *= data->diffuse.checker_scale_u;
-    v_coord *= data->diffuse.checker_scale_v;
+    u_coord *= mat->diffuse.checker_scale_u;
+    v_coord *= mat->diffuse.checker_scale_v;
     int cu = (int)floorf(u_coord);
     int cv = (int)floorf(v_coord);
     if (((cu ^ cv) & 1) == 0)
-      albedo = make_f3(data->diffuse.checker_color1);
+      albedo = make_f3(mat->diffuse.checker_color1);
     else
-      albedo = make_f3(data->diffuse.checker_color2);
+      albedo = make_f3(mat->diffuse.checker_color2);
   }
 
   // Image texture sampling
-  if (data->texture_data && data->texcoords) {
+  if (mat->texture_data && data->texcoords) {
     float u_coord = wt * data->texcoords[idx0 * 2] +
                     bary.x * data->texcoords[idx1 * 2] +
                     bary.y * data->texcoords[idx2 * 2];
@@ -1389,36 +1390,36 @@ extern "C" __global__ void __closesthit__ch() {
     v_coord = v_coord - floorf(v_coord);
 
     // Bilinear sample
-    float fx = u_coord * (data->texture_width - 1);
-    float fy = (1.0f - v_coord) * (data->texture_height - 1); // flip V
+    float fx = u_coord * (mat->texture_width - 1);
+    float fy = (1.0f - v_coord) * (mat->texture_height - 1); // flip V
     int ix = (int)fx;
     int iy = (int)fy;
     float dx = fx - ix;
     float dy = fy - iy;
-    int ix1 = min(ix + 1, data->texture_width - 1);
-    int iy1 = min(iy + 1, data->texture_height - 1);
+    int ix1 = min(ix + 1, mat->texture_width - 1);
+    int iy1 = min(iy + 1, mat->texture_height - 1);
 
-    int tw = data->texture_width;
-    float3 c00 = make_float3(data->texture_data[(iy * tw + ix) * 3],
-                             data->texture_data[(iy * tw + ix) * 3 + 1],
-                             data->texture_data[(iy * tw + ix) * 3 + 2]);
-    float3 c10 = make_float3(data->texture_data[(iy * tw + ix1) * 3],
-                             data->texture_data[(iy * tw + ix1) * 3 + 1],
-                             data->texture_data[(iy * tw + ix1) * 3 + 2]);
-    float3 c01 = make_float3(data->texture_data[(iy1 * tw + ix) * 3],
-                             data->texture_data[(iy1 * tw + ix) * 3 + 1],
-                             data->texture_data[(iy1 * tw + ix) * 3 + 2]);
-    float3 c11 = make_float3(data->texture_data[(iy1 * tw + ix1) * 3],
-                             data->texture_data[(iy1 * tw + ix1) * 3 + 1],
-                             data->texture_data[(iy1 * tw + ix1) * 3 + 2]);
+    int tw = mat->texture_width;
+    float3 c00 = make_float3(mat->texture_data[(iy * tw + ix) * 3],
+                             mat->texture_data[(iy * tw + ix) * 3 + 1],
+                             mat->texture_data[(iy * tw + ix) * 3 + 2]);
+    float3 c10 = make_float3(mat->texture_data[(iy * tw + ix1) * 3],
+                             mat->texture_data[(iy * tw + ix1) * 3 + 1],
+                             mat->texture_data[(iy * tw + ix1) * 3 + 2]);
+    float3 c01 = make_float3(mat->texture_data[(iy1 * tw + ix) * 3],
+                             mat->texture_data[(iy1 * tw + ix) * 3 + 1],
+                             mat->texture_data[(iy1 * tw + ix) * 3 + 2]);
+    float3 c11 = make_float3(mat->texture_data[(iy1 * tw + ix1) * 3],
+                             mat->texture_data[(iy1 * tw + ix1) * 3 + 1],
+                             mat->texture_data[(iy1 * tw + ix1) * 3 + 2]);
 
     albedo = c00 * (1 - dx) * (1 - dy) + c10 * dx * (1 - dy) +
              c01 * (1 - dx) * dy + c11 * dx * dy;
   }
 
   // Roughness: sample from texture if available, otherwise use constant
-  float roughness_val = data->roughness;
-  if (data->roughness_data && data->texcoords) {
+  float roughness_val = mat->roughness;
+  if (mat->roughness_data && data->texcoords) {
     float ru = wt * data->texcoords[idx0 * 2] +
                bary.x * data->texcoords[idx1 * 2] +
                bary.y * data->texcoords[idx2 * 2];
@@ -1427,15 +1428,15 @@ extern "C" __global__ void __closesthit__ch() {
                bary.y * data->texcoords[idx2 * 2 + 1];
     ru = ru - floorf(ru);
     rv = rv - floorf(rv);
-    int rx = max(0, min((int)(ru * (data->roughness_width - 1)),
-                        data->roughness_width - 1));
-    int ry = max(0, min((int)((1.0f - rv) * (data->roughness_height - 1)),
-                        data->roughness_height - 1));
-    roughness_val = data->roughness_data[ry * data->roughness_width + rx];
+    int rx = max(0, min((int)(ru * (mat->roughness_width - 1)),
+                        mat->roughness_width - 1));
+    int ry = max(0, min((int)((1.0f - rv) * (mat->roughness_height - 1)),
+                        mat->roughness_height - 1));
+    roughness_val = mat->roughness_data[ry * mat->roughness_width + rx];
   }
 
   // Normal mapping: perturb shading normal using tangent-space normal map
-  if (data->normalmap_data && data->texcoords) {
+  if (mat->normalmap_data && data->texcoords) {
     float nu = wt * data->texcoords[idx0 * 2] +
                bary.x * data->texcoords[idx1 * 2] +
                bary.y * data->texcoords[idx2 * 2];
@@ -1446,8 +1447,8 @@ extern "C" __global__ void __closesthit__ch() {
     nv = nv - floorf(nv);
 
     // Bilinear sample normal map
-    int nw = data->normalmap_width;
-    int nh = data->normalmap_height;
+    int nw = mat->normalmap_width;
+    int nh = mat->normalmap_height;
     float nfx = nu * (nw - 1);
     float nfy = (1.0f - nv) * (nh - 1);
     int nix = max(0, min((int)nfx, nw - 1));
@@ -1456,7 +1457,7 @@ extern "C" __global__ void __closesthit__ch() {
     int niy1 = min(niy + 1, nh - 1);
     float ndx = nfx - nix;
     float ndy = nfy - niy;
-    const float *nd = data->normalmap_data;
+    const float *nd = mat->normalmap_data;
     float3 nm00 =
         make_float3(nd[(niy * nw + nix) * 3], nd[(niy * nw + nix) * 3 + 1],
                     nd[(niy * nw + nix) * 3 + 2]);
@@ -1489,14 +1490,15 @@ extern "C" __global__ void __closesthit__ch() {
       shading_normal = shading_normal * (-1.0f);
   }
 
-  set_common_payloads(data, hit_pos, shading_normal, albedo, roughness_val,
-                      data->roughness_v, geom_tangent);
+  set_common_payloads(mat, hit_pos, shading_normal, albedo, roughness_val,
+                      mat->roughness_v, geom_tangent);
 }
 
 // Closest hit for sphere
 extern "C" __global__ void __closesthit__sphere() {
   const HitGroupData *data =
       reinterpret_cast<const HitGroupData *>(optixGetSbtDataPointer());
+  const MaterialData *mat = data->mat;
   const float t = optixGetRayTmax();
   const float3 ray_orig = optixGetWorldRayOrigin();
   const float3 ray_dir = optixGetWorldRayDirection();
@@ -1509,15 +1511,16 @@ extern "C" __global__ void __closesthit__sphere() {
   if (dot3(world_normal, ray_dir) > 0.0f)
     world_normal = world_normal * (-1.0f);
 
-  set_common_payloads(data, hit_pos, world_normal, make_f3(data->albedo),
-                      data->roughness, data->roughness_v, make_float3(0, 0, 0));
+  set_common_payloads(mat, hit_pos, world_normal, make_f3(mat->albedo),
+                      mat->roughness, mat->roughness_v, make_float3(0, 0, 0));
 }
 
 // Any-hit program for alpha cutout
 extern "C" __global__ void __anyhit__alpha() {
   const HitGroupData *data =
       reinterpret_cast<const HitGroupData *>(optixGetSbtDataPointer());
-  if (!data->alpha_data || !data->texcoords)
+  const MaterialData *mat = data->mat;
+  if (!mat->alpha_data || !data->texcoords)
     return;
 
   const float2 bary = optixGetTriangleBarycentrics();
@@ -1541,11 +1544,10 @@ extern "C" __global__ void __anyhit__alpha() {
             bary.y * data->texcoords[i2 * 2 + 1];
   u = u - floorf(u);
   v = v - floorf(v);
-  int ix =
-      max(0, min((int)(u * (data->alpha_width - 1)), data->alpha_width - 1));
-  int iy = max(0, min((int)((1.0f - v) * (data->alpha_height - 1)),
-                      data->alpha_height - 1));
-  float alpha = data->alpha_data[iy * data->alpha_width + ix];
+  int ix = max(0, min((int)(u * (mat->alpha_width - 1)), mat->alpha_width - 1));
+  int iy = max(0, min((int)((1.0f - v) * (mat->alpha_height - 1)),
+                      mat->alpha_height - 1));
+  float alpha = mat->alpha_data[iy * mat->alpha_width + ix];
   if (alpha < 0.5f) {
     optixIgnoreIntersection();
   }

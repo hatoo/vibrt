@@ -77,8 +77,7 @@ pub union MaterialParams {
 
 #[repr(C)]
 #[derive(Copy, Clone)]
-pub struct HitGroupData {
-    // Material
+pub struct MaterialData {
     pub material_type: i32,
     pub albedo: [f32; 3],
     pub emission: [f32; 3],
@@ -89,12 +88,6 @@ pub struct HitGroupData {
     pub coat_thickness: f32,
     pub coat_albedo: [f32; 3],
     pub params: MaterialParams,
-    // Geometry
-    pub vertices: optix_sys::CUdeviceptr,
-    pub normals: optix_sys::CUdeviceptr,
-    pub indices: optix_sys::CUdeviceptr,
-    pub texcoords: optix_sys::CUdeviceptr,
-    pub num_vertices: i32,
     // Texture maps
     pub texture_data: optix_sys::CUdeviceptr,
     pub texture_width: i32,
@@ -111,6 +104,18 @@ pub struct HitGroupData {
     pub normalmap_data: optix_sys::CUdeviceptr,
     pub normalmap_width: i32,
     pub normalmap_height: i32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct HitGroupData {
+    pub mat: optix_sys::CUdeviceptr, // pointer to MaterialData on device
+    // Geometry
+    pub vertices: optix_sys::CUdeviceptr,
+    pub normals: optix_sys::CUdeviceptr,
+    pub indices: optix_sys::CUdeviceptr,
+    pub texcoords: optix_sys::CUdeviceptr,
+    pub num_vertices: i32,
 }
 
 #[repr(C)]

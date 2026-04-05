@@ -197,7 +197,7 @@ fn generate_ggx_energy_lut() -> (Vec<f32>, Vec<f32>) {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn make_hitgroup_data(
+fn make_material_data(
     mat: &scene::SceneMaterial,
     texture_data: optix_sys::CUdeviceptr,
     texture_width: i32,
@@ -214,12 +214,7 @@ fn make_hitgroup_data(
     normalmap_data: optix_sys::CUdeviceptr,
     normalmap_width: i32,
     normalmap_height: i32,
-    texcoords: optix_sys::CUdeviceptr,
-    normals: optix_sys::CUdeviceptr,
-    indices: optix_sys::CUdeviceptr,
-    vertices: optix_sys::CUdeviceptr,
-    num_vertices: i32,
-) -> HitGroupData {
+) -> MaterialData {
     let params = match mat.material_type {
         MAT_DIELECTRIC => MaterialParams {
             dielectric: DielectricParams {
@@ -243,7 +238,7 @@ fn make_hitgroup_data(
             },
         },
     };
-    HitGroupData {
+    MaterialData {
         material_type: mat.material_type,
         albedo: mat.albedo,
         emission: mat.emission,
@@ -254,11 +249,6 @@ fn make_hitgroup_data(
         coat_thickness: mat.coat_thickness,
         coat_albedo: mat.coat_albedo,
         params,
-        vertices,
-        normals,
-        indices,
-        texcoords,
-        num_vertices,
         texture_data,
         texture_width,
         texture_height,
@@ -275,6 +265,13 @@ fn make_hitgroup_data(
         normalmap_width,
         normalmap_height,
     }
+}
+
+fn upload_material(
+    mat_data: &MaterialData,
+    stream: &Arc<cudarc::driver::CudaStream>,
+) -> Result<optix_sys::CUdeviceptr> {
+    alloc_and_copy(stream, mat_data)
 }
 
 fn compute_camera(
@@ -683,29 +680,17 @@ fn main() -> Result<()> {
                 .context("sphere accel build")?;
 
                 // Store radius in num_vertices field (reinterpreted as float in shader)
-                let mut hg_data = make_hitgroup_data(
-                    &obj.material,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                );
+                let mat_data =
+                    make_material_data(&obj.material, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+                let d_mat_ptr = upload_material(&mat_data, &stream)?;
+                let mut hg_data = HitGroupData {
+                    mat: d_mat_ptr,
+                    vertices: 0,
+                    normals: 0,
+                    indices: 0,
+                    texcoords: 0,
+                    num_vertices: 0,
+                };
                 hg_data.num_vertices = radius.to_bits() as i32;
 
                 let sbt_offset = sphere_hg_records.len() as u32;
@@ -818,7 +803,7 @@ fn main() -> Result<()> {
                     (0, 0, 0)
                 };
 
-                let hg_data = make_hitgroup_data(
+                let mat_data = make_material_data(
                     &obj.material,
                     d_tex,
                     tex_w,
@@ -835,12 +820,16 @@ fn main() -> Result<()> {
                     d_nmap,
                     nmap_w,
                     nmap_h,
-                    d_tc,
-                    d_normals,
-                    dptr(&d_indices, &stream),
-                    dptr(&d_verts, &stream),
-                    num_verts as i32,
                 );
+                let d_mat_ptr = upload_material(&mat_data, &stream)?;
+                let hg_data = HitGroupData {
+                    mat: d_mat_ptr,
+                    vertices: dptr(&d_verts, &stream),
+                    normals: d_normals,
+                    indices: dptr(&d_indices, &stream),
+                    texcoords: d_tc,
+                    num_vertices: num_verts as i32,
+                };
 
                 let sbt_offset = tri_hg_records.len() as u32;
                 tri_hg_records.push(SbtRecord::new(&hitgroup_tri_pg, hg_data)?);
