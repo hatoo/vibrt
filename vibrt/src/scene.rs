@@ -530,6 +530,77 @@ fn blackbody_to_rgb(kelvin: f32) -> [f32; 3] {
     [r, g, b]
 }
 
+/// Sample an image texture at pixel (x, y), clamped
+fn sample_tex_pixel(tex: &ImageTexture, x: u32, y: u32) -> [f32; 3] {
+    let x = x.min(tex.width - 1) as usize;
+    let y = y.min(tex.height - 1) as usize;
+    let i = (y * tex.width as usize + x) * 3;
+    [tex.data[i], tex.data[i + 1], tex.data[i + 2]]
+}
+
+/// Blend two texture sources into a new image texture.
+/// `amount`: 0.0 = all tex1, 1.0 = all tex2.
+/// If `amount_tex` is provided, it overrides the constant amount per-pixel.
+fn blend_textures(
+    tex1: Option<&ImageTexture>,
+    rgb1: [f32; 3],
+    tex2: Option<&ImageTexture>,
+    rgb2: [f32; 3],
+    amount: f32,
+    amount_tex: Option<&ImageTexture>,
+) -> ImageTexture {
+    // Determine output size
+    let w = [
+        tex1.map(|t| t.width).unwrap_or(1),
+        tex2.map(|t| t.width).unwrap_or(1),
+        amount_tex.map(|t| t.width).unwrap_or(1),
+    ]
+    .into_iter()
+    .max()
+    .unwrap();
+    let h = [
+        tex1.map(|t| t.height).unwrap_or(1),
+        tex2.map(|t| t.height).unwrap_or(1),
+        amount_tex.map(|t| t.height).unwrap_or(1),
+    ]
+    .into_iter()
+    .max()
+    .unwrap();
+
+    let mut data = Vec::with_capacity((w * h * 3) as usize);
+    for y_px in 0..h {
+        for x_px in 0..w {
+            // Sample each source (nearest-neighbor resampling for size mismatch)
+            let c1 = if let Some(t) = tex1 {
+                let sx = x_px * t.width / w;
+                let sy = y_px * t.height / h;
+                sample_tex_pixel(t, sx, sy)
+            } else {
+                rgb1
+            };
+            let c2 = if let Some(t) = tex2 {
+                let sx = x_px * t.width / w;
+                let sy = y_px * t.height / h;
+                sample_tex_pixel(t, sx, sy)
+            } else {
+                rgb2
+            };
+            let a = if let Some(t) = amount_tex {
+                let sx = x_px * t.width / w;
+                let sy = y_px * t.height / h;
+                let p = sample_tex_pixel(t, sx, sy);
+                0.2126 * p[0] + 0.7152 * p[1] + 0.0722 * p[2]
+            } else {
+                amount
+            };
+            data.push(c1[0] * (1.0 - a) + c2[0] * a);
+            data.push(c1[1] * (1.0 - a) + c2[1] * a);
+            data.push(c1[2] * (1.0 - a) + c2[2] * a);
+        }
+    }
+    ImageTexture::new(data, w, h)
+}
+
 // ---- Shape parsing helper ----
 
 /// Returns (shape, alpha_texture_name, displacement_texture_name)
@@ -1536,39 +1607,64 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                         );
                     }
                 } else if class == "mix" {
-                    // Try tex/tex1 as texture refs first, then fall back to inline rgb
-                    let mut inserted = false;
-                    for key in &["tex", "tex1"] {
-                        if let Some(tex_ref) = p.texture_ref(key) {
-                            if let Some(base) = textures.get(tex_ref) {
-                                textures.insert(name.clone(), base.clone());
-                                inserted = true;
-                                break;
-                            }
-                        }
-                    }
-                    if !inserted {
-                        // Try inline RGB values
-                        if let Some(c) = p.rgb("tex1").or_else(|| p.rgb("tex2")) {
-                            textures.insert(
-                                name.clone(),
-                                SceneTexture::Image(std::sync::Arc::new(ImageTexture::new(
-                                    vec![c[0], c[1], c[2]],
-                                    1,
-                                    1,
-                                ))),
-                            );
-                        }
-                    }
+                    // Get tex1 source: texture ref or inline RGB
+                    let tex1_img = p
+                        .texture_ref("tex1")
+                        .or_else(|| p.texture_ref("tex"))
+                        .and_then(|r| match textures.get(r) {
+                            Some(SceneTexture::Image(img)) => Some(img.clone()),
+                            _ => None,
+                        });
+                    let rgb1 = p.rgb("tex1").unwrap_or([0.5, 0.5, 0.5]);
+
+                    // Get tex2 source
+                    let tex2_img = p.texture_ref("tex2").and_then(|r| match textures.get(r) {
+                        Some(SceneTexture::Image(img)) => Some(img.clone()),
+                        _ => None,
+                    });
+                    let rgb2 = p.rgb("tex2").unwrap_or([0.5, 0.5, 0.5]);
+
+                    // Get amount: texture ref or float
+                    let amount_img = p.texture_ref("amount").and_then(|r| match textures.get(r) {
+                        Some(SceneTexture::Image(img)) => Some(img.clone()),
+                        _ => None,
+                    });
+                    let amount_val = p.float("amount").unwrap_or(0.5);
+
+                    let blended = blend_textures(
+                        tex1_img.as_deref(),
+                        rgb1,
+                        tex2_img.as_deref(),
+                        rgb2,
+                        amount_val,
+                        amount_img.as_deref(),
+                    );
+                    textures.insert(
+                        name.clone(),
+                        SceneTexture::Image(std::sync::Arc::new(blended)),
+                    );
                 } else if class == "directionmix" {
-                    // Approximate by using tex1 (ignore viewing-direction blend)
-                    if let Some(tex_ref) = p.texture_ref("tex1") {
-                        if let Some(base) = textures.get(tex_ref) {
-                            textures.insert(name.clone(), base.clone());
-                        } else {
-                            eprintln!("  warning: directionmix tex1 not found: {tex_ref}");
-                        }
-                    }
+                    // Approximate as 50/50 blend (true blend is view-dependent)
+                    let tex1_img = p.texture_ref("tex1").and_then(|r| match textures.get(r) {
+                        Some(SceneTexture::Image(img)) => Some(img.clone()),
+                        _ => None,
+                    });
+                    let tex2_img = p.texture_ref("tex2").and_then(|r| match textures.get(r) {
+                        Some(SceneTexture::Image(img)) => Some(img.clone()),
+                        _ => None,
+                    });
+                    let blended = blend_textures(
+                        tex1_img.as_deref(),
+                        [0.5, 0.5, 0.5],
+                        tex2_img.as_deref(),
+                        [0.5, 0.5, 0.5],
+                        0.5,
+                        None,
+                    );
+                    textures.insert(
+                        name.clone(),
+                        SceneTexture::Image(std::sync::Arc::new(blended)),
+                    );
                 } else {
                     eprintln!("  warning: unsupported texture class: {class} (texture \"{name}\")");
                 }
