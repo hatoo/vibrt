@@ -1251,18 +1251,41 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                         } else {
                             parse_conductor_k(&p)
                         };
+                        let has_reflectance_tex = if let Some(tex_name) =
+                            p.texture_ref("reflectance")
+                        {
+                            match textures.get(tex_name) {
+                                Some(SceneTexture::Image(img)) => {
+                                    current_material.texture = Some(img.clone());
+                                    true
+                                }
+                                Some(_) => {
+                                    eprintln!("  warning: non-image texture type not supported for: {tex_name}");
+                                    false
+                                }
+                                None => {
+                                    eprintln!("  warning: unknown texture reference: {tex_name}");
+                                    false
+                                }
+                            }
+                        } else {
+                            false
+                        };
                         if let Some(c) = p.rgb("reflectance") {
                             current_material.albedo = c;
-                        } else if let Some(eta) = eta_found {
+                        }
+                        if let Some(eta) = eta_found {
                             current_material.conductor_eta = eta;
                             if let Some(k) = k_found {
                                 current_material.conductor_k = k;
                             }
-                            current_material.albedo = conductor_f0(
-                                &current_material.conductor_eta,
-                                &current_material.conductor_k,
-                            );
-                        } else {
+                            if current_material.albedo == [0.5, 0.5, 0.5] {
+                                current_material.albedo = conductor_f0(
+                                    &current_material.conductor_eta,
+                                    &current_material.conductor_k,
+                                );
+                            }
+                        } else if !has_reflectance_tex && p.rgb("reflectance").is_none() {
                             current_material.conductor_eta = [0.143, 0.374, 1.442];
                             current_material.conductor_k = [3.983, 2.380, 1.603];
                             current_material.albedo = conductor_f0(
@@ -1420,20 +1443,47 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                         } else {
                             parse_conductor_k(&p)
                         };
+                        // Check for texture reflectance
+                        let has_reflectance_tex = if let Some(tex_name) =
+                            p.texture_ref("reflectance")
+                        {
+                            match textures.get(tex_name) {
+                                Some(SceneTexture::Image(img)) => {
+                                    mat.texture = Some(img.clone());
+                                    true
+                                }
+                                Some(_) => {
+                                    eprintln!("  warning: non-image texture type not supported for: {tex_name}");
+                                    false
+                                }
+                                None => {
+                                    eprintln!("  warning: unknown texture reference: {tex_name}");
+                                    false
+                                }
+                            }
+                        } else {
+                            false
+                        };
                         if let Some(c) = p.rgb("reflectance") {
                             mat.albedo = c;
-                        } else if let Some(eta) = eta_found {
+                        }
+                        if let Some(eta) = eta_found {
                             mat.conductor_eta = eta;
                             if let Some(k) = k_found {
                                 mat.conductor_k = k;
                             }
-                            mat.albedo = conductor_f0(&mat.conductor_eta, &mat.conductor_k);
-                        } else {
+                            if mat.albedo == [0.5, 0.5, 0.5] {
+                                // Only override default albedo with F0 if no explicit reflectance
+                                mat.albedo = conductor_f0(&mat.conductor_eta, &mat.conductor_k);
+                            }
+                        } else if !has_reflectance_tex && p.rgb("reflectance").is_none() {
+                            // No reflectance (rgb or texture) and no eta/k: use default copper
                             mat.conductor_eta = [0.143, 0.374, 1.442];
                             mat.conductor_k = [3.983, 2.380, 1.603];
                             mat.albedo = conductor_f0(&mat.conductor_eta, &mat.conductor_k);
                         }
-                        // Acknowledge coatedconductor-specific params
+                        // If reflectance texture/rgb is provided but no eta/k,
+                        // leave conductor_eta/k at zero → GPU uses Schlick with albedo as F0
                         let remap = p.bool("remaproughness").unwrap_or(true);
                         if is_coated {
                             let (ru, rv) = parse_roughness(&p, "conductor", remap);
