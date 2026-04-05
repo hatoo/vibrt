@@ -629,9 +629,13 @@ static __forceinline__ __device__ float3 nee_triangle_lights(
         int i = (int)grp.start + tri_idx;
 
         RNG light_rng(pixel_idx * 37 + i, sample_idx, depth + 201);
-        float3 lv0 = make_f3(params.triangle_lights[i].v0);
-        float3 lv1 = make_f3(params.triangle_lights[i].v1);
-        float3 lv2 = make_f3(params.triangle_lights[i].v2);
+        const float* verts = params.triangle_light_vertices;
+        int vi0 = (grp.vertex_offset + params.triangle_lights[i].i0) * 3;
+        int vi1 = (grp.vertex_offset + params.triangle_lights[i].i1) * 3;
+        int vi2 = (grp.vertex_offset + params.triangle_lights[i].i2) * 3;
+        float3 lv0 = make_float3(verts[vi0], verts[vi0+1], verts[vi0+2]);
+        float3 lv1 = make_float3(verts[vi1], verts[vi1+1], verts[vi1+2]);
+        float3 lv2 = make_float3(verts[vi2], verts[vi2+1], verts[vi2+2]);
         float3 light_em = make_f3(grp.emission);
         float3 cross_e = cross3(lv1 - lv0, lv2 - lv0);
         float cross_len = sqrtf(dot3(cross_e, cross_e));

@@ -943,6 +943,11 @@ fn main() -> Result<()> {
     } else {
         alloc_and_copy_slice(&stream, &scene.triangle_lights)?
     };
+    let d_triangle_light_vertices = if scene.triangle_light_vertices.is_empty() {
+        0
+    } else {
+        alloc_and_copy_slice(&stream, &scene.triangle_light_vertices)?
+    };
 
     // Build power-weighted CDF over triangle light groups (object-based)
     let (d_tri_light_groups, d_tri_light_group_cdf) = if scene.triangle_light_groups.is_empty() {
@@ -1006,6 +1011,7 @@ fn main() -> Result<()> {
         sphere_lights: d_sphere_lights,
         num_triangle_lights: scene.triangle_lights.len() as i32,
         triangle_lights: d_triangle_lights,
+        triangle_light_vertices: d_triangle_light_vertices,
         triangle_light_groups: d_tri_light_groups,
         num_triangle_light_groups: scene.triangle_light_groups.len() as i32,
         triangle_light_group_cdf: d_tri_light_group_cdf,

@@ -26,9 +26,9 @@ pub struct SphereLight {
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct TriangleLight {
-    pub v0: [f32; 3],
-    pub v1: [f32; 3],
-    pub v2: [f32; 3],
+    pub i0: i32,
+    pub i1: i32,
+    pub i2: i32,
 }
 
 #[repr(C)]
@@ -37,6 +37,7 @@ pub struct TriangleLightGroup {
     pub start: u32,         // index into triangle_lights array
     pub count: u32,         // number of triangles in this group
     pub total_power: f32,   // sum of area * luminance
+    pub vertex_offset: u32, // offset into triangle_light_vertices (in vertex count)
     pub emission: [f32; 3], // shared emission for all triangles in group
     pub _pad: f32,
 }
@@ -127,7 +128,8 @@ pub struct LaunchParams {
     pub sphere_lights: optix_sys::CUdeviceptr,
     pub num_triangle_lights: i32,
     pub triangle_lights: optix_sys::CUdeviceptr,
-    pub triangle_light_groups: optix_sys::CUdeviceptr, // TriangleLightGroup[]
+    pub triangle_light_vertices: optix_sys::CUdeviceptr, // float[n*3], world-space
+    pub triangle_light_groups: optix_sys::CUdeviceptr,   // TriangleLightGroup[]
     pub num_triangle_light_groups: i32,
     pub triangle_light_group_cdf: optix_sys::CUdeviceptr, // float[num_groups+1], power-weighted
     // Environment map (IBL)

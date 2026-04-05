@@ -106,6 +106,7 @@ pub struct ParsedScene {
     pub distant_lights: Vec<DistantLight>,
     pub sphere_lights: Vec<SphereLight>,
     pub triangle_lights: Vec<TriangleLight>,
+    pub triangle_light_vertices: Vec<f32>, // world-space vertices shared across groups
     pub triangle_light_groups: Vec<TriangleLightGroup>,
     pub objects: Vec<SceneObject>,
     pub filename: String,
@@ -666,6 +667,7 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
         distant_lights: Vec::new(),
         sphere_lights: Vec::new(),
         triangle_lights: Vec::new(),
+        triangle_light_vertices: Vec::new(),
         triangle_light_groups: Vec::new(),
         objects: Vec::new(),
         filename: "output.png".to_string(),
@@ -1501,10 +1503,18 @@ fn register_area_light(
             vertices, indices, ..
         } = shape
         {
-            let start = scene.triangle_lights.len() as u32;
+            let tri_start = scene.triangle_lights.len() as u32;
+            let vertex_offset = (scene.triangle_light_vertices.len() / 3) as u32;
             let lum = 0.2126 * em[0] + 0.7152 * em[1] + 0.0722 * em[2];
             let mut group_power = 0.0f32;
+
+            // Append transformed vertices to shared buffer
             let transformed = transform::transform_vertices(vertices, xform);
+            scene
+                .triangle_light_vertices
+                .extend_from_slice(&transformed);
+
+            // Store triangle indices (mesh-local, offset applied in shader)
             for tri in indices.chunks(3) {
                 if tri.len() < 3 {
                     continue;
@@ -1524,14 +1534,19 @@ fn register_area_light(
                 ];
                 let area = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt() * 0.5;
                 group_power += area * lum;
-                scene.triangle_lights.push(TriangleLight { v0, v1, v2 });
+                scene.triangle_lights.push(TriangleLight {
+                    i0: tri[0] as i32,
+                    i1: tri[1] as i32,
+                    i2: tri[2] as i32,
+                });
             }
-            let count = scene.triangle_lights.len() as u32 - start;
+            let count = scene.triangle_lights.len() as u32 - tri_start;
             if count > 0 {
                 scene.triangle_light_groups.push(TriangleLightGroup {
-                    start,
+                    start: tri_start,
                     count,
                     total_power: group_power,
+                    vertex_offset,
                     emission: em,
                     _pad: 0.0,
                 });

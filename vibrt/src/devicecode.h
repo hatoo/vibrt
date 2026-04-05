@@ -23,15 +23,16 @@ struct SphereLight {
 };
 
 struct TriangleLight {
-    float v0[3];
-    float v1[3];
-    float v2[3];
+    int i0;
+    int i1;
+    int i2;
 };
 
 struct TriangleLightGroup {
     unsigned int start;
     unsigned int count;
     float total_power;
+    unsigned int vertex_offset;
     float emission[3];
     float _pad;
 };
@@ -108,6 +109,7 @@ struct LaunchParams {
     SphereLight*  sphere_lights;
     int           num_triangle_lights;
     TriangleLight* triangle_lights;
+    float*        triangle_light_vertices;
     TriangleLightGroup* triangle_light_groups;
     int           num_triangle_light_groups;
     float*        triangle_light_group_cdf; // float[num_groups+1]
