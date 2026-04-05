@@ -1829,6 +1829,8 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                     emission[1] *= scale;
                     emission[2] *= scale;
                     current_material.emission = emission;
+                } else {
+                    eprintln!("  warning: unsupported area light type: {ty}");
                 }
             }
             Directive::MakeNamedMedium { name, params } => {
