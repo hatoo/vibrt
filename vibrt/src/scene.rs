@@ -495,8 +495,13 @@ fn blackbody_to_rgb(kelvin: f32) -> [f32; 3] {
 
 // ---- Shape parsing helper ----
 
-fn parse_shape(ty: &str, params: &[pbrt_parser::Param], scene_dir: &Path) -> Option<SceneShape> {
+fn parse_shape(
+    ty: &str,
+    params: &[pbrt_parser::Param],
+    scene_dir: &Path,
+) -> Option<(SceneShape, Option<String>)> {
     let p = ParamSet::new(params, format!("Shape \"{ty}\""));
+    let alpha_tex = p.texture_ref("alpha").map(|s| s.to_string());
     // Known but not fully used
     match ty {
         "sphere" => {
@@ -647,6 +652,7 @@ fn parse_shape(ty: &str, params: &[pbrt_parser::Param], scene_dir: &Path) -> Opt
             None
         }
     }
+    .map(|shape| (shape, alpha_tex))
 }
 
 // ---- Main scene parser ----
@@ -1106,6 +1112,8 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                         None => eprintln!("  warning: roughness texture not found: {tex_name}"),
                     }
                 }
+                // Acknowledge normalmap (not yet implemented but suppress warning)
+                let _ = p.string("normalmap");
             }
             Directive::MakeNamedMaterial { name, params } => {
                 let p = ParamSet::new(params, format!("MakeNamedMaterial \"{name}\""));
@@ -1158,11 +1166,33 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                         } else {
                             MAT_CONDUCTOR
                         };
+                        // Try conductor.eta/conductor.k first for coatedconductor, then bare eta/k
+                        let eta_found = if is_coated {
+                            parse_conductor_eta(&p).or_else(|| {
+                                // Try prefixed versions
+                                p.spectrum_string("conductor.eta")
+                                    .and_then(named_metal_eta)
+                                    .or_else(|| p.spectrum_rgb("conductor.eta"))
+                                    .or_else(|| p.rgb("conductor.eta"))
+                            })
+                        } else {
+                            parse_conductor_eta(&p)
+                        };
+                        let k_found = if is_coated {
+                            parse_conductor_k(&p).or_else(|| {
+                                p.spectrum_string("conductor.k")
+                                    .and_then(named_metal_k)
+                                    .or_else(|| p.spectrum_rgb("conductor.k"))
+                                    .or_else(|| p.rgb("conductor.k"))
+                            })
+                        } else {
+                            parse_conductor_k(&p)
+                        };
                         if let Some(c) = p.rgb("reflectance") {
                             mat.albedo = c;
-                        } else if let Some(eta) = parse_conductor_eta(&p) {
+                        } else if let Some(eta) = eta_found {
                             mat.conductor_eta = eta;
-                            if let Some(k) = parse_conductor_k(&p) {
+                            if let Some(k) = k_found {
                                 mat.conductor_k = k;
                             }
                             mat.albedo = conductor_f0(&mat.conductor_eta, &mat.conductor_k);
@@ -1170,6 +1200,11 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                             mat.conductor_eta = [0.143, 0.374, 1.442];
                             mat.conductor_k = [3.983, 2.380, 1.603];
                             mat.albedo = conductor_f0(&mat.conductor_eta, &mat.conductor_k);
+                        }
+                        // Acknowledge coatedconductor-specific params
+                        if is_coated {
+                            let _ = p.float("thickness");
+                            let _ = p.rgb("albedo");
                         }
                         let remap = p.bool("remaproughness").unwrap_or(true);
                         if is_coated {
@@ -1260,6 +1295,7 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                         None => eprintln!("  warning: roughness texture not found: {tex_name}"),
                     }
                 }
+                let _ = p.string("normalmap");
                 named_materials.insert(name.clone(), mat);
             }
             Directive::NamedMaterial(name) => {
@@ -1356,7 +1392,13 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                 }
             }
             Directive::Shape { ty, params } => {
-                if let Some(mut shape) = parse_shape(ty, params, scene_dir) {
+                if let Some((mut shape, alpha_tex)) = parse_shape(ty, params, scene_dir) {
+                    let mut mat_override = current_material.clone();
+                    if let Some(ref tex_name) = alpha_tex {
+                        if let Some(SceneTexture::Image(img)) = textures.get(tex_name.as_str()) {
+                            mat_override.alpha_map = Some(img.clone());
+                        }
+                    }
                     if reverse_orientation {
                         if let SceneShape::TriangleMesh {
                             ref mut indices,
@@ -1374,7 +1416,7 @@ pub fn parse_scene(input: &str, scene_dir: &Path) -> ParsedScene {
                     }
                     let obj = SceneObject {
                         shape,
-                        material: current_material.clone(),
+                        material: mat_override,
                         transform: current_transform,
                     };
                     if let Some(ref name) = current_object_name {
