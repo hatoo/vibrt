@@ -745,7 +745,8 @@ static __forceinline__ __device__ float3 nee_portal(
     return make_float3(0, 0, 0);
 
   // Shadow ray toward portal point
-  ShadowResult sr = trace_shadow(hit_pos, L, dist - 0.01f, OPTIX_RAY_FLAG_NONE);
+  ShadowResult sr =
+      trace_shadow(hit_pos, L, dist * 0.999f, OPTIX_RAY_FLAG_NONE);
   if (!sr.hit) {
     // Sample environment light color in the portal direction
     float3 env_color = sample_envmap(L);
@@ -985,9 +986,10 @@ extern "C" __global__ void __raygen__rg() {
 
       if (p9 == 0xFFFFFFFF) {
         // Miss - sample environment map or use constant ambient
-        // Only add envmap on camera rays or specular bounces to avoid
-        // double-counting with envmap NEE on diffuse paths
-        if (specular_bounce || !params.envmap_data) {
+        // Only add on camera rays or specular bounces to avoid
+        // double-counting with NEE (envmap or portal) on diffuse paths
+        bool has_env_nee = params.envmap_data || params.has_portal;
+        if (specular_bounce || !has_env_nee) {
           float3 bg = sample_envmap(direction);
           radiance = radiance + throughput * bg;
         }
