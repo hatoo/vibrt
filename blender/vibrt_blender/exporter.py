@@ -490,6 +490,13 @@ def export_scene(
         else:
             obj_eval = obj.evaluated_get(depsgraph)
 
+        # Skip meshes that Cycles hides from camera — they're light portals
+        # (e.g. classroom's `windows` dayLight_portal) meant to inject light
+        # but never appear as geometry on the rendered image. Without this
+        # check the emissive portal bleeds over the ceiling / walls.
+        if obj_eval.type == "MESH" and not getattr(obj, "visible_camera", True):
+            continue
+
         if obj_eval.type == "MESH":
             # Resolve materials before mesh export — _export_mesh needs to know
             # which vertex-colour attribute (if any) a bound material references.
