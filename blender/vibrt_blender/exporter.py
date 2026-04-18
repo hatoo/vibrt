@@ -8,7 +8,7 @@ column-major via mathutils, our JSON schema expects row-major 16-float arrays).
 from __future__ import annotations
 
 import json
-import struct
+import time
 from pathlib import Path
 
 import bpy
@@ -21,11 +21,20 @@ def _matrix_to_row_major(m) -> list[float]:
 
 
 def _pack_f32(xs) -> bytes:
-    return struct.pack(f"<{len(xs)}f", *xs)
+    # numpy .tobytes() is orders of magnitude faster than struct.pack(*xs)
+    # once N crosses a few thousand — the latter splats every float as a
+    # positional argument. Meshes and textures easily hit millions.
+    import numpy as np
+    if isinstance(xs, np.ndarray):
+        return np.ascontiguousarray(xs, dtype=np.float32).tobytes()
+    return np.asarray(xs, dtype=np.float32).tobytes()
 
 
 def _pack_u32(xs) -> bytes:
-    return struct.pack(f"<{len(xs)}I", *xs)
+    import numpy as np
+    if isinstance(xs, np.ndarray):
+        return np.ascontiguousarray(xs, dtype=np.uint32).tobytes()
+    return np.asarray(xs, dtype=np.uint32).tobytes()
 
 
 def _write_blob(buf: bytearray, data: bytes) -> dict:
@@ -84,45 +93,63 @@ def _export_mesh(obj_eval, buf: bytearray, textures: list) -> dict | None:
 
     Returns a dict suitable for a `MeshDesc` — always includes `material_indices`
     when there's more than one slot, otherwise the entry is omitted.
+
+    Vertex / normal / UV / index arrays are built through `foreach_get` into
+    numpy buffers. A Python-level per-triangle loop was the dominant export
+    cost on non-trivial meshes (seconds per 100k-tri object vs milliseconds).
     """
+    import numpy as np
+
     mesh = obj_eval.to_mesh()
     try:
         mesh.calc_loop_triangles()
-        if not mesh.loop_triangles:
+        ntri = len(mesh.loop_triangles)
+        if ntri == 0:
             return None
-        verts: list[float] = []
-        normals: list[float] = []
-        uvs: list[float] = []
-        indices: list[int] = []
-        mat_indices: list[int] = []
-        uv_layer = mesh.uv_layers.active
-        uv_data = uv_layer.data if uv_layer is not None else None
+        # Split normals are auto-computed in Blender 4.2+; older branches still
+        # need the explicit call.
         if hasattr(mesh, "calc_normals_split"):
-            mesh.calc_normals_split()
+            try:
+                mesh.calc_normals_split()
+            except RuntimeError:
+                pass
         num_slots = len(obj_eval.material_slots)
-        for tri in mesh.loop_triangles:
-            for k in range(3):
-                li = tri.loops[k]
-                vi = mesh.loops[li].vertex_index
-                v = mesh.vertices[vi].co
-                n = tri.split_normals[k]
-                verts.extend((v.x, v.y, v.z))
-                normals.extend((n[0], n[1], n[2]))
-                if uv_data is not None:
-                    uv = uv_data[li].uv
-                    uvs.extend((uv.x, uv.y))
-                else:
-                    uvs.extend((0.0, 0.0))
-                indices.append(len(indices))
-            mat_indices.append(int(tri.material_index) if num_slots > 1 else 0)
+
+        tri_vert_idx = np.empty(ntri * 3, dtype=np.int32)
+        mesh.loop_triangles.foreach_get("vertices", tri_vert_idx)
+        tri_loop_idx = np.empty(ntri * 3, dtype=np.int32)
+        mesh.loop_triangles.foreach_get("loops", tri_loop_idx)
+        split_normals = np.empty(ntri * 9, dtype=np.float32)
+        mesh.loop_triangles.foreach_get("split_normals", split_normals)
+
+        nverts = len(mesh.vertices)
+        vcos = np.empty(nverts * 3, dtype=np.float32)
+        mesh.vertices.foreach_get("co", vcos)
+        vcos = vcos.reshape(-1, 3)
+        positions = np.ascontiguousarray(vcos[tri_vert_idx].reshape(-1))
+
+        uv_layer = mesh.uv_layers.active
+        if uv_layer is not None:
+            nloops = len(mesh.loops)
+            uv_all = np.empty(nloops * 2, dtype=np.float32)
+            uv_layer.data.foreach_get("uv", uv_all)
+            uv_all = uv_all.reshape(-1, 2)
+            uvs = np.ascontiguousarray(uv_all[tri_loop_idx].reshape(-1))
+        else:
+            uvs = None
+
+        indices = np.arange(ntri * 3, dtype=np.uint32)
+
         desc = {
-            "vertices": _write_blob(buf, _pack_f32(verts)),
-            "normals": _write_blob(buf, _pack_f32(normals)),
-            "uvs": _write_blob(buf, _pack_f32(uvs)) if uv_data else None,
+            "vertices": _write_blob(buf, _pack_f32(positions)),
+            "normals": _write_blob(buf, _pack_f32(split_normals)),
+            "uvs": _write_blob(buf, _pack_f32(uvs)) if uvs is not None else None,
             "indices": _write_blob(buf, _pack_u32(indices)),
         }
         if num_slots > 1:
-            desc["material_indices"] = _write_blob(buf, _pack_u32(mat_indices))
+            tri_mat_idx = np.empty(ntri, dtype=np.int32)
+            mesh.loop_triangles.foreach_get("material_index", tri_mat_idx)
+            desc["material_indices"] = _write_blob(buf, _pack_u32(tri_mat_idx))
         disp_tex, disp_strength = _find_displacement(obj_eval, buf, textures)
         if disp_tex is not None and disp_strength != 0.0:
             desc["displacement_tex"] = disp_tex
@@ -243,6 +270,7 @@ def export_scene(
     json_path: Path,
     bin_path: Path,
 ):
+    t0 = time.perf_counter()
     scene = depsgraph.scene_eval
     rd = scene.render
     width = int(rd.resolution_x * rd.resolution_percentage / 100.0)
@@ -351,3 +379,9 @@ def export_scene(
 
     bin_path.write_bytes(bytes(buf))
     json_path.write_text(json.dumps(scene_json, indent=2))
+    dt = time.perf_counter() - t0
+    print(
+        f"[vibrt] exported {len(meshes)} mesh(es), {len(objects)} obj, "
+        f"{len(textures)} tex, {len(materials)} mat, "
+        f"{len(buf)/1024/1024:.1f}MB bin in {dt:.2f}s"
+    )

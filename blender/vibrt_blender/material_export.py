@@ -38,7 +38,13 @@ def _node_tag(node) -> str:
 
 
 def _pack_f32(xs) -> bytes:
-    return struct.pack(f"<{len(xs)}f", *xs)
+    # numpy .tobytes() is orders of magnitude faster than struct.pack(*xs)
+    # for megapixel-sized textures (the latter splats every float as a
+    # positional argument).
+    import numpy as np
+    if isinstance(xs, np.ndarray):
+        return np.ascontiguousarray(xs, dtype=np.float32).tobytes()
+    return np.asarray(xs, dtype=np.float32).tobytes()
 
 
 def _write_blob(buf: bytearray, data: bytes) -> dict:
@@ -78,6 +84,7 @@ def export_image_texture(
     or a `_PreBakedTexture` (already in linear space; chain ignored, must be
     empty). Returns the texture index. Reuses existing entries by cache key.
     """
+    import numpy as np
     if isinstance(image, _PreBakedTexture):
         return _export_prebaked(image, buf, textures)
     chain_key = "" if not chain else "|" + repr(tuple(x[0] for x in chain))
@@ -90,9 +97,12 @@ def export_image_texture(
     width, height = image.size[0], image.size[1]
     if width == 0 or height == 0:
         width, height = 1, 1
-        pixels = [1.0, 1.0, 1.0, 1.0]
+        pixels = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
     else:
-        pixels = list(image.pixels[:])  # RGBA f32
+        # `list(image.pixels[:])` iterates one Python float at a time; foreach_get
+        # drops the whole buffer into a numpy array at C speed.
+        pixels = np.empty(width * height * 4, dtype=np.float32)
+        image.pixels.foreach_get(pixels)
     if colorspace is None:
         colorspace = (
             "srgb"
@@ -121,7 +131,7 @@ def _export_prebaked(pb: "_PreBakedTexture", buf: bytearray, textures: list) -> 
     rgba = np.concatenate(
         [pb.rgb, np.ones((pb.h, pb.w, 1), dtype=np.float32)], axis=-1
     )
-    pixels = rgba.astype(np.float32).reshape(-1).tolist()
+    pixels = np.ascontiguousarray(rgba, dtype=np.float32).reshape(-1)
     desc = {
         "width": int(pb.w),
         "height": int(pb.h),
@@ -142,7 +152,9 @@ def _image_to_linear_rgb(image):
     w, h = int(image.size[0]), int(image.size[1])
     if w == 0 or h == 0:
         return np.ones((1, 1, 3), dtype=np.float32), 1, 1
-    px = np.asarray(list(image.pixels[:]), dtype=np.float32).reshape((h, w, 4))
+    px = np.empty(w * h * 4, dtype=np.float32)
+    image.pixels.foreach_get(px)
+    px = px.reshape((h, w, 4))
     rgb = px[..., :3].copy()
     if image.colorspace_settings.name.lower().startswith("srgb"):
         rgb = _srgb_to_linear_np(rgb).astype(np.float32)
@@ -202,14 +214,15 @@ def _bake_chain(pixels, w, h, colorspace, chain):
     output colorspace string ("linear" once anything is baked in).
     """
     import numpy as np
-    arr = np.asarray(pixels, dtype=np.float32).reshape((h, w, 4))
+    arr = np.asarray(pixels, dtype=np.float32).reshape((h, w, 4)).copy()
     rgb = arr[..., :3].copy()
     if colorspace.lower() == "srgb":
         rgb = _srgb_to_linear_np(rgb).astype(np.float32)
     for _id, apply_fn in chain:
         rgb = apply_fn(rgb)
     arr[..., :3] = rgb
-    return arr.reshape(-1).tolist(), "linear"
+    # Return numpy directly — _pack_f32 handles it without a list round-trip.
+    return arr.reshape(-1), "linear"
 
 
 def _socket_rgb(sock) -> list[float]:
