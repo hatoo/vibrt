@@ -1,4 +1,4 @@
-"""Blender `RenderEngine` subclass for vibrt-blender (final-frame F12 only)."""
+"""Blender `RenderEngine` subclass for vibrt (final-frame F12 only)."""
 
 from __future__ import annotations
 
@@ -13,8 +13,8 @@ from . import runner
 
 
 class VibrtRenderEngine(bpy.types.RenderEngine):
-    bl_idname = "VIBRT_BLENDER"
-    bl_label = "vibrt-blender"
+    bl_idname = "VIBRT"
+    bl_label = "vibrt"
     bl_use_preview = False
     bl_use_shading_nodes_custom = False
 
@@ -28,11 +28,11 @@ class VibrtRenderEngine(bpy.types.RenderEngine):
         if exe is None:
             self.report(
                 {"ERROR"},
-                "vibrt-blender executable not found (set in addon preferences or $VIBRT_BLENDER_EXECUTABLE or PATH)",
+                "vibrt executable not found (set in addon preferences or $VIBRT_EXECUTABLE or PATH)",
             )
             return
 
-        work = Path(bpy.app.tempdir) / f"vibrt_blender_{uuid.uuid4().hex[:8]}"
+        work = Path(bpy.app.tempdir) / f"vibrt_{uuid.uuid4().hex[:8]}"
         work.mkdir(parents=True, exist_ok=True)
         json_path = work / "scene.json"
         bin_path = work / "scene.bin"
@@ -41,14 +41,14 @@ class VibrtRenderEngine(bpy.types.RenderEngine):
         # empty pixel buffers.
         exr_path = work / "output.raw"
 
-        self.update_stats("vibrt-blender", "Exporting scene...")
+        self.update_stats("vibrt", "Exporting scene...")
         try:
             exporter.export_scene(depsgraph, json_path, bin_path)
         except Exception as e:
             self.report({"ERROR"}, f"Export failed: {e}")
             raise
 
-        self.update_stats("vibrt-blender", "Rendering...")
+        self.update_stats("vibrt", "Rendering...")
         code = runner.run_render(
             exe,
             json_path,
@@ -57,13 +57,13 @@ class VibrtRenderEngine(bpy.types.RenderEngine):
             self.test_break,
         )
         if code != 0:
-            self.report({"ERROR"}, f"vibrt-blender exited with code {code}")
+            self.report({"ERROR"}, f"vibrt exited with code {code}")
             return
         if not exr_path.exists():
             self.report({"ERROR"}, f"No output produced at {exr_path}")
             return
 
-        self.update_stats("vibrt-blender", "Loading result...")
+        self.update_stats("vibrt", "Loading result...")
         _load_exr_into_render_result(self, exr_path, width, height)
 
     # Fallback: this addon does not support viewport IPR (yet).

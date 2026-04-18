@@ -1,10 +1,10 @@
 bl_info = {
-    "name": "vibrt-blender",
-    "author": "vibrt-blender",
+    "name": "vibrt",
+    "author": "vibrt",
     "version": (0, 1, 0),
     "blender": (4, 0, 0),
     "location": "Render > Render Engine",
-    "description": "OptiX path-tracing renderer via vibrt-blender",
+    "description": "OptiX path-tracing renderer via vibrt",
     "category": "Render",
 }
 

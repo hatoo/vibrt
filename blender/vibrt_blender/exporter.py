@@ -1,6 +1,6 @@
 """Export the evaluated Blender scene to scene.json + scene.bin.
 
-Blender uses right-handed, Z-up, metres. vibrt-blender uses the same, so no
+Blender uses right-handed, Z-up, metres. vibrt uses the same, so no
 axis conversion is required — only matrix transposition (Blender matrices are
 column-major via mathutils, our JSON schema expects row-major 16-float arrays).
 """
@@ -84,7 +84,7 @@ def _export_camera(scene, cam_obj, aspect: float) -> dict:
     cam = cam_obj.data
     if cam.type != "PERSP":
         raise ValueError(
-            f"vibrt-blender only supports perspective cameras (got {cam.type})"
+            f"vibrt only supports perspective cameras (got {cam.type})"
         )
     # Blender's sensor_fit + sensor_width/height govern how angle maps to vertical
     # FOV. Use the "vertical FOV" approximation from `angle_y`.

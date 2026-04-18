@@ -1,4 +1,4 @@
-"""Discover and invoke the vibrt-blender binary."""
+"""Discover and invoke the vibrt binary."""
 
 from __future__ import annotations
 
@@ -14,10 +14,10 @@ def find_executable() -> str | None:
     prefs = bpy.context.preferences.addons[__package__].preferences
     if prefs.vibrt_executable and Path(prefs.vibrt_executable).exists():
         return prefs.vibrt_executable
-    env = os.environ.get("VIBRT_BLENDER_EXECUTABLE")
+    env = os.environ.get("VIBRT_EXECUTABLE")
     if env and Path(env).exists():
         return env
-    which = shutil.which("vibrt-blender")
+    which = shutil.which("vibrt")
     if which:
         return which
     return None
@@ -30,7 +30,7 @@ def run_render(
     report,
     is_break,
 ) -> int:
-    """Run vibrt-blender; return exit code. Pipes stderr lines to `report`."""
+    """Run vibrt; return exit code. Pipes stderr lines to `report`."""
     cmd = [exe, str(scene_json), "--output", str(output_path)]
     proc = subprocess.Popen(
         cmd,

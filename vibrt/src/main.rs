@@ -21,10 +21,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 #[derive(Parser)]
-#[command(
-    name = "vibrt-blender",
-    about = "Blender-native OptiX path-tracing renderer"
-)]
+#[command(name = "vibrt", about = "Blender-native OptiX path-tracing renderer")]
 struct Args {
     /// Input scene.json (scene.bin must be alongside).
     input: Option<PathBuf>,

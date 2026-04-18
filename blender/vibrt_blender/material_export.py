@@ -1,4 +1,4 @@
-"""Map Blender Principled BSDF + Image Texture nodes to vibrt-blender JSON."""
+"""Map Blender Principled BSDF + Image Texture nodes to vibrt JSON."""
 
 from __future__ import annotations
 

@@ -1,10 +1,10 @@
 [package]
-name = "vibrt-blender"
+name = "vibrt"
 version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "vibrt-blender"
+name = "vibrt"
 path = "src/main.rs"
 
 [dependencies]

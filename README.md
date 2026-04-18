@@ -1,4 +1,4 @@
-# vibrt-blender
+# vibrt
 
 A GPU path-tracing renderer for Blender, powered by NVIDIA OptiX 9.
 
@@ -8,9 +8,9 @@ A GPU path-tracing renderer for Blender, powered by NVIDIA OptiX 9.
 |-------|-------------|
 | [`optix-sys`](optix-sys/) | Raw FFI bindings to OptiX 9.0.0 (bindgen) |
 | [`optix`](optix/) | Safe Rust wrapper with RAII, builders, and type-safe enums |
-| [`vibrt-blender`](vibrt-blender/) | OptiX path-tracing renderer with a Blender-native JSON+binary input format |
+| [`vibrt`](vibrt/) | OptiX path-tracing renderer with a Blender-native JSON+binary input format |
 
-The [`blender/vibrt_blender/`](blender/) directory contains the Blender addon that registers `vibrt-blender` as a render engine, exports the scene, spawns the renderer, and loads the result back into Blender.
+The [`blender/vibrt_blender/`](blender/) directory contains the Blender addon that registers `vibrt` as a render engine, exports the scene, spawns the renderer, and loads the result back into Blender.
 
 ## Features
 
@@ -31,7 +31,7 @@ The [`blender/vibrt_blender/`](blender/) directory contains the Blender addon th
 ## Building
 
 ```bash
-cargo build --release -p vibrt-blender
+cargo build --release -p vibrt
 ```
 
 ## Usage
@@ -39,7 +39,7 @@ cargo build --release -p vibrt-blender
 ### CLI (standalone)
 
 ```bash
-cargo run --release -p vibrt-blender -- scene.json --spp 128 --output render.exr
+cargo run --release -p vibrt -- scene.json --spp 128 --output render.exr
 ```
 
 See [`test_scenes/cornell/`](test_scenes/cornell/) for a hand-built Cornell-box example.

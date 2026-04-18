@@ -1,28 +1,28 @@
-# vibrt-blender Blender Addon
+# vibrt Blender Addon
 
-A Blender render engine that delegates rendering to the `vibrt-blender` CLI.
+A Blender render engine that delegates rendering to the `vibrt` CLI.
 
 ## Installation
 
 1. Build the renderer:
 
    ```
-   cargo build --release -p vibrt-blender
+   cargo build --release -p vibrt
    ```
 
-   The binary will be at `target/release/vibrt-blender` (`vibrt-blender.exe` on Windows).
+   The binary will be at `target/release/vibrt` (`vibrt.exe` on Windows).
 
-2. Zip the `blender/vibrt_blender/` directory into `vibrt_blender.zip`.
+2. Zip the `blender/vibrt_blender/` directory into `vibrt_blender.zip` (e.g. via `python blender/build_addon.py`).
 
 3. Open Blender → `Edit` → `Preferences` → `Add-ons` → `Install...` and select the zip.
 
-4. Enable the `Render: vibrt-blender` addon.
+4. Enable the `Render: vibrt` addon.
 
-5. Open the addon preferences panel and set the **vibrt-blender executable** path to the binary built above. Alternatively, set `$VIBRT_BLENDER_EXECUTABLE` or put the binary on `PATH`.
+5. Open the addon preferences panel and set the **vibrt executable** path to the binary built above. Alternatively, set `$VIBRT_EXECUTABLE` or put the binary on `PATH`.
 
 ## Usage
 
-1. In the Render Properties panel, set **Render Engine** to `vibrt-blender`.
+1. In the Render Properties panel, set **Render Engine** to `vibrt`.
 
 2. Add geometry, lights (Point, Sun, Spot, or Area), and a camera.
 
@@ -32,8 +32,8 @@ A Blender render engine that delegates rendering to the `vibrt-blender` CLI.
 
 5. Press `F12` (or `Render > Render Image`). The addon will:
    - Export the scene to a temporary `scene.json` + `scene.bin` under Blender's `tempdir`.
-   - Spawn `vibrt-blender` as a subprocess.
-   - Load the resulting EXR back into the image editor.
+   - Spawn `vibrt` as a subprocess.
+   - Load the resulting `.raw` float image back into the image editor.
 
 ## Supported features (Stage 1)
 
@@ -42,7 +42,7 @@ A Blender render engine that delegates rendering to the `vibrt-blender` CLI.
 - Materials: Principled BSDF — base color, metallic, roughness, IOR, transmission, emission, and image textures for base color / normal / roughness / metallic.
 - Lights: Point, Sun, Spot, Area (square/rectangle).
 - World: constant colour background or Environment Texture.
-- Output: EXR loaded back into Blender's compositor/image-editor.
+- Output: linear float image loaded into Blender's image editor.
 
 ## Not supported yet
 

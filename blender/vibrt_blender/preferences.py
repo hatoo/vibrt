@@ -5,9 +5,9 @@ class VibrtBlenderPrefs(bpy.types.AddonPreferences):
     bl_idname = __package__
 
     vibrt_executable: bpy.props.StringProperty(
-        name="vibrt-blender executable",
+        name="vibrt executable",
         subtype="FILE_PATH",
-        description="Path to the vibrt-blender binary. If empty, $VIBRT_BLENDER_EXECUTABLE or PATH is used.",
+        description="Path to the vibrt binary. If empty, $VIBRT_EXECUTABLE or PATH is used.",
         default="",
     )
 
@@ -15,7 +15,7 @@ class VibrtBlenderPrefs(bpy.types.AddonPreferences):
         layout = self.layout
         layout.prop(self, "vibrt_executable")
         layout.label(
-            text="Lookup order: addon preference > $VIBRT_BLENDER_EXECUTABLE > PATH",
+            text="Lookup order: addon preference > $VIBRT_EXECUTABLE > PATH",
             icon="INFO",
         )
 
