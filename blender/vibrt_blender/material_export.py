@@ -1078,8 +1078,12 @@ def _mix_node_params(node):
     return fac_sock, a_sock, b_sock, blend, use_clamp, True
 
 
-def _apply_mix_blend(col1, col2, fac: float, blend: str, use_clamp: bool):
-    """Blender ramp_blend applied to two arrays (or array + broadcast scalar)."""
+def _apply_mix_blend(col1, col2, fac, blend: str, use_clamp: bool):
+    """Blender ramp_blend applied to two arrays (or array + broadcast scalar).
+
+    `fac` is either a Python float or a numpy array broadcastable against
+    `col1`/`col2` (e.g. `(h, w, 1)` for a textured Factor).
+    """
     import numpy as np
     facm = 1.0 - fac
     if blend == "MIX":
@@ -1178,42 +1182,108 @@ def _mix_transform(node, chain_input_name):
 
 
 def _try_premix_two_textures(mix_node, group_stack):
-    """If both Mix inputs resolve to texture chains, pre-bake the mix into a
-    `_PreBakedTexture` (linear RGB). Returns None if either side is not a
-    bakeable texture chain, the factor is linked, the blend isn't supported,
-    or the Mix node is in an unsupported mode.
+    """Pre-bake a Mix into one `_PreBakedTexture` when the shape can't be
+    collapsed by the in-chain `_mix_transform` path.
+
+    Handles two cases:
+      - Both colour sides are textures (const factor): the classic two-texture
+        mix; the in-chain path can't bake it because it only threads one side.
+      - Factor is linked to a texture chain: requires per-pixel fac, so we
+        premix regardless of whether the other colour side is a texture or a
+        resolvable constant.
+
+    Returns None when the Mix is in an unsupported mode, the blend isn't
+    bakeable, a required side (colour or fac) can't be resolved, or there's
+    nothing texture-shaped left to bake (all operands are constants, which the
+    constant-folding path will pick up instead).
     """
+    import numpy as np
     fac_sock, a_sock, b_sock, blend, use_clamp, ok = _mix_node_params(mix_node)
-    if not ok:
-        return None
-    if fac_sock.is_linked or blend not in _SUPPORTED_MIX_BLENDS:
+    if not ok or blend not in _SUPPORTED_MIX_BLENDS:
         return None
     img_a, chain_a = _socket_linked_image_with_chain(a_sock, group_stack=group_stack)
     img_b, chain_b = _socket_linked_image_with_chain(b_sock, group_stack=group_stack)
-    if img_a is None or img_b is None:
-        return None
-    fac = _socket_f(fac_sock)
+    if fac_sock.is_linked:
+        img_f, chain_f = _socket_linked_image_with_chain(
+            fac_sock, group_stack=group_stack
+        )
+        if img_f is None:
+            return None
+        fac_const = None
+        # A textured factor forces a full premix, so it's fine if one colour
+        # side is only a resolvable constant.
+        const_a = None if img_a is not None else _socket_constant_rgb(a_sock)
+        const_b = None if img_b is not None else _socket_constant_rgb(b_sock)
+        if img_a is None and const_a is None:
+            return None
+        if img_b is None and const_b is None:
+            return None
+    else:
+        img_f, chain_f = None, ()
+        fac_const = _socket_f(fac_sock)
+        # Constant factor: only worth a full premix when both sides are
+        # textures. Otherwise the cheaper in-chain `_mix_transform` path
+        # already handles tex-vs-const and we'd be baking an extra copy.
+        if img_a is None or img_b is None:
+            return None
+        const_a = const_b = None
+
     chain_a_id = tuple(x[0] for x in chain_a)
     chain_b_id = tuple(x[0] for x in chain_b)
+    chain_f_id = tuple(x[0] for x in chain_f)
 
     def _src_id(src):
         return src.cache_key if isinstance(src, _PreBakedTexture) else f"img:{src.name}"
 
+    def _side_key(img, chain_id, const):
+        if img is not None:
+            return f"tex:{_src_id(img)}|{chain_id!r}"
+        return f"const:{tuple(round(float(c), 6) for c in const)}"
+
+    fac_key = (
+        f"tex:{_src_id(img_f)}|{chain_f_id!r}" if img_f is not None
+        else f"const:{round(fac_const, 6)}"
+    )
     cache_key = (
-        f"__mix2tex__|{_src_id(img_a)}|{chain_a_id!r}|{_src_id(img_b)}|"
-        f"{chain_b_id!r}|{blend}|{round(fac, 6)}|{use_clamp}"
+        f"__mix2tex__|{_side_key(img_a, chain_a_id, const_a)}|"
+        f"{_side_key(img_b, chain_b_id, const_b)}|{blend}|{fac_key}|{use_clamp}"
     )
     hit = _PREMIX_CACHE.get(cache_key)
     if hit is not None:
         _STATS["premix_cache_hits"] += 1
         return hit
     _STATS["premix_cache_misses"] += 1
-    rgb_a, wa, ha = _bake_source_to_linear(img_a, chain_a)
-    rgb_b, wb, hb = _bake_source_to_linear(img_b, chain_b)
-    out_h = max(ha, hb)
-    out_w = max(wa, wb)
-    rgb_a = _resample_bilinear(rgb_a, out_h, out_w)
-    rgb_b = _resample_bilinear(rgb_b, out_h, out_w)
+
+    baked_a = _bake_source_to_linear(img_a, chain_a) if img_a is not None else None
+    baked_b = _bake_source_to_linear(img_b, chain_b) if img_b is not None else None
+    baked_f = _bake_source_to_linear(img_f, chain_f) if img_f is not None else None
+    sizes = [(b[2], b[1]) for b in (baked_a, baked_b, baked_f) if b is not None]
+    # Guaranteed non-empty: at least one of the three must be a texture, else
+    # we'd have returned above.
+    out_h = max(h for h, _ in sizes)
+    out_w = max(w for _, w in sizes)
+
+    def _resolve_side(baked, const):
+        if baked is not None:
+            return _resample_bilinear(baked[0], out_h, out_w)
+        return np.broadcast_to(
+            np.asarray(const, dtype=np.float32), (out_h, out_w, 3)
+        ).astype(np.float32, copy=True)
+
+    rgb_a = _resolve_side(baked_a, const_a)
+    rgb_b = _resolve_side(baked_b, const_b)
+    if baked_f is not None:
+        rgb_f = _resample_bilinear(baked_f[0], out_h, out_w)
+        # VALUE sockets receive an RGB as Rec.709 luminance (matches Cycles'
+        # rgb_to_bw). Keep a trailing axis so the (h, w, 1) factor broadcasts
+        # against the (h, w, 3) colour operands in `_apply_mix_blend`.
+        fac = (
+            np.float32(0.2126) * rgb_f[..., 0:1]
+            + np.float32(0.7152) * rgb_f[..., 1:2]
+            + np.float32(0.0722) * rgb_f[..., 2:3]
+        ).astype(np.float32)
+    else:
+        fac = fac_const
     mixed = _apply_mix_blend(rgb_a, rgb_b, fac, blend, use_clamp)
     result = _PreBakedTexture(mixed, out_w, out_h, cache_key)
     _PREMIX_CACHE[cache_key] = result
