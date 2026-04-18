@@ -160,19 +160,39 @@ def _first_mapping_node(node_tree) -> "bpy.types.Node | None":
     return None
 
 
-def _mapping_to_affine(node) -> list[float]:
-    """Convert a Mapping node (type=POINT) to a 2x3 affine matrix over UV.
+def _invert_affine_2x3(m: list[float]) -> list[float]:
+    """Invert a row-major 2x3 affine matrix [a, b, tx, c, d, ty].
 
-    Other types (TEXTURE/VECTOR/NORMAL) fall back to identity with a warning.
+    Non-invertible inputs (det ≈ 0) return the identity so the caller gets a
+    safe fallback instead of NaNs.
+    """
+    a, b, tx, c, d, ty = m
+    det = a * d - b * c
+    if abs(det) < 1e-12:
+        return list(_IDENTITY_UV)
+    inv_a = d / det
+    inv_b = -b / det
+    inv_c = -c / det
+    inv_d = a / det
+    return [inv_a, inv_b, -(inv_a * tx + inv_b * ty),
+            inv_c, inv_d, -(inv_c * tx + inv_d * ty)]
+
+
+def _mapping_to_affine(node) -> list[float]:
+    """Convert a Mapping node to a 2x3 affine matrix over UV.
+
+    Supports POINT (apply transform to input coords) and TEXTURE (apply the
+    inverse — see Blender's vector_math_mapping). VECTOR/NORMAL fall back to
+    identity with a warning.
     """
     if node is None:
         return list(_IDENTITY_UV)
     vector_type = getattr(node, "vector_type", "POINT")
-    if vector_type != "POINT":
+    if vector_type not in ("POINT", "TEXTURE"):
         _warn(
             f"map-vtype:{node.as_pointer()}",
             f"Mapping {_node_tag(node)}: vector_type={vector_type!r} not "
-            f"supported (only POINT) — UV transform ignored",
+            f"supported (only POINT/TEXTURE) — UV transform ignored",
         )
         return list(_IDENTITY_UV)
 
@@ -198,8 +218,12 @@ def _mapping_to_affine(node) -> list[float]:
     c = math.cos(theta)
     s = math.sin(theta)
     # M = T · R · S, row-major 2x3:
-    return [sx * c, -sy * s, tx,
-            sx * s,  sy * c, ty]
+    point = [sx * c, -sy * s, tx,
+             sx * s,  sy * c, ty]
+    if vector_type == "TEXTURE":
+        # TEXTURE applies the inverse transform — see blender's node_shader_mapping.
+        return _invert_affine_2x3(point)
+    return point
 
 
 # Node types we traverse to reach an underlying TexImage, mapped to the input
@@ -578,12 +602,19 @@ def _clamp_transform(node):
     return id_tuple, apply
 
 
+_SUPPORTED_MIX_BLENDS = frozenset((
+    "MIX", "MULTIPLY", "ADD", "SUBTRACT", "SCREEN", "DIVIDE", "DIFFERENCE",
+    "DARKEN", "LIGHTEN", "OVERLAY", "SOFT_LIGHT", "LINEAR_LIGHT",
+))
+
+
 def _mix_transform(node, chain_input_name):
     """Bake a Mix node when the non-chain input is a constant colour.
 
-    Supports MIX / MULTIPLY / ADD / SUBTRACT blend types. If the factor, or the
-    non-chain input, is linked, we can't bake (return None and the node's
-    effect is silently dropped — same as pre-bake behaviour).
+    Formulas match Blender's `ramp_blend` (intern/cycles/kernel/svm/mix.h): the
+    chain side is always treated as col1 when is_a_chain, else col2. If the
+    factor, or the non-chain input, is linked, we can't bake (return None and
+    the node's effect is silently dropped — same as pre-bake behaviour).
     """
     import numpy as np
     if node.bl_idname == "ShaderNodeMixRGB":
@@ -609,7 +640,7 @@ def _mix_transform(node, chain_input_name):
         blend = getattr(node, "blend_type", "MIX")
         is_a_chain = chain_input_name == "A"
 
-    if blend not in ("MIX", "MULTIPLY", "ADD", "SUBTRACT"):
+    if blend not in _SUPPORTED_MIX_BLENDS:
         _warn(
             f"mix-blend:{node.as_pointer()}:{blend}",
             f"{_node_tag(node)}: blend_type={blend!r} not supported — "
@@ -633,6 +664,7 @@ def _mix_transform(node, chain_input_name):
         return None
 
     fac = _socket_f(fac_sock)
+    facm = 1.0 - fac
     use_clamp = bool(
         getattr(node, "use_clamp", False) or getattr(node, "clamp_result", False)
     )
@@ -646,34 +678,45 @@ def _mix_transform(node, chain_input_name):
     def _clamp01(x):
         return np.clip(x, 0.0, 1.0) if use_clamp else x
 
-    if blend == "MIX":
-        if is_a_chain:
-            def apply(rgb):
-                return _clamp01(rgb * (1.0 - fac) + other_rgb * fac).astype(np.float32)
-        else:
-            def apply(rgb):
-                return _clamp01(other_rgb * (1.0 - fac) + rgb * fac).astype(np.float32)
-    elif blend == "MULTIPLY":
-        if is_a_chain:
-            def apply(rgb):
-                return _clamp01(rgb * (1.0 - fac + fac * other_rgb)).astype(np.float32)
-        else:
-            def apply(rgb):
-                return _clamp01(other_rgb * (1.0 - fac + fac * rgb)).astype(np.float32)
-    elif blend == "ADD":
-        if is_a_chain:
-            def apply(rgb):
-                return _clamp01(rgb + fac * other_rgb).astype(np.float32)
-        else:
-            def apply(rgb):
-                return _clamp01(other_rgb + fac * rgb).astype(np.float32)
-    else:  # SUBTRACT
-        if is_a_chain:
-            def apply(rgb):
-                return _clamp01(rgb - fac * other_rgb).astype(np.float32)
-        else:
-            def apply(rgb):
-                return _clamp01(other_rgb - fac * rgb).astype(np.float32)
+    def _blend(col1, col2):
+        """Apply Blender's ramp_blend with col1=A (base), col2=B (top)."""
+        if blend == "MIX":
+            return col1 * facm + col2 * fac
+        if blend == "MULTIPLY":
+            return col1 * (facm + fac * col2)
+        if blend == "ADD":
+            return col1 + fac * col2
+        if blend == "SUBTRACT":
+            return col1 - fac * col2
+        if blend == "SCREEN":
+            return 1.0 - (facm + fac * (1.0 - col2)) * (1.0 - col1)
+        if blend == "DIVIDE":
+            col2_safe = np.where(col2 == 0.0, 1.0, col2)
+            return np.where(col2 == 0.0, col1, facm * col1 + fac * col1 / col2_safe)
+        if blend == "DIFFERENCE":
+            return facm * col1 + fac * np.abs(col1 - col2)
+        if blend == "DARKEN":
+            return facm * col1 + fac * np.minimum(col1, col2)
+        if blend == "LIGHTEN":
+            # Blender's asymmetric formula: max(col1, col2*fac).
+            return np.maximum(col1, col2 * fac)
+        if blend == "OVERLAY":
+            lo = col1 * (facm + 2.0 * fac * col2)
+            hi = 1.0 - (facm + 2.0 * fac * (1.0 - col2)) * (1.0 - col1)
+            return np.where(col1 < 0.5, lo, hi)
+        if blend == "SOFT_LIGHT":
+            scr = 1.0 - (1.0 - col2) * (1.0 - col1)
+            return facm * col1 + fac * ((1.0 - col1) * col2 * col1 + col1 * scr)
+        if blend == "LINEAR_LIGHT":
+            return col1 + fac * (2.0 * col2 - 1.0)
+        raise AssertionError(f"unreachable blend: {blend}")
+
+    if is_a_chain:
+        def apply(rgb):
+            return _clamp01(_blend(rgb, other_rgb)).astype(np.float32)
+    else:
+        def apply(rgb):
+            return _clamp01(_blend(other_rgb, rgb)).astype(np.float32)
 
     return id_tuple, apply
 
