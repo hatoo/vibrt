@@ -13,6 +13,9 @@ pub struct LoadedMesh {
     pub indices: Vec<u32>,
     /// u32 per triangle; empty when the mesh is single-material.
     pub material_indices: Vec<u32>,
+    /// f32 x 3 per vertex; empty when the mesh has no vertex colour attribute
+    /// referenced by any material. See `MeshDesc::vertex_colors`.
+    pub vertex_colors: Vec<f32>,
 }
 
 pub struct LoadedTexture {
@@ -336,6 +339,10 @@ fn load_mesh(desc: &MeshDesc, bin: &[u8]) -> Result<LoadedMesh> {
         Some(b) => read_u32_vec(slice_bin(bin, b)?),
         None => Vec::new(),
     };
+    let vertex_colors = match desc.vertex_colors {
+        Some(b) => read_f32_vec(slice_bin(bin, b)?),
+        None => Vec::new(),
+    };
 
     if indices.len() % 3 != 0 {
         return Err(anyhow!("mesh index count is not a multiple of 3"));
@@ -351,6 +358,13 @@ fn load_mesh(desc: &MeshDesc, bin: &[u8]) -> Result<LoadedMesh> {
             num_tris
         ));
     }
+    if !vertex_colors.is_empty() && vertex_colors.len() != vertices.len() {
+        return Err(anyhow!(
+            "mesh vertex_colors len {} != vertices len {} (expected f32x3 per vertex)",
+            vertex_colors.len(),
+            vertices.len()
+        ));
+    }
 
     Ok(LoadedMesh {
         vertices,
@@ -358,6 +372,7 @@ fn load_mesh(desc: &MeshDesc, bin: &[u8]) -> Result<LoadedMesh> {
         uvs,
         indices,
         material_indices,
+        vertex_colors,
     })
 }
 

@@ -80,6 +80,12 @@ pub struct MeshDesc {
     pub displacement_tex: Option<u32>,
     #[serde(default)]
     pub displacement_strength: f32,
+    /// f32 x 3 per vertex; optional. Written when a material references a
+    /// vertex color Attribute for base_color. Interpolated barycentrically at
+    /// the hit and multiplied into base_color when the material has
+    /// `use_vertex_color` set.
+    #[serde(default)]
+    pub vertex_colors: Option<BlobRef>,
 }
 
 #[derive(Deserialize)]
@@ -140,6 +146,12 @@ pub struct PrincipledMaterial {
     pub sss_radius: [f32; 3],
     #[serde(default)]
     pub sss_anisotropy: f32,
+    /// When true, multiply base_color by the mesh's interpolated vertex
+    /// color (MeshDesc::vertex_colors). Set by the Blender exporter when a
+    /// material drives its base colour via a ShaderNodeAttribute — otherwise
+    /// the Attribute folds to a single mean, losing rim darkening.
+    #[serde(default)]
+    pub use_vertex_color: bool,
 }
 
 fn default_sss_radius() -> [f32; 3] {

@@ -289,6 +289,7 @@ struct PathVertex {
   float3 Ns; // shading normal (world)
   float3 T;  // tangent (world)
   float2 uv; // mesh UVs (0,0 if absent)
+  float3 vc; // interpolated vertex colour (1,1,1 if mesh has none)
   PrincipledGpu *mat;
   int hit; // 1 if hit, 0 if miss
 };
@@ -477,6 +478,9 @@ static __device__ MaterialEval eval_material(const PathVertex &v) {
         sample_rgba(m->base_color_tex, m->base_color_tex_w, m->base_color_tex_h,
                     m->base_color_tex_channels, uv);
     e.base_color = e.base_color * t;
+  }
+  if (m->use_vertex_color) {
+    e.base_color = e.base_color * v.vc;
   }
   if (m->roughness_tex != nullptr) {
     float3 t = sample_rgba(m->roughness_tex, m->roughness_tex_w,
@@ -998,11 +1002,20 @@ extern "C" __global__ void __closesthit__ch() {
     T = make_float3(0, 1, 0);
   }
 
+  float3 vc = make_float3(1.0f, 1.0f, 1.0f);
+  if (hg->vertex_colors != nullptr) {
+    float3 c0 = make_f3(&hg->vertex_colors[i0 * 3]);
+    float3 c1 = make_f3(&hg->vertex_colors[i1 * 3]);
+    float3 c2 = make_f3(&hg->vertex_colors[i2 * 3]);
+    vc = c0 * b0 + c1 * bary.x + c2 * bary.y;
+  }
+
   v->P = P;
   v->Ng = Ng;
   v->Ns = Ns;
   v->T = T;
   v->uv = uv;
+  v->vc = vc;
   v->mat = hg->mat;
   if (hg->material_indices != nullptr && hg->num_materials > 0) {
     unsigned int mi = hg->material_indices[prim];

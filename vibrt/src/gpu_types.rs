@@ -46,6 +46,8 @@ pub struct PrincipledGpu {
     pub sss_weight: f32,
     pub sss_radius: [f32; 3],
     pub sss_anisotropy: f32,
+    /// i32 used as bool — multiply base_color by interpolated vertex color.
+    pub use_vertex_color: i32,
 }
 
 #[repr(C)]
@@ -63,7 +65,8 @@ pub struct HitGroupData {
     /// PrincipledGpu* per slot. Used when `material_indices` != 0.
     pub materials: optix_sys::CUdeviceptr,
     pub num_materials: i32,
-    pub _pad_hg: i32,
+    /// f32 x 3 per vertex. 0 when the mesh has no vertex color attribute.
+    pub vertex_colors: optix_sys::CUdeviceptr,
 }
 
 #[repr(C)]

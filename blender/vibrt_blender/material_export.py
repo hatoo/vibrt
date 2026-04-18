@@ -395,6 +395,66 @@ _PROCEDURAL_LEAF_DEFAULTS: dict[str, list[float]] = {
 }
 
 
+def _attribute_driven_color(sock, depth: int = 0):
+    """Detect a ShaderNodeAttribute driving `sock`, through Mix nodes whose
+    factor is a compile-time 0 or 1. Returns `(attribute_name, tint_rgb)` or
+    `None`.
+
+    The renderer multiplies `base_color * vertex_color` at the hit point, so
+    `tint_rgb` is the per-material factor that collapses the non-attribute
+    side of the Mix into a constant:
+
+    - MIX fac=1, B=Attribute: `result = B` → tint = (1,1,1).
+    - MULTIPLY fac=1, B=Attribute: `result = A * B` → tint ≈ A_const.
+    - OVERLAY fac=1, B=Attribute (as in classroom `wallClock_darkWood`):
+      `result = 2*A*B` when A<0.5 per channel — approximated as `tint =
+      clamp(2*A_const, 0, 1)`. A is the ColorRamp over a noise mix here,
+      which folds near-0.5 via procedural leaf defaults, giving a mid-dark
+      wood tint that the per-vertex mask further darkens to near-black.
+    """
+    if depth > 4 or not sock.is_linked:
+        return None
+    src = sock.links[0].from_node
+    if src.bl_idname == "ShaderNodeAttribute":
+        name = getattr(src, "attribute_name", "") or ""
+        return (name, [1.0, 1.0, 1.0]) if name else None
+    if src.bl_idname in ("ShaderNodeMix", "ShaderNodeMixRGB"):
+        fac_sock, a_sock, b_sock, blend, _use_clamp, ok = _mix_node_params(src)
+        if not ok or fac_sock.is_linked:
+            return None
+        fac = _socket_f(fac_sock)
+        if blend == "MIX":
+            if fac >= 0.999:
+                return _attribute_driven_color(b_sock, depth + 1)
+            if fac <= 0.001:
+                return _attribute_driven_color(a_sock, depth + 1)
+            return None
+        if blend not in ("MULTIPLY", "OVERLAY", "DARKEN"):
+            return None
+        if fac < 0.999:
+            return None
+        inner_a = _attribute_driven_color(a_sock, depth + 1)
+        inner_b = _attribute_driven_color(b_sock, depth + 1)
+        if inner_b is not None:
+            other_const = _socket_constant_rgb(a_sock)
+            if other_const is None:
+                return None
+            attr_name, inner_tint = inner_b
+            tint = [c * t for c, t in zip(other_const, inner_tint)]
+        elif inner_a is not None:
+            other_const = _socket_constant_rgb(b_sock)
+            if other_const is None:
+                return None
+            attr_name, inner_tint = inner_a
+            tint = [c * t for c, t in zip(other_const, inner_tint)]
+        else:
+            return None
+        if blend == "OVERLAY":
+            tint = [min(2.0 * c, 1.0) for c in tint]
+        return attr_name, tint
+    return None
+
+
 def _leaf_constant_rgb(src) -> list[float]:
     """Best-effort constant colour for a non-bakeable leaf node.
 
@@ -1649,7 +1709,14 @@ def _from_principled(node, buf, textures) -> dict:
         p["base_color_tex"] = export_image_texture(img, buf, textures, "srgb", chain=chain)
         p["base_color"] = [1.0, 1.0, 1.0]
     else:
-        p["base_color"] = _socket_rgb(bc)
+        attr_info = _attribute_driven_color(bc)
+        if attr_info is not None:
+            attr_name, tint = attr_info
+            p["use_vertex_color"] = True
+            p["_vertex_color_attr"] = attr_name
+            p["base_color"] = tint
+        else:
+            p["base_color"] = _socket_rgb(bc)
 
     tex = _export_linked_scalar_texture(node.inputs["Metallic"], buf, textures)
     if tex is not None:
@@ -1776,12 +1843,20 @@ def _from_diffuse(node, buf, textures) -> dict:
     p = _default_params()
     p["roughness"] = 1.0
     p["metallic"] = 0.0
-    img, chain = _socket_linked_image_with_chain(node.inputs["Color"])
+    color_sock = node.inputs["Color"]
+    img, chain = _socket_linked_image_with_chain(color_sock)
     if img is not None:
         p["base_color_tex"] = export_image_texture(img, buf, textures, "srgb", chain=chain)
         p["base_color"] = [1.0, 1.0, 1.0]
     else:
-        p["base_color"] = _socket_rgb(node.inputs["Color"])
+        attr_info = _attribute_driven_color(color_sock)
+        if attr_info is not None:
+            attr_name, tint = attr_info
+            p["use_vertex_color"] = True
+            p["_vertex_color_attr"] = attr_name
+            p["base_color"] = tint
+        else:
+            p["base_color"] = _socket_rgb(color_sock)
     _apply_normal_perturbation(p, node.inputs.get("Normal"), buf, textures)
     return p
 

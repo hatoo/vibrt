@@ -91,7 +91,9 @@ def _find_displacement(obj_eval, buf, textures):
     return None, 0.0
 
 
-def _export_mesh(obj_eval, buf: bytearray, textures: list) -> dict | None:
+def _export_mesh(
+    obj_eval, buf: bytearray, textures: list, vc_attr_name: str | None = None
+) -> dict | None:
     """Export a mesh + per-triangle material indices.
 
     Returns a dict suitable for a `MeshDesc` — always includes `material_indices`
@@ -100,6 +102,10 @@ def _export_mesh(obj_eval, buf: bytearray, textures: list) -> dict | None:
     Vertex / normal / UV / index arrays are built through `foreach_get` into
     numpy buffers. A Python-level per-triangle loop was the dominant export
     cost on non-trivial meshes (seconds per 100k-tri object vs milliseconds).
+
+    If `vc_attr_name` is given and the mesh has a matching colour attribute,
+    emits f32x3 per emitted vertex (one per triangle corner, matching the
+    duplicated-vertex layout) so the renderer can interpolate it.
     """
     import numpy as np
 
@@ -153,6 +159,24 @@ def _export_mesh(obj_eval, buf: bytearray, textures: list) -> dict | None:
             tri_mat_idx = np.empty(ntri, dtype=np.int32)
             mesh.loop_triangles.foreach_get("material_index", tri_mat_idx)
             desc["material_indices"] = _write_u32(buf, tri_mat_idx)
+        if vc_attr_name:
+            color_attrs = getattr(mesh, "color_attributes", None) or []
+            target = next((ca for ca in color_attrs if ca.name == vc_attr_name), None)
+            if target is not None:
+                n = len(target.data)
+                rgba = np.empty(n * 4, dtype=np.float32)
+                target.data.foreach_get("color", rgba)
+                rgba = rgba.reshape(n, 4)[:, :3]
+                if target.domain == "CORNER":
+                    per_corner = rgba[tri_loop_idx]
+                elif target.domain == "POINT":
+                    per_corner = rgba[tri_vert_idx]
+                else:
+                    per_corner = None
+                if per_corner is not None:
+                    desc["vertex_colors"] = _write_f32(
+                        buf, np.ascontiguousarray(per_corner.reshape(-1))
+                    )
         disp_tex, disp_strength = _find_displacement(obj_eval, buf, textures)
         if disp_tex is not None and disp_strength != 0.0:
             desc["displacement_tex"] = disp_tex
@@ -351,6 +375,11 @@ def export_scene(
     textures: list[dict] = []
     materials: list[dict] = []
     material_index: dict[str, int] = {}
+    # Materials that drive base_color from a ShaderNodeAttribute flag the
+    # attribute name on their exported dict under `_vertex_color_attr`. We pop
+    # it here so the material JSON stays clean, and remember it so meshes that
+    # reference the material can emit the matching vertex-colour blob.
+    material_vc_attr: dict[str, str] = {}
 
     def resolve_material(mat) -> int:
         if mat is None:
@@ -367,6 +396,9 @@ def export_scene(
         if mat.name in material_index:
             return material_index[mat.name]
         exported = material_export.export_material(mat, buf, textures)
+        vc_attr = exported.pop("_vertex_color_attr", None)
+        if vc_attr:
+            material_vc_attr[mat.name] = vc_attr
         mid = len(materials)
         materials.append(exported)
         material_index[mat.name] = mid
@@ -387,11 +419,25 @@ def export_scene(
             obj_eval = obj.evaluated_get(depsgraph)
 
         if obj_eval.type == "MESH":
-            mkey = f"{obj_eval.data.name}#{obj_eval.name}"
+            # Resolve materials before mesh export — _export_mesh needs to know
+            # which vertex-colour attribute (if any) a bound material references.
+            slot_mat_ids: list[int] = []
+            vc_attr_name: str | None = None
+            if obj_eval.material_slots:
+                for slot in obj_eval.material_slots:
+                    slot_mat_ids.append(resolve_material(slot.material))
+                    if slot.material is not None and vc_attr_name is None:
+                        vc_attr_name = material_vc_attr.get(slot.material.name)
+            if not slot_mat_ids:
+                slot_mat_ids = [resolve_material(None)]
+
+            # Same mesh data exported with / without vertex colour would need
+            # separate blobs, so fold the attribute name into the cache key.
+            mkey = f"{obj_eval.data.name}#{obj_eval.name}#vc={vc_attr_name}"
             mesh_id = mesh_cache.get(mkey)
             if mesh_id is None:
                 t_mesh = time.perf_counter()
-                mesh = _export_mesh(obj_eval, buf, textures)
+                mesh = _export_mesh(obj_eval, buf, textures, vc_attr_name)
                 dt_mesh = time.perf_counter() - t_mesh
                 mesh_s += dt_mesh
                 if mesh is None:
@@ -404,12 +450,6 @@ def export_scene(
                 mesh_id = len(meshes)
                 meshes.append(mesh)
                 mesh_cache[mkey] = mesh_id
-            slot_mat_ids: list[int] = []
-            if obj_eval.material_slots:
-                for slot in obj_eval.material_slots:
-                    slot_mat_ids.append(resolve_material(slot.material))
-            if not slot_mat_ids:
-                slot_mat_ids = [resolve_material(None)]
             obj_desc = {
                 "mesh": mesh_id,
                 "material": slot_mat_ids[0],

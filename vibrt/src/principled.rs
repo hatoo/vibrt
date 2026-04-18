@@ -91,5 +91,6 @@ pub fn make_material_data(
         sss_weight: mat.sss_weight.clamp(0.0, 1.0),
         sss_radius: mat.sss_radius,
         sss_anisotropy: mat.sss_anisotropy.clamp(-0.99, 0.99),
+        use_vertex_color: if mat.use_vertex_color { 1 } else { 0 },
     }
 }

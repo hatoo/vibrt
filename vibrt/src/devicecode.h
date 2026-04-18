@@ -44,6 +44,7 @@ struct PrincipledGpu {
   float sss_weight;
   float sss_radius[3];
   float sss_anisotropy;
+  int use_vertex_color;
 };
 
 struct HitGroupData {
@@ -57,7 +58,7 @@ struct HitGroupData {
   unsigned int *material_indices; // nullptr => use `mat`
   PrincipledGpu **materials;
   int num_materials;
-  int _pad_hg;
+  float *vertex_colors; // f32x3 per vertex, nullptr if absent
 };
 
 struct PointLight {
