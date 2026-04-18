@@ -6,6 +6,7 @@
 #   make veach_mis            # regenerate one scene by directory name
 #   make previews             # regenerate scenes and render preview.png for each
 #   make veach_mis-preview    # render preview for one scene
+#   make addon                # rebuild blender/vibrt_blender.zip
 #   make clean                # remove generated scene.json, scene.bin, preview.png
 #
 # Overridable:
@@ -25,12 +26,16 @@ PREVIEW_PNGS  := $(SCENE_SCRIPTS:make_scene.py=preview.png)
 
 PREVIEW_TARGETS := $(addsuffix -preview,$(SCENES))
 
-.PHONY: all scenes previews clean $(SCENES) $(PREVIEW_TARGETS)
+ADDON_ZIP     := blender/vibrt_blender.zip
+ADDON_SOURCES := $(wildcard blender/vibrt_blender/*.py)
+
+.PHONY: all scenes previews addon clean $(SCENES) $(PREVIEW_TARGETS)
 
 all: scenes
 
 scenes: $(SCENE_JSONS)
 previews: $(PREVIEW_PNGS)
+addon: $(ADDON_ZIP)
 
 # Shorthand: `make <scene>` regenerates scene.json;
 #            `make <scene>-preview` renders preview.png.
@@ -44,5 +49,8 @@ test_scenes/%/scene.json: test_scenes/%/make_scene.py
 test_scenes/%/preview.png: test_scenes/%/scene.json
 	$(VIBRT) $< --spp $(SPP) --output $@
 
+$(ADDON_ZIP): $(ADDON_SOURCES) blender/build_addon.py
+	$(PYTHON) blender/build_addon.py
+
 clean:
-	rm -f $(SCENE_JSONS) $(SCENE_BINS) $(PREVIEW_PNGS)
+	rm -f $(SCENE_JSONS) $(SCENE_BINS) $(PREVIEW_PNGS) $(ADDON_ZIP)
