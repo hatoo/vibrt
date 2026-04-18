@@ -414,20 +414,26 @@ static __device__ MaterialEval eval_material(const PathVertex &v) {
   e.ior = m->ior;
   e.transmission = m->transmission;
   e.emission = make_f3(m->emission);
+
+  const float *M = m->uv_transform;
+  float2 uv =
+      make_float2(M[0] * v.uv.x + M[1] * v.uv.y + M[2],
+                  M[3] * v.uv.x + M[4] * v.uv.y + M[5]);
+
   if (m->base_color_tex != nullptr) {
     float3 t =
         sample_rgba(m->base_color_tex, m->base_color_tex_w, m->base_color_tex_h,
-                    m->base_color_tex_channels, v.uv);
+                    m->base_color_tex_channels, uv);
     e.base_color = e.base_color * t;
   }
   if (m->roughness_tex != nullptr) {
     float3 t = sample_rgba(m->roughness_tex, m->roughness_tex_w,
-                           m->roughness_tex_h, m->roughness_tex_channels, v.uv);
+                           m->roughness_tex_h, m->roughness_tex_channels, uv);
     e.roughness = e.roughness * t.x;
   }
   if (m->metallic_tex != nullptr) {
     float3 t = sample_rgba(m->metallic_tex, m->metallic_tex_w,
-                           m->metallic_tex_h, m->metallic_tex_channels, v.uv);
+                           m->metallic_tex_h, m->metallic_tex_channels, uv);
     e.metallic = e.metallic * t.x;
   }
   e.metallic = fminf(fmaxf(e.metallic, 0.0f), 1.0f);
@@ -435,14 +441,54 @@ static __device__ MaterialEval eval_material(const PathVertex &v) {
   e.alpha = fmaxf(e.roughness * e.roughness, 1e-4f);
 
   float3 Ns = v.Ns;
+  // Composite tangent-space perturbation: start from (0,0,1), apply bump
+  // (central-difference over heightmap) first, then normal map (multiplied).
+  float3 nm_t = make_float3(0.0f, 0.0f, 1.0f);
+  bool any_perturb = false;
+  if (m->bump_tex != nullptr && m->bump_strength != 0.0f) {
+    int bw = m->bump_tex_w;
+    int bh = m->bump_tex_h;
+    if (bw > 0 && bh > 0) {
+      float du = 1.0f / (float)bw;
+      float dv = 1.0f / (float)bh;
+      float h_px = sample_rgba(m->bump_tex, bw, bh, m->bump_tex_channels,
+                               make_float2(uv.x + du, uv.y)).x;
+      float h_mx = sample_rgba(m->bump_tex, bw, bh, m->bump_tex_channels,
+                               make_float2(uv.x - du, uv.y)).x;
+      float h_py = sample_rgba(m->bump_tex, bw, bh, m->bump_tex_channels,
+                               make_float2(uv.x, uv.y + dv)).x;
+      float h_my = sample_rgba(m->bump_tex, bw, bh, m->bump_tex_channels,
+                               make_float2(uv.x, uv.y - dv)).x;
+      // Central-difference slope × user strength. Empirical 0.25 keeps the
+      // bump in a "subtle micro-relief" range at Strength=1.
+      float sx = -(h_px - h_mx) * m->bump_strength * 0.25f;
+      float sy = -(h_py - h_my) * m->bump_strength * 0.25f;
+      nm_t = normalize3(make_float3(sx, sy, 1.0f));
+      any_perturb = true;
+    }
+  }
   if (m->normal_tex != nullptr) {
     float3 n = sample_rgba(m->normal_tex, m->normal_tex_w, m->normal_tex_h,
-                           m->normal_tex_channels, v.uv);
-    float3 nm = make_float3(n.x * 2.0f - 1.0f, n.y * 2.0f - 1.0f,
+                           m->normal_tex_channels, uv);
+    float s = m->normal_strength;
+    float3 nn = make_float3((n.x * 2.0f - 1.0f) * s,
+                            (n.y * 2.0f - 1.0f) * s,
                             fmaxf(n.z * 2.0f - 1.0f, 0.01f));
+    nn = normalize3(nn);
+    // Compose: treat nm_t as frame, re-express nn in its tangent basis.
+    if (any_perturb) {
+      float3 nt, nb;
+      build_frame(nm_t, nt, nb);
+      nm_t = normalize3(nt * nn.x + nb * nn.y + nm_t * nn.z);
+    } else {
+      nm_t = nn;
+    }
+    any_perturb = true;
+  }
+  if (any_perturb) {
     float3 T, B;
     build_frame(Ns, T, B);
-    Ns = normalize3(T * nm.x + B * nm.y + Ns * nm.z);
+    Ns = normalize3(T * nm_t.x + B * nm_t.y + Ns * nm_t.z);
   }
   e.Ns = Ns;
   build_frame(e.Ns, e.T, e.B);

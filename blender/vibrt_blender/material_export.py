@@ -7,6 +7,7 @@ All collapsed onto the renderer's Principled-only parameter set.
 
 from __future__ import annotations
 
+import math
 import struct
 
 import bpy
@@ -73,39 +74,120 @@ def _socket_f(sock) -> float:
     return float(sock.default_value)
 
 
-def _socket_linked_image(sock) -> bpy.types.Image | None:
-    """Return the image feeding a socket, seeing through a Mapping node."""
-    if not sock.is_linked:
+_IDENTITY_UV = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
+
+
+def _first_mapping_node(node_tree) -> "bpy.types.Node | None":
+    """Find any ShaderNodeMapping feeding a TexImage inside this node tree."""
+    if node_tree is None:
+        return None
+    for n in node_tree.nodes:
+        if n.bl_idname == "ShaderNodeMapping":
+            return n
+    return None
+
+
+def _mapping_to_affine(node) -> list[float]:
+    """Convert a Mapping node (type=POINT) to a 2x3 affine matrix over UV.
+
+    Other types (TEXTURE/VECTOR/NORMAL) fall back to identity with a warning.
+    """
+    if node is None:
+        return list(_IDENTITY_UV)
+    vector_type = getattr(node, "vector_type", "POINT")
+    if vector_type != "POINT":
+        return list(_IDENTITY_UV)
+
+    def _vec3(sock):
+        v = sock.default_value
+        return [float(v[0]), float(v[1]), float(v[2])]
+
+    loc = _vec3(node.inputs["Location"])
+    rot = _vec3(node.inputs["Rotation"])
+    scl = _vec3(node.inputs["Scale"])
+
+    sx, sy = scl[0], scl[1]
+    theta = rot[2]  # UV is 2D; only Z rotation matters
+    tx, ty = loc[0], loc[1]
+    c = math.cos(theta)
+    s = math.sin(theta)
+    # M = T · R · S, row-major 2x3:
+    return [sx * c, -sy * s, tx,
+            sx * s,  sy * c, ty]
+
+
+# Node types that pass a TexImage through unchanged in semantic terms: Mapping
+# only transforms the Vector side, so seeing through it is safe. MixRGB /
+# ColorRamp / Gamma / etc. change colour values; treating them as passthrough
+# visibly darkens or tints the result, so they're omitted.
+_PASSTHROUGH_NODES = {
+    "ShaderNodeMapping",
+}
+
+
+def _socket_linked_image(sock, depth: int = 0) -> bpy.types.Image | None:
+    """Return the image feeding a socket.
+
+    Sees through color-math / UV-transform intermediates (MixRGB, ColorRamp,
+    Mapping, etc.). The actual color math or UV transform is discarded — the
+    renderer can't replicate it — but picking up the underlying image is still
+    better than exporting a flat default colour.
+    """
+    if not sock.is_linked or depth > 6:
         return None
     src = sock.links[0].from_node
     if src.bl_idname == "ShaderNodeTexImage" and src.image is not None:
         return src.image
-    # Rare on color paths but harmless: follow through a Mapping node,
-    # dropping the UV transform (renderer doesn't honor it).
-    if src.bl_idname == "ShaderNodeMapping":
+    if src.bl_idname in _PASSTHROUGH_NODES:
         for inp in src.inputs:
             if not inp.is_linked:
                 continue
-            upstream = inp.links[0].from_node
-            if upstream.bl_idname == "ShaderNodeTexImage" and upstream.image is not None:
-                return upstream.image
+            img = _socket_linked_image(inp, depth + 1)
+            if img is not None:
+                return img
     return None
+
+
+def _normal_perturbation(normal_sock):
+    """Inspect a Normal input socket and return (normal_img, strength,
+    bump_img, bump_strength).
+
+    Any can be None. Tangent-space normal maps go through ShaderNodeNormalMap;
+    heightmaps come through ShaderNodeBump's Height input.
+    """
+    if normal_sock is None or not normal_sock.is_linked:
+        return None, 1.0, None, 1.0
+    src = normal_sock.links[0].from_node
+    if src.bl_idname == "ShaderNodeNormalMap":
+        img = _socket_linked_image(src.inputs["Color"])
+        strength = _socket_f(src.inputs["Strength"]) if "Strength" in src.inputs else 1.0
+        return img, strength, None, 1.0
+    if src.bl_idname == "ShaderNodeBump":
+        h_img = _socket_linked_image(src.inputs["Height"])
+        strength = _socket_f(src.inputs["Strength"]) if "Strength" in src.inputs else 1.0
+        distance = _socket_f(src.inputs["Distance"]) if "Distance" in src.inputs else 1.0
+        return None, 1.0, h_img, strength * distance
+    if src.bl_idname == "ShaderNodeTexImage" and src.image is not None:
+        return src.image, 1.0, None, 1.0
+    return None, 1.0, None, 1.0
 
 
 def _normal_map_image(normal_sock) -> bpy.types.Image | None:
-    """Return a tangent-space normal map image feeding a Normal input, or None.
+    img, _, _, _ = _normal_perturbation(normal_sock)
+    return img
 
-    Bump nodes (height-based) are intentionally skipped — the renderer only
-    supports tangent-space normal maps.
-    """
-    if normal_sock is None or not normal_sock.is_linked:
-        return None
-    src = normal_sock.links[0].from_node
-    if src.bl_idname == "ShaderNodeNormalMap":
-        return _socket_linked_image(src.inputs["Color"])
-    if src.bl_idname == "ShaderNodeTexImage" and src.image is not None:
-        return src.image
-    return None
+
+def _apply_normal_perturbation(params: dict, normal_sock, buf, textures) -> None:
+    """Resolve the Normal input and assign normal_tex / bump_tex + strengths."""
+    n_img, n_strength, b_img, b_strength = _normal_perturbation(normal_sock)
+    if n_img is not None:
+        params["normal_tex"] = export_image_texture(n_img, buf, textures, "linear")
+        if n_strength != 1.0:
+            params["normal_strength"] = n_strength
+    if b_img is not None:
+        params["bump_tex"] = export_image_texture(b_img, buf, textures, "linear")
+        if b_strength != 1.0:
+            params["bump_strength"] = b_strength
 
 
 def _default_params() -> dict:
@@ -136,10 +218,17 @@ def _resolve_shader(node, buf, textures, mat_name: str) -> dict:
         return _from_mix(node, buf, textures, mat_name)
     if bl == "ShaderNodeBsdfGlass":
         return _from_glass(node, buf, textures)
+    if bl == "ShaderNodeBsdfRefraction":
+        return _from_refraction(node, buf, textures)
     if bl == "ShaderNodeEmission":
         return _from_emission(node, buf, textures)
+    if bl == "ShaderNodeAddShader":
+        return _from_add(node, buf, textures, mat_name)
     if bl == "ShaderNodeGroup":
         return _from_group(node, buf, textures, mat_name)
+    if bl == "ShaderNodeVolumeAbsorption" or bl == "ShaderNodeVolumeScatter" or bl == "ShaderNodeVolumePrincipled":
+        print(f"[vibrt] ignoring volume shader {bl} in material {mat_name!r}")
+        return _default_params()
     print(f"[vibrt] unsupported shader node: {bl} in material {mat_name!r}")
     return _default_params()
 
@@ -182,9 +271,7 @@ def _from_principled(node, buf, textures) -> dict:
         )
         p["emission"] = [c * strength for c in color]
 
-    img = _normal_map_image(node.inputs.get("Normal"))
-    if img is not None:
-        p["normal_tex"] = export_image_texture(img, buf, textures, "linear")
+    _apply_normal_perturbation(p, node.inputs.get("Normal"), buf, textures)
     return p
 
 
@@ -196,9 +283,7 @@ def _from_diffuse(node, buf, textures) -> dict:
     img = _socket_linked_image(node.inputs["Color"])
     if img is not None:
         p["base_color_tex"] = export_image_texture(img, buf, textures, "srgb")
-    img = _normal_map_image(node.inputs.get("Normal"))
-    if img is not None:
-        p["normal_tex"] = export_image_texture(img, buf, textures, "linear")
+    _apply_normal_perturbation(p, node.inputs.get("Normal"), buf, textures)
     return p
 
 
@@ -215,9 +300,7 @@ def _from_glossy(node, buf, textures) -> dict:
         img = _socket_linked_image(node.inputs["Roughness"])
         if img is not None:
             p["roughness_tex"] = export_image_texture(img, buf, textures, "linear")
-    img = _normal_map_image(node.inputs.get("Normal"))
-    if img is not None:
-        p["normal_tex"] = export_image_texture(img, buf, textures, "linear")
+    _apply_normal_perturbation(p, node.inputs.get("Normal"), buf, textures)
     return p
 
 
@@ -237,6 +320,48 @@ def _from_glass(node, buf, textures) -> dict:
         if img is not None:
             p["roughness_tex"] = export_image_texture(img, buf, textures, "linear")
     return p
+
+
+def _from_refraction(node, buf, textures) -> dict:
+    p = _default_params()
+    p["base_color"] = _socket_rgb(node.inputs["Color"])
+    p["transmission"] = 1.0
+    p["metallic"] = 0.0
+    if "Roughness" in node.inputs:
+        p["roughness"] = _socket_f(node.inputs["Roughness"])
+    if "IOR" in node.inputs:
+        p["ior"] = _socket_f(node.inputs["IOR"])
+    img = _socket_linked_image(node.inputs["Color"])
+    if img is not None:
+        p["base_color_tex"] = export_image_texture(img, buf, textures, "srgb")
+    if "Roughness" in node.inputs:
+        img = _socket_linked_image(node.inputs["Roughness"])
+        if img is not None:
+            p["roughness_tex"] = export_image_texture(img, buf, textures, "linear")
+    return p
+
+
+def _from_add(node, buf, textures, mat_name: str) -> dict:
+    """Add Shader: sum of two branches. Average surface-like params, sum emission."""
+    in1, in2 = node.inputs[0], node.inputs[1]
+    n1 = in1.links[0].from_node if in1.is_linked else None
+    n2 = in2.links[0].from_node if in2.is_linked else None
+    p1 = _resolve_shader(n1, buf, textures, mat_name) if n1 else _default_params()
+    p2 = _resolve_shader(n2, buf, textures, mat_name) if n2 else _default_params()
+    out = dict(p1)
+    out["emission"] = [a + b for a, b in zip(p1["emission"], p2["emission"])]
+    out["transmission"] = max(p1["transmission"], p2["transmission"])
+    # Prefer the non-emission branch's surface params when mixing with an Emission.
+    if sum(p1["emission"]) > 0 and sum(p2["emission"]) == 0:
+        out["base_color"] = p2["base_color"]
+        out["metallic"] = p2["metallic"]
+        out["roughness"] = p2["roughness"]
+        for k in ("base_color_tex", "normal_tex", "roughness_tex",
+                  "metallic_tex", "bump_tex", "normal_strength",
+                  "bump_strength", "uv_transform"):
+            if k in p2:
+                out[k] = p2[k]
+    return out
 
 
 def _from_transparent(node, buf, textures) -> dict:
@@ -287,8 +412,9 @@ def _from_mix(node, buf, textures, mat_name: str) -> dict:
         out["metallic"] = 0.0
         if "roughness_tex" in gloss:
             out["roughness_tex"] = gloss["roughness_tex"]
-        if "normal_tex" not in out and "normal_tex" in gloss:
-            out["normal_tex"] = gloss["normal_tex"]
+        for k in ("normal_tex", "normal_strength", "bump_tex", "bump_strength"):
+            if k not in out and k in gloss:
+                out[k] = gloss[k]
         return out
 
     fac_sock = node.inputs[0]
@@ -344,5 +470,21 @@ def export_material(
     if out_node is None or not out_node.inputs["Surface"].is_linked:
         return _default_params()
 
+    volume = out_node.inputs.get("Volume")
+    if volume is not None and volume.is_linked:
+        print(f"[vibrt] ignoring Volume shader in material {mat.name!r}")
+    displacement = out_node.inputs.get("Displacement")
+    if displacement is not None and displacement.is_linked:
+        # Displacement is consumed by the mesh exporter in a later phase.
+        pass
+
     surface = out_node.inputs["Surface"].links[0].from_node
-    return _resolve_shader(surface, buf, textures, mat.name)
+    params = _resolve_shader(surface, buf, textures, mat.name)
+
+    # Per-material UV transform: take the first Mapping node found.
+    mapping = _first_mapping_node(mat.node_tree)
+    if mapping is not None:
+        affine = _mapping_to_affine(mapping)
+        if affine != _IDENTITY_UV:
+            params["uv_transform"] = affine
+    return params

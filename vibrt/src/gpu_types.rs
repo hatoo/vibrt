@@ -26,6 +26,15 @@ pub struct PrincipledGpu {
     pub metallic_tex_w: i32,
     pub metallic_tex_h: i32,
     pub metallic_tex_channels: i32,
+    /// 2x3 row-major affine UV transform: uv' = [M[0..3]·(u,v,1), M[3..6]·(u,v,1)].
+    pub uv_transform: [f32; 6],
+    pub normal_strength: f32,
+    pub bump_strength: f32,
+    pub bump_tex: optix_sys::CUdeviceptr,
+    pub bump_tex_w: i32,
+    pub bump_tex_h: i32,
+    pub bump_tex_channels: i32,
+    pub _pad_bump: i32,
 }
 
 #[repr(C)]

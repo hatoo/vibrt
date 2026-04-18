@@ -89,6 +89,20 @@ pub struct PrincipledMaterial {
     pub roughness_tex: Option<u32>,
     #[serde(default)]
     pub metallic_tex: Option<u32>,
+    /// 2x3 row-major affine UV transform [a,b,tu, c,d,tv]: uv' = M · (uv, 1).
+    /// Default identity.
+    #[serde(default = "identity_uv_transform")]
+    pub uv_transform: [f32; 6],
+    #[serde(default = "one_f32")]
+    pub normal_strength: f32,
+    #[serde(default)]
+    pub bump_tex: Option<u32>,
+    #[serde(default = "one_f32")]
+    pub bump_strength: f32,
+}
+
+fn identity_uv_transform() -> [f32; 6] {
+    [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
 }
 
 fn half_f32() -> f32 {

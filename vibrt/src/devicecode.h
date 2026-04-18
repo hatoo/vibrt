@@ -25,6 +25,14 @@ struct PrincipledGpu {
   int metallic_tex_w;
   int metallic_tex_h;
   int metallic_tex_channels;
+  float uv_transform[6];
+  float normal_strength;
+  float bump_strength;
+  float *bump_tex;
+  int bump_tex_w;
+  int bump_tex_h;
+  int bump_tex_channels;
+  int _pad_bump;
 };
 
 struct HitGroupData {

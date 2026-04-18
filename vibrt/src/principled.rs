@@ -47,6 +47,7 @@ pub fn make_material_data(
     let (n_ptr, n_w, n_h, n_c) = lookup(mat.normal_tex);
     let (r_ptr, r_w, r_h, r_c) = lookup(mat.roughness_tex);
     let (m_ptr, m_w, m_h, m_c) = lookup(mat.metallic_tex);
+    let (b_ptr, b_w, b_h, b_c) = lookup(mat.bump_tex);
 
     PrincipledGpu {
         base_color: mat.base_color,
@@ -71,5 +72,13 @@ pub fn make_material_data(
         metallic_tex_w: m_w,
         metallic_tex_h: m_h,
         metallic_tex_channels: m_c,
+        uv_transform: mat.uv_transform,
+        normal_strength: mat.normal_strength,
+        bump_strength: mat.bump_strength,
+        bump_tex: b_ptr,
+        bump_tex_w: b_w,
+        bump_tex_h: b_h,
+        bump_tex_channels: b_c,
+        _pad_bump: 0,
     }
 }
