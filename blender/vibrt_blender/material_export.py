@@ -255,20 +255,29 @@ def _resolve_shader(node, buf, textures, mat_name: str) -> dict:
 def _from_principled(node, buf, textures) -> dict:
     p = _default_params()
     bc = node.inputs["Base Color"]
-    p["base_color"] = _socket_rgb(bc)
     img = _socket_linked_image(bc)
     if img is not None:
+        # Linked socket: the link drives the colour, the default RGB is unused
+        # in Cycles. The renderer multiplies base_color × texture, so neutralise
+        # the factor to avoid tinting the texture.
         p["base_color_tex"] = export_image_texture(img, buf, textures, "srgb")
+        p["base_color"] = [1.0, 1.0, 1.0]
+    else:
+        p["base_color"] = _socket_rgb(bc)
 
-    p["metallic"] = _socket_f(node.inputs["Metallic"])
     img = _socket_linked_image(node.inputs["Metallic"])
     if img is not None:
         p["metallic_tex"] = export_image_texture(img, buf, textures, "linear")
+        p["metallic"] = 1.0
+    else:
+        p["metallic"] = _socket_f(node.inputs["Metallic"])
 
-    p["roughness"] = _socket_f(node.inputs["Roughness"])
     img = _socket_linked_image(node.inputs["Roughness"])
     if img is not None:
         p["roughness_tex"] = export_image_texture(img, buf, textures, "linear")
+        p["roughness"] = 1.0
+    else:
+        p["roughness"] = _socket_f(node.inputs["Roughness"])
 
     if "IOR" in node.inputs:
         p["ior"] = _socket_f(node.inputs["IOR"])
@@ -379,29 +388,34 @@ def _from_principled(node, buf, textures) -> dict:
 
 def _from_diffuse(node, buf, textures) -> dict:
     p = _default_params()
-    p["base_color"] = _socket_rgb(node.inputs["Color"])
     p["roughness"] = 1.0
     p["metallic"] = 0.0
     img = _socket_linked_image(node.inputs["Color"])
     if img is not None:
         p["base_color_tex"] = export_image_texture(img, buf, textures, "srgb")
+        p["base_color"] = [1.0, 1.0, 1.0]
+    else:
+        p["base_color"] = _socket_rgb(node.inputs["Color"])
     _apply_normal_perturbation(p, node.inputs.get("Normal"), buf, textures)
     return p
 
 
 def _from_glossy(node, buf, textures) -> dict:
     p = _default_params()
-    p["base_color"] = _socket_rgb(node.inputs["Color"])
     p["metallic"] = 1.0
-    if "Roughness" in node.inputs:
-        p["roughness"] = _socket_f(node.inputs["Roughness"])
     img = _socket_linked_image(node.inputs["Color"])
     if img is not None:
         p["base_color_tex"] = export_image_texture(img, buf, textures, "srgb")
+        p["base_color"] = [1.0, 1.0, 1.0]
+    else:
+        p["base_color"] = _socket_rgb(node.inputs["Color"])
     if "Roughness" in node.inputs:
         img = _socket_linked_image(node.inputs["Roughness"])
         if img is not None:
             p["roughness_tex"] = export_image_texture(img, buf, textures, "linear")
+            p["roughness"] = 1.0
+        else:
+            p["roughness"] = _socket_f(node.inputs["Roughness"])
     if "Anisotropy" in node.inputs:
         a = _socket_f(node.inputs["Anisotropy"])
         if a != 0.0:
@@ -416,38 +430,44 @@ def _from_glossy(node, buf, textures) -> dict:
 
 def _from_glass(node, buf, textures) -> dict:
     p = _default_params()
-    p["base_color"] = _socket_rgb(node.inputs["Color"])
     p["transmission"] = 1.0
-    if "Roughness" in node.inputs:
-        p["roughness"] = _socket_f(node.inputs["Roughness"])
     if "IOR" in node.inputs:
         p["ior"] = _socket_f(node.inputs["IOR"])
     img = _socket_linked_image(node.inputs["Color"])
     if img is not None:
         p["base_color_tex"] = export_image_texture(img, buf, textures, "srgb")
+        p["base_color"] = [1.0, 1.0, 1.0]
+    else:
+        p["base_color"] = _socket_rgb(node.inputs["Color"])
     if "Roughness" in node.inputs:
         img = _socket_linked_image(node.inputs["Roughness"])
         if img is not None:
             p["roughness_tex"] = export_image_texture(img, buf, textures, "linear")
+            p["roughness"] = 1.0
+        else:
+            p["roughness"] = _socket_f(node.inputs["Roughness"])
     return p
 
 
 def _from_refraction(node, buf, textures) -> dict:
     p = _default_params()
-    p["base_color"] = _socket_rgb(node.inputs["Color"])
     p["transmission"] = 1.0
     p["metallic"] = 0.0
-    if "Roughness" in node.inputs:
-        p["roughness"] = _socket_f(node.inputs["Roughness"])
     if "IOR" in node.inputs:
         p["ior"] = _socket_f(node.inputs["IOR"])
     img = _socket_linked_image(node.inputs["Color"])
     if img is not None:
         p["base_color_tex"] = export_image_texture(img, buf, textures, "srgb")
+        p["base_color"] = [1.0, 1.0, 1.0]
+    else:
+        p["base_color"] = _socket_rgb(node.inputs["Color"])
     if "Roughness" in node.inputs:
         img = _socket_linked_image(node.inputs["Roughness"])
         if img is not None:
             p["roughness_tex"] = export_image_texture(img, buf, textures, "linear")
+            p["roughness"] = 1.0
+        else:
+            p["roughness"] = _socket_f(node.inputs["Roughness"])
     return p
 
 
@@ -476,14 +496,16 @@ def _from_add(node, buf, textures, mat_name: str) -> dict:
 
 def _from_transparent(node, buf, textures) -> dict:
     p = _default_params()
-    p["base_color"] = _socket_rgb(node.inputs["Color"])
     p["transmission"] = 1.0
     p["ior"] = 1.0  # no refraction
     p["roughness"] = 0.0
     img = _socket_linked_image(node.inputs["Color"])
     if img is not None:
         p["base_color_tex"] = export_image_texture(img, buf, textures, "srgb")
+        p["base_color"] = [1.0, 1.0, 1.0]
         p["alpha_threshold"] = 0.5
+    else:
+        p["base_color"] = _socket_rgb(node.inputs["Color"])
     return p
 
 
