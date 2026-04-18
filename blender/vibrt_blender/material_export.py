@@ -130,13 +130,36 @@ def _socket_f(sock) -> float:
     return float(sock.default_value)
 
 
+# Procedural / data-driven leaves that have no TexImage behind them. Treated
+# as approximate constants when feeding the "other" side of a Mix bake — the
+# spatial detail they would add is lost, but the resulting tint usually still
+# matches the artist's intent better than dropping the whole chain.
+_PROCEDURAL_LEAF_DEFAULTS: dict[str, list[float]] = {
+    "ShaderNodeTexNoise": [0.5, 0.5, 0.5],
+    "ShaderNodeTexWave": [0.5, 0.5, 0.5],
+    "ShaderNodeTexMusgrave": [0.5, 0.5, 0.5],
+    "ShaderNodeTexVoronoi": [0.5, 0.5, 0.5],
+    "ShaderNodeTexMagic": [0.5, 0.5, 0.5],
+    "ShaderNodeTexChecker": [0.5, 0.5, 0.5],
+    "ShaderNodeTexGradient": [0.5, 0.5, 0.5],
+    "ShaderNodeTexSky": [0.5, 0.5, 0.5],
+    # Vertex / object data — neutral white so an Attribute used as a
+    # multiplicative tint collapses to identity.
+    "ShaderNodeAttribute": [1.0, 1.0, 1.0],
+    "ShaderNodeObjectInfo": [1.0, 1.0, 1.0],
+    "ShaderNodeParticleInfo": [1.0, 1.0, 1.0],
+    "ShaderNodeUVMap": [0.5, 0.5, 0.0],
+}
+
+
 def _socket_constant_rgb(sock) -> list[float] | None:
     """Return a constant RGB triple if the socket is effectively constant.
 
-    Accepts unlinked sockets (uses default_value) and sockets linked to a
-    `ShaderNodeRGB`. Returns None for any other linked source — signalling to
-    callers that the value depends on a runtime-computed chain and can't be
-    folded into a bake.
+    Accepts unlinked sockets (uses default_value), sockets linked to a
+    `ShaderNodeRGB`, `ShaderNodeBlackbody` (computed from Temperature), and
+    procedural / data-driven leaves listed in `_PROCEDURAL_LEAF_DEFAULTS`
+    (collapsed to a representative constant — spatial detail is lost).
+    Returns None for any other linked source.
     """
     if not sock.is_linked:
         return _socket_rgb(sock)
@@ -144,7 +167,43 @@ def _socket_constant_rgb(sock) -> list[float] | None:
     if src.bl_idname == "ShaderNodeRGB":
         v = src.outputs[0].default_value
         return [float(v[0]), float(v[1]), float(v[2])]
+    if src.bl_idname == "ShaderNodeBlackbody":
+        temp_sock = src.inputs.get("Temperature")
+        if temp_sock is None or temp_sock.is_linked:
+            return None
+        return _blackbody_to_linear_rgb(_socket_f(temp_sock))
+    if src.bl_idname in _PROCEDURAL_LEAF_DEFAULTS:
+        return list(_PROCEDURAL_LEAF_DEFAULTS[src.bl_idname])
     return None
+
+
+def _blackbody_to_linear_rgb(kelvin: float) -> list[float]:
+    """Tanner-Helland blackbody → sRGB approximation, then sRGB→linear.
+
+    Matches Blender's Blackbody node within a few percent in the 1000-12000K
+    range, which is enough for a baked constant going into a Mix or BSDF.
+    """
+    t = max(1000.0, min(40000.0, float(kelvin))) / 100.0
+    if t <= 66.0:
+        r = 255.0
+    else:
+        r = 329.698727446 * ((t - 60.0) ** -0.1332047592)
+    if t <= 66.0:
+        g = 99.4708025861 * math.log(t) - 161.1195681661
+    else:
+        g = 288.1221695283 * ((t - 60.0) ** -0.0755148492)
+    if t >= 66.0:
+        b = 255.0
+    elif t <= 19.0:
+        b = 0.0
+    else:
+        b = 138.5177312231 * math.log(t - 10.0) - 305.0447927307
+    rgb_srgb = [max(0.0, min(255.0, c)) / 255.0 for c in (r, g, b)]
+
+    def s2l(x):
+        return x / 12.92 if x <= 0.04045 else ((x + 0.055) / 1.055) ** 2.4
+
+    return [s2l(c) for c in rgb_srgb]
 
 
 _IDENTITY_UV = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
@@ -251,24 +310,49 @@ _PASSTHROUGH_INPUTS: dict[str, tuple[str, ...] | None] = {
 
 
 def _socket_linked_image(sock, depth: int = 0) -> bpy.types.Image | None:
-    """Return the image feeding a non-base-color socket.
+    """Return just the image feeding a non-base-color socket.
 
-    Sees through common colour-math / UV-transform / scalar-math intermediates
-    listed in `_PASSTHROUGH_INPUTS`. Chain transforms are *dropped* here
-    (scalar texture paths aren't baked), so we warn if any were detected so
-    the user knows the effect on roughness/metallic/normal is missing.
+    Kept as a thin wrapper for callers that don't bake the chain (currently
+    only the alpha-cutout path in `_from_principled`). Prefer
+    `_export_linked_scalar_texture` for roughness / metallic / bump inputs.
     """
-    img, chain = _socket_linked_image_with_chain(sock, depth)
-    if img is not None and chain:
-        _warn(
-            f"scalar-drop:{id(sock)}",
-            f"socket {sock.name!r}: colour transform(s) between TexImage and "
-            f"this input were dropped (scalar-path bake not implemented)",
-        )
+    img, _ = _socket_linked_image_with_chain(sock, depth)
     return img
 
 
-def _socket_linked_image_with_chain(sock, depth: int = 0):
+def _export_linked_scalar_texture(sock, buf, textures):
+    """Resolve a scalar input socket to a (linear) baked texture.
+
+    The chain transforms still apply per-channel; the GPU only reads the R
+    channel for scalar inputs (roughness/metallic/bump), so baking RGB is
+    fine — R after the bake is what the GPU will sample. Returns texture id
+    or None.
+    """
+    img, chain = _socket_linked_image_with_chain(sock)
+    if img is None:
+        return None
+    return export_image_texture(img, buf, textures, "linear", chain=chain)
+
+
+_CONSTANT_LEAF_NODES = frozenset((
+    # No texture lives behind these; `_socket_constant_rgb` folds them into
+    # bakeable Mix operands (with an approximate constant for procedurals),
+    # so chain traversal can stop here without warning.
+    "ShaderNodeRGB",
+    "ShaderNodeBlackbody",
+    "ShaderNodeWavelength",
+    "ShaderNodeValue",
+    *list(_PROCEDURAL_LEAF_DEFAULTS),
+))
+
+
+# Stack of ShaderNodeGroup nodes currently being resolved by _from_group.
+# Lets chain traversal jump back out through NodeGroupInput → parent socket
+# without threading the stack through every BSDF helper.
+_GROUP_STACK: list = []
+
+
+def _socket_linked_image_with_chain(sock, depth: int = 0, group_stack=None):
     """Return (image, transforms_chain) feeding a color socket.
 
     `transforms_chain` is a tuple of (id_tuple, apply_fn) pairs that should be
@@ -276,16 +360,25 @@ def _socket_linked_image_with_chain(sock, depth: int = 0):
     reproduce the effect of colour-modifying nodes between the texture and
     `sock`. Nodes whose effect can't be baked are passed through with a
     warning via `_warn`.
+
+    `group_stack` tracks nested ShaderNodeGroup traversals so a chain that
+    enters a NodeGroupInput can follow back out to the corresponding socket on
+    the parent group node. Defaults to the live `_GROUP_STACK` so BSDF helpers
+    don't need to thread it through.
     """
+    if group_stack is None:
+        group_stack = tuple(_GROUP_STACK)
     if not sock.is_linked:
         return None, ()
-    if depth > 6:
+    if depth > 12:
         _warn(
             f"depth:{id(sock)}",
-            f"socket {sock.name!r}: chain deeper than 6 nodes — giving up",
+            f"socket {sock.name!r}: chain deeper than 12 nodes — giving up",
         )
         return None, ()
-    src = sock.links[0].from_node
+    link = sock.links[0]
+    src = link.from_node
+    from_socket = link.from_socket
     if src.bl_idname == "ShaderNodeTexImage":
         if src.image is None:
             _warn(
@@ -294,6 +387,14 @@ def _socket_linked_image_with_chain(sock, depth: int = 0):
             )
             return None, ()
         return src.image, ()
+    if src.bl_idname in _CONSTANT_LEAF_NODES:
+        # Constant-colour source — there's no texture behind it. Caller's bake
+        # path (e.g. Mix) handles the constant via _socket_constant_rgb.
+        return None, ()
+    if src.bl_idname == "ShaderNodeGroup":
+        return _follow_into_group(src, from_socket, depth, group_stack)
+    if src.bl_idname == "NodeGroupInput":
+        return _follow_out_of_group(from_socket, depth, group_stack)
     candidates = _chain_candidates(src)
     if candidates is None:
         _warn(
@@ -305,13 +406,61 @@ def _socket_linked_image_with_chain(sock, depth: int = 0):
     for name, inp in candidates:
         if not inp.is_linked:
             continue
-        img, sub_chain = _socket_linked_image_with_chain(inp, depth + 1)
+        img, sub_chain = _socket_linked_image_with_chain(inp, depth + 1, group_stack)
         if img is None:
             continue
         xform = _node_color_transform(src, chain_input_name=name)
         # Inner (closer to texture) first, then outer.
         chain = sub_chain + ((xform,) if xform is not None else ())
         return img, chain
+    return None, ()
+
+
+def _follow_into_group(group_node, output_sock, depth, group_stack):
+    """Enter a ShaderNodeGroup: find the NodeGroupOutput input matching the
+    socket whose value the chain wants, then keep following backwards.
+    """
+    tree = group_node.node_tree
+    if tree is None:
+        return None, ()
+    group_output = next(
+        (n for n in tree.nodes if n.bl_idname == "NodeGroupOutput"), None
+    )
+    if group_output is None:
+        return None, ()
+    inner = None
+    for inp in group_output.inputs:
+        if inp.name == output_sock.name and (inp.type == output_sock.type
+                                              or inp.type in ("RGBA", "VALUE")):
+            inner = inp
+            break
+    if inner is None:
+        return None, ()
+    return _socket_linked_image_with_chain(
+        inner, depth + 1, group_stack + (group_node,)
+    )
+
+
+def _follow_out_of_group(output_sock, depth, group_stack):
+    """Exit a ShaderNodeGroup via NodeGroupInput: look up the matching socket
+    on the most recent parent group node and continue the chain there.
+    """
+    if not group_stack:
+        _warn(
+            f"groupin-orphan:{output_sock.name}",
+            f"NodeGroupInput.{output_sock.name!r} encountered without an "
+            f"outer group context — chain stopped",
+        )
+        return None, ()
+    parent = group_stack[-1]
+    external = parent.inputs.get(output_sock.name)
+    if external is None:
+        return None, ()
+    if external.is_linked:
+        return _socket_linked_image_with_chain(external, depth + 1, group_stack[:-1])
+    # Unlinked: the group's external default could still be a baked-in colour,
+    # but there's no texture chain to walk. Returning None lets the caller
+    # fall back to its own constant handling (`_socket_constant_rgb`).
     return None, ()
 
 
@@ -722,26 +871,27 @@ def _mix_transform(node, chain_input_name):
 
 
 def _normal_perturbation(normal_sock):
-    """Inspect a Normal input socket and return (normal_img, strength,
-    bump_img, bump_strength).
+    """Inspect a Normal input socket and return (normal_sock_or_None,
+    n_strength, bump_sock_or_None, b_strength).
 
-    Any can be None. Tangent-space normal maps go through ShaderNodeNormalMap;
-    heightmaps come through ShaderNodeBump's Height input.
+    The returned sockets are the upstream Color/Height inputs that ultimately
+    feed the perturbation; callers run them through the chain machinery to
+    bake any colour transforms into the resulting linear texture.
     """
     if normal_sock is None or not normal_sock.is_linked:
         return None, 1.0, None, 1.0
     src = normal_sock.links[0].from_node
     if src.bl_idname == "ShaderNodeNormalMap":
-        img = _socket_linked_image(src.inputs["Color"])
         strength = _socket_f(src.inputs["Strength"]) if "Strength" in src.inputs else 1.0
-        return img, strength, None, 1.0
+        return src.inputs["Color"], strength, None, 1.0
     if src.bl_idname == "ShaderNodeBump":
-        h_img = _socket_linked_image(src.inputs["Height"])
         strength = _socket_f(src.inputs["Strength"]) if "Strength" in src.inputs else 1.0
         distance = _socket_f(src.inputs["Distance"]) if "Distance" in src.inputs else 1.0
-        return None, 1.0, h_img, strength * distance
+        return None, 1.0, src.inputs["Height"], strength * distance
     if src.bl_idname == "ShaderNodeTexImage" and src.image is not None:
-        return src.image, 1.0, None, 1.0
+        # Direct TexImage on Normal input: synthesise a fake socket-like by
+        # wrapping the node's output back into normal_sock itself.
+        return normal_sock, 1.0, None, 1.0
     _warn(
         f"normal-src:{src.bl_idname}",
         f"Normal input driven by {_node_tag(src)} — not handled (expected "
@@ -751,21 +901,28 @@ def _normal_perturbation(normal_sock):
 
 
 def _normal_map_image(normal_sock) -> bpy.types.Image | None:
-    img, _, _, _ = _normal_perturbation(normal_sock)
-    return img
+    n_sock, _, b_sock, _ = _normal_perturbation(normal_sock)
+    src = n_sock if n_sock is not None else b_sock
+    if src is None:
+        return None
+    return _socket_linked_image(src)
 
 
 def _apply_normal_perturbation(params: dict, normal_sock, buf, textures) -> None:
     """Resolve the Normal input and assign normal_tex / bump_tex + strengths."""
-    n_img, n_strength, b_img, b_strength = _normal_perturbation(normal_sock)
-    if n_img is not None:
-        params["normal_tex"] = export_image_texture(n_img, buf, textures, "linear")
-        if n_strength != 1.0:
-            params["normal_strength"] = n_strength
-    if b_img is not None:
-        params["bump_tex"] = export_image_texture(b_img, buf, textures, "linear")
-        if b_strength != 1.0:
-            params["bump_strength"] = b_strength
+    n_sock, n_strength, b_sock, b_strength = _normal_perturbation(normal_sock)
+    if n_sock is not None:
+        tex = _export_linked_scalar_texture(n_sock, buf, textures)
+        if tex is not None:
+            params["normal_tex"] = tex
+            if n_strength != 1.0:
+                params["normal_strength"] = n_strength
+    if b_sock is not None:
+        tex = _export_linked_scalar_texture(b_sock, buf, textures)
+        if tex is not None:
+            params["bump_tex"] = tex
+            if b_strength != 1.0:
+                params["bump_strength"] = b_strength
 
 
 def _default_params() -> dict:
@@ -824,16 +981,16 @@ def _from_principled(node, buf, textures) -> dict:
     else:
         p["base_color"] = _socket_rgb(bc)
 
-    img = _socket_linked_image(node.inputs["Metallic"])
-    if img is not None:
-        p["metallic_tex"] = export_image_texture(img, buf, textures, "linear")
+    tex = _export_linked_scalar_texture(node.inputs["Metallic"], buf, textures)
+    if tex is not None:
+        p["metallic_tex"] = tex
         p["metallic"] = 1.0
     else:
         p["metallic"] = _socket_f(node.inputs["Metallic"])
 
-    img = _socket_linked_image(node.inputs["Roughness"])
-    if img is not None:
-        p["roughness_tex"] = export_image_texture(img, buf, textures, "linear")
+    tex = _export_linked_scalar_texture(node.inputs["Roughness"], buf, textures)
+    if tex is not None:
+        p["roughness_tex"] = tex
         p["roughness"] = 1.0
     else:
         p["roughness"] = _socket_f(node.inputs["Roughness"])
@@ -969,9 +1126,9 @@ def _from_glossy(node, buf, textures) -> dict:
     else:
         p["base_color"] = _socket_rgb(node.inputs["Color"])
     if "Roughness" in node.inputs:
-        img = _socket_linked_image(node.inputs["Roughness"])
-        if img is not None:
-            p["roughness_tex"] = export_image_texture(img, buf, textures, "linear")
+        tex = _export_linked_scalar_texture(node.inputs["Roughness"], buf, textures)
+        if tex is not None:
+            p["roughness_tex"] = tex
             p["roughness"] = 1.0
         else:
             p["roughness"] = _socket_f(node.inputs["Roughness"])
@@ -999,9 +1156,9 @@ def _from_glass(node, buf, textures) -> dict:
     else:
         p["base_color"] = _socket_rgb(node.inputs["Color"])
     if "Roughness" in node.inputs:
-        img = _socket_linked_image(node.inputs["Roughness"])
-        if img is not None:
-            p["roughness_tex"] = export_image_texture(img, buf, textures, "linear")
+        tex = _export_linked_scalar_texture(node.inputs["Roughness"], buf, textures)
+        if tex is not None:
+            p["roughness_tex"] = tex
             p["roughness"] = 1.0
         else:
             p["roughness"] = _socket_f(node.inputs["Roughness"])
@@ -1021,9 +1178,9 @@ def _from_refraction(node, buf, textures) -> dict:
     else:
         p["base_color"] = _socket_rgb(node.inputs["Color"])
     if "Roughness" in node.inputs:
-        img = _socket_linked_image(node.inputs["Roughness"])
-        if img is not None:
-            p["roughness_tex"] = export_image_texture(img, buf, textures, "linear")
+        tex = _export_linked_scalar_texture(node.inputs["Roughness"], buf, textures)
+        if tex is not None:
+            p["roughness_tex"] = tex
             p["roughness"] = 1.0
         else:
             p["roughness"] = _socket_f(node.inputs["Roughness"])
@@ -1135,7 +1292,13 @@ def _from_group(node, buf, textures, mat_name: str) -> dict:
     for sock in group_output.inputs:
         if sock.is_linked:
             inner = sock.links[0].from_node
-            return _resolve_shader(inner, buf, textures, mat_name)
+            # Push so chain traversal inside the inner BSDF can follow
+            # NodeGroupInput → external socket on this group node.
+            _GROUP_STACK.append(node)
+            try:
+                return _resolve_shader(inner, buf, textures, mat_name)
+            finally:
+                _GROUP_STACK.pop()
     _warn(
         f"group-nolink:{tree.name}",
         f"group {tree.name!r} output has no linked input",
