@@ -268,6 +268,69 @@ def _export_world(world, buf: bytearray, textures: list) -> dict:
     return {"type": "constant", "color": [0, 0, 0], "strength": 0.0}
 
 
+def _collect_attribute_means(depsgraph) -> dict:
+    """Mean colour per (material_name, attribute_name) across mesh objects.
+
+    Feeds `material_export.set_attribute_means`. ShaderNodeAttribute nodes
+    otherwise fold to neutral white, which breaks shaders (classroom
+    wallClock_darkWood) where the attribute is the dominant colour input to a
+    Mix. Using the mesh's actual mean keeps the baked colour close to what
+    Cycles would render.
+
+    Imprecise on meshes with multiple material slots — the mesh's overall
+    attribute mean is credited to every referenced material rather than split
+    per-slot. Good enough for this export path, where the typical use is a
+    single-material asset (the clock frame) with a darkening mask attribute.
+    """
+    import numpy as np
+    acc: dict = {}
+    seen_meshes: set = set()
+    for inst in depsgraph.object_instances:
+        obj = inst.object
+        obj_eval = obj if inst.is_instance else obj.evaluated_get(depsgraph)
+        if obj_eval.type != "MESH":
+            continue
+        me = obj_eval.data
+        if me is None:
+            continue
+        mesh_ptr = me.as_pointer()
+        if mesh_ptr in seen_meshes:
+            continue
+        seen_meshes.add(mesh_ptr)
+        col_attrs = getattr(me, "color_attributes", None)
+        if not col_attrs:
+            continue
+        mats_used = {s.material.name for s in obj_eval.material_slots if s.material}
+        if not mats_used:
+            continue
+        for ca in col_attrs:
+            n = len(ca.data)
+            if n == 0:
+                continue
+            buf = np.empty(n * 4, dtype=np.float32)
+            try:
+                ca.data.foreach_get("color", buf)
+            except Exception:
+                continue
+            rgb = buf.reshape(n, 4)[:, :3]
+            sum_rgb = rgb.sum(axis=0)
+            for mat_name in mats_used:
+                key = (mat_name, ca.name)
+                e = acc.get(key)
+                if e is None:
+                    acc[key] = [float(sum_rgb[0]), float(sum_rgb[1]), float(sum_rgb[2]), n]
+                else:
+                    e[0] += float(sum_rgb[0])
+                    e[1] += float(sum_rgb[1])
+                    e[2] += float(sum_rgb[2])
+                    e[3] += n
+    return {
+        key: [r / n, g / n, b / n]
+        for key, (r, g, b, n) in acc.items()
+        if n > 0
+    }
+
+
 def export_scene(
     depsgraph: bpy.types.Depsgraph,
     json_path: Path,
@@ -275,6 +338,7 @@ def export_scene(
 ):
     t0 = time.perf_counter()
     material_export.reset_stats()
+    material_export.set_attribute_means(_collect_attribute_means(depsgraph))
     mesh_s = 0.0
     slow_meshes: list[tuple] = []
     scene = depsgraph.scene_eval

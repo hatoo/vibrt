@@ -53,6 +53,19 @@ _PREMIX_CACHE: dict = {}
 _LINEAR_RGB_CACHE: dict = {}
 
 
+# Per-(material_name, attribute_name) mean RGB for vertex color attributes,
+# populated by the exporter before material export runs. Lets ShaderNodeAttribute
+# collapse to the mesh's actual mean colour rather than the neutral (1,1,1)
+# fallback — critical for attributes used as dominant colour (e.g. classroom
+# wallClock_darkWood frame, whose `Col` bakes near-black onto the rim).
+_ATTRIBUTE_MEANS: dict = {}
+
+
+def set_attribute_means(means: dict) -> None:
+    _ATTRIBUTE_MEANS.clear()
+    _ATTRIBUTE_MEANS.update(means)
+
+
 def reset_stats() -> None:
     _STATS["material_self_s"] = 0.0
     _STATS["texture_self_s"] = 0.0
@@ -382,6 +395,23 @@ _PROCEDURAL_LEAF_DEFAULTS: dict[str, list[float]] = {
 }
 
 
+def _leaf_constant_rgb(src) -> list[float]:
+    """Best-effort constant colour for a non-bakeable leaf node.
+
+    For ShaderNodeAttribute, prefer the mesh's precomputed mean of the named
+    vertex-colour attribute (see `_ATTRIBUTE_MEANS`) so attributes used as the
+    dominant colour side of a Mix don't collapse to white. Falls back to the
+    neutral default for unknown names or non-attribute leaves.
+    """
+    if src.bl_idname == "ShaderNodeAttribute":
+        attr_name = getattr(src, "attribute_name", "") or ""
+        if attr_name and _CURRENT_MATERIAL:
+            mean = _ATTRIBUTE_MEANS.get((_CURRENT_MATERIAL, attr_name))
+            if mean is not None:
+                return list(mean)
+    return list(_PROCEDURAL_LEAF_DEFAULTS[src.bl_idname])
+
+
 def _socket_constant_rgb(sock) -> list[float] | None:
     """Return a constant RGB triple if the socket is effectively constant.
 
@@ -409,7 +439,7 @@ def _resolve_constant_socket(sock, depth: int = 0):
             return None
         return _blackbody_to_linear_rgb(_socket_f(temp_sock))
     if src.bl_idname in _PROCEDURAL_LEAF_DEFAULTS:
-        return list(_PROCEDURAL_LEAF_DEFAULTS[src.bl_idname])
+        return _leaf_constant_rgb(src)
     if src.bl_idname == "ShaderNodeTexImage":
         # A real texture isn't a constant; callers handle textures separately.
         return None
@@ -529,7 +559,7 @@ def _resolve_constant_scalar(sock, depth: int = 0) -> float | None:
     # Colour-leaf used as a scalar: Blender would luminance-convert. Match the
     # socket's expected range by using the leaf's procedural default.
     if src.bl_idname in _PROCEDURAL_LEAF_DEFAULTS:
-        col = _PROCEDURAL_LEAF_DEFAULTS[src.bl_idname]
+        col = _leaf_constant_rgb(src)
         return 0.2126 * col[0] + 0.7152 * col[1] + 0.0722 * col[2]
     if src.bl_idname == "ShaderNodeMath":
         return _eval_math_constant(src, depth + 1)
