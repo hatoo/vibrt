@@ -5,3 +5,4 @@
 *.pbrt
 __pycache__/
 *.pyc
+blender/vibrt_blender.zip

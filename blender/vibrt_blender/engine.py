@@ -36,7 +36,10 @@ class VibrtRenderEngine(bpy.types.RenderEngine):
         work.mkdir(parents=True, exist_ok=True)
         json_path = work / "scene.json"
         bin_path = work / "scene.bin"
-        exr_path = work / "output.exr"
+        # Use `.raw` so we can bypass Blender's EXR loader, which emits
+        # multi-layer-channel warnings on single-layer files and can return
+        # empty pixel buffers.
+        exr_path = work / "output.raw"
 
         self.update_stats("vibrt-blender", "Exporting scene...")
         try:
@@ -66,25 +69,47 @@ class VibrtRenderEngine(bpy.types.RenderEngine):
     # Fallback: this addon does not support viewport IPR (yet).
 
 
-def _load_exr_into_render_result(engine, exr_path: Path, width: int, height: int):
-    # Load via Blender's own EXR loader for fidelity.
+def _load_exr_into_render_result(engine, raw_path: Path, width: int, height: int):
+    """Read our `.raw` float RGBA file and copy pixels into the Combined pass."""
+    import struct
+
+    data = raw_path.read_bytes()
+    if len(data) < 16 or data[:4] != b"VBLT":
+        engine.report({"ERROR"}, f"invalid raw file header in {raw_path}")
+        return
+    file_w, file_h, ch = struct.unpack("<III", data[4:16])
+    if ch != 4 or file_w != width or file_h != height:
+        engine.report(
+            {"ERROR"},
+            f"raw file dims mismatch (file {file_w}x{file_h}x{ch}, expected {width}x{height}x4)",
+        )
+        return
+    expected = width * height * 4
+    pixels = struct.unpack(f"<{expected}f", data[16:16 + expected * 4])
+
     result = engine.begin_result(0, 0, width, height)
-    layer = result.layers[0].passes.find_by_name("Combined")
-    if layer is None:
+    render_layer = result.layers[0]
+    # Blender 5.x requires a `view` argument; fall back to scanning for older API.
+    combined = None
+    try:
+        combined = render_layer.passes.find_by_name("Combined", "")
+    except TypeError:
+        combined = render_layer.passes.find_by_name("Combined")
+    if combined is None:
+        for p in render_layer.passes:
+            if p.name == "Combined":
+                combined = p
+                break
+    if combined is None:
         engine.end_result(result)
         engine.report({"ERROR"}, "Combined pass not found in render result")
         return
-    # Use Blender's image load to get pixel data.
-    img = bpy.data.images.load(str(exr_path), check_existing=False)
-    try:
-        pixels = list(img.pixels[:])
-        # Blender layer pass wants RGBA flat
-        layer.rect = [
-            (pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3])
-            for i in range(0, len(pixels), 4)
+    if hasattr(combined.rect, "foreach_set"):
+        combined.rect.foreach_set(pixels)
+    else:
+        combined.rect = [
+            tuple(pixels[i : i + 4]) for i in range(0, len(pixels), 4)
         ]
-    finally:
-        bpy.data.images.remove(img)
     engine.end_result(result)
 
 
