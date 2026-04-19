@@ -1703,6 +1703,188 @@ def _try_premix_two_textures(mix_node, group_stack):
     return result
 
 
+_GRAPH_MAX_NODES = 32
+
+_GRAPH_BLEND_MODES = frozenset((
+    "mix", "multiply", "add", "subtract", "screen", "divide", "difference",
+    "darken", "lighten", "overlay", "soft_light", "linear_light",
+))
+
+_GRAPH_MATH_OPS = frozenset((
+    "add", "subtract", "multiply", "divide", "power",
+    "multiply_add", "minimum", "maximum",
+))
+
+
+def _tex_node_uv_transform(tex_node) -> list[float]:
+    """Extract the UV affine feeding a TexImage.Vector. Returns identity when
+    the Vector is unlinked (TexImage falls back to the mesh's default UV)."""
+    vec_sock = tex_node.inputs.get("Vector")
+    if vec_sock is None or not vec_sock.is_linked:
+        return list(_IDENTITY_UV)
+    src = vec_sock.links[0].from_node
+    if src.bl_idname == "ShaderNodeMapping":
+        return _mapping_to_affine(src)
+    if src.bl_idname == "ShaderNodeTexCoord":
+        return list(_IDENTITY_UV)
+    # Anything else (procedurals, wrangler groups) loses the transform — the
+    # graph evaluator still works, just without its UV tweak.
+    return list(_IDENTITY_UV)
+
+
+def _try_emit_color_graph(sock, buf, textures, group_stack=None) -> dict | None:
+    """Walk the shader graph feeding `sock` and emit a `color_graph` dict that
+    the GPU evaluator can run per-pixel. Returns None if the graph uses a
+    node we can't yet translate (ShaderNodeValToRGB, ShaderNodeTexNoise, ...);
+    callers fall back to the existing bake path in that case.
+
+    Only handles a focused subset today — ImageTex, Mix, Invert, Math,
+    HueSat (treated as pass-through until HSV lands on the GPU), plus
+    constant-RGB leaves. classroom's paintedCeiling comes out as a 7-node
+    graph that mirrors the Cycles shader exactly except for the HSV
+    saturation bump.
+    """
+    if group_stack is None:
+        group_stack = tuple(_GROUP_STACK)
+    if not sock.is_linked:
+        # Just a constant colour — no graph needed, caller can use base_color.
+        return None
+    nodes: list[dict] = []
+    memo: dict = {}
+
+    def emit(emit_sock) -> int | None:
+        if len(nodes) >= _GRAPH_MAX_NODES:
+            return None
+        if not emit_sock.is_linked:
+            rgb = _socket_rgb(emit_sock)
+            idx = len(nodes)
+            nodes.append({"type": "const", "rgb": rgb})
+            return idx
+        link = emit_sock.links[0]
+        src = link.from_node
+        key = (src.as_pointer(), link.from_socket.name)
+        if key in memo:
+            return memo[key]
+
+        bl = src.bl_idname
+        if bl == "ShaderNodeTexImage":
+            if src.image is None:
+                return None
+            tex_id = export_image_texture(src.image, buf, textures, "srgb")
+            uv = _tex_node_uv_transform(src)
+            idx = len(nodes)
+            nodes.append({"type": "image_tex", "tex": tex_id, "uv": uv})
+            memo[key] = idx
+            return idx
+
+        if bl in ("ShaderNodeMix", "ShaderNodeMixRGB"):
+            fac_sock, a_sock, b_sock, blend, clamp, ok = _mix_node_params(src)
+            if not ok:
+                return None
+            blend_lc = blend.lower()
+            if blend_lc not in _GRAPH_BLEND_MODES:
+                return None
+            ai = emit(a_sock)
+            if ai is None:
+                return None
+            bi = emit(b_sock)
+            if bi is None:
+                return None
+            if fac_sock.is_linked:
+                fi = emit(fac_sock)
+                if fi is None:
+                    return None
+                fac_spec: float | dict = {"node": fi}
+            else:
+                fac_spec = _socket_f(fac_sock)
+            idx = len(nodes)
+            nodes.append({
+                "type": "mix", "a": ai, "b": bi,
+                "fac": fac_spec, "blend": blend_lc, "clamp": bool(clamp),
+            })
+            memo[key] = idx
+            return idx
+
+        if bl == "ShaderNodeInvert":
+            fac_sock = src.inputs.get("Fac")
+            col_sock = src.inputs.get("Color")
+            if col_sock is None:
+                return None
+            if fac_sock is not None and fac_sock.is_linked:
+                return None  # textured Fac on Invert not supported yet
+            fac = _socket_f(fac_sock) if fac_sock is not None else 1.0
+            ci = emit(col_sock)
+            if ci is None:
+                return None
+            idx = len(nodes)
+            nodes.append({"type": "invert", "input": ci, "fac": fac})
+            memo[key] = idx
+            return idx
+
+        if bl == "ShaderNodeMath":
+            op = getattr(src, "operation", "MULTIPLY").lower()
+            if op not in _GRAPH_MATH_OPS:
+                return None
+            use_clamp = bool(getattr(src, "use_clamp", False))
+            inputs = list(src.inputs)
+            chain_idx = next(
+                (i for i, inp in enumerate(inputs) if inp.is_linked),
+                -1,
+            )
+            if chain_idx < 0:
+                return None
+            ci = emit(inputs[chain_idx])
+            if ci is None:
+                return None
+            # Non-chain inputs must fold to constants.
+            others: list[float] = []
+            for i, inp in enumerate(inputs):
+                if i == chain_idx:
+                    continue
+                if inp.is_linked:
+                    v = _resolve_constant_scalar(inp)
+                    if v is None:
+                        return None
+                else:
+                    v = _socket_f(inp)
+                others.append(v)
+            b = others[0] if others else 0.0
+            c = others[1] if len(others) > 1 else 0.0
+            # Non-commutative ops reading chain from input 1 flip operands.
+            if chain_idx == 1 and op in ("subtract", "divide", "power"):
+                # Emit as: b - chain / b / chain / b ** chain — fold via a
+                # Math-on-const plus an existing op. For now, bail out so
+                # these cases don't silently render wrong.
+                return None
+            idx = len(nodes)
+            nodes.append({
+                "type": "math", "input": ci, "op": op,
+                "b": b, "c": c, "clamp": use_clamp,
+            })
+            memo[key] = idx
+            return idx
+
+        if bl == "ShaderNodeHueSaturation":
+            # No HSV node on the GPU yet — pass the Color input through so
+            # the rest of the graph survives. Saturation tweaks are lost.
+            col_sock = src.inputs.get("Color")
+            if col_sock is None:
+                return None
+            result = emit(col_sock)
+            if result is not None:
+                memo[key] = result
+            return result
+
+        # Anything else (ColorRamp, Noise, RGBCurve, Gamma, BrightContrast,
+        # NodeGroup, ...) — bail out so the caller falls back to baking.
+        return None
+
+    out_idx = emit(sock)
+    if out_idx is None or not nodes:
+        return None
+    return {"nodes": nodes, "output": out_idx}
+
+
 def _normal_perturbation(normal_sock):
     """Inspect a Normal input socket and return (normal_sock_or_None,
     n_strength, bump_sock_or_None, b_strength).
@@ -1804,22 +1986,27 @@ def _resolve_shader(node, buf, textures, mat_name: str) -> dict:
 def _from_principled(node, buf, textures) -> dict:
     p = _default_params()
     bc = node.inputs["Base Color"]
-    img, chain = _socket_linked_image_with_chain(bc)
-    if img is not None:
-        # Linked socket: the link drives the colour, the default RGB is unused
-        # in Cycles. The renderer multiplies base_color × texture, so neutralise
-        # the factor to avoid tinting the texture.
-        p["base_color_tex"] = export_image_texture(img, buf, textures, "srgb", chain=chain)
+    graph = _try_emit_color_graph(bc, buf, textures) if bc.is_linked else None
+    if graph is not None:
+        p["color_graph"] = graph
         p["base_color"] = [1.0, 1.0, 1.0]
     else:
-        attr_info = _attribute_driven_color(bc)
-        if attr_info is not None:
-            attr_name, tint = attr_info
-            p["use_vertex_color"] = True
-            p["_vertex_color_attr"] = attr_name
-            p["base_color"] = tint
+        img, chain = _socket_linked_image_with_chain(bc)
+        if img is not None:
+            # Linked socket: the link drives the colour, the default RGB is unused
+            # in Cycles. The renderer multiplies base_color × texture, so neutralise
+            # the factor to avoid tinting the texture.
+            p["base_color_tex"] = export_image_texture(img, buf, textures, "srgb", chain=chain)
+            p["base_color"] = [1.0, 1.0, 1.0]
         else:
-            p["base_color"] = _socket_rgb(bc)
+            attr_info = _attribute_driven_color(bc)
+            if attr_info is not None:
+                attr_name, tint = attr_info
+                p["use_vertex_color"] = True
+                p["_vertex_color_attr"] = attr_name
+                p["base_color"] = tint
+            else:
+                p["base_color"] = _socket_rgb(bc)
 
     tex = _export_linked_scalar_texture(node.inputs["Metallic"], buf, textures)
     if tex is not None:
@@ -1947,19 +2134,24 @@ def _from_diffuse(node, buf, textures) -> dict:
     p["roughness"] = 1.0
     p["metallic"] = 0.0
     color_sock = node.inputs["Color"]
-    img, chain = _socket_linked_image_with_chain(color_sock)
-    if img is not None:
-        p["base_color_tex"] = export_image_texture(img, buf, textures, "srgb", chain=chain)
+    graph = _try_emit_color_graph(color_sock, buf, textures) if color_sock.is_linked else None
+    if graph is not None:
+        p["color_graph"] = graph
         p["base_color"] = [1.0, 1.0, 1.0]
     else:
-        attr_info = _attribute_driven_color(color_sock)
-        if attr_info is not None:
-            attr_name, tint = attr_info
-            p["use_vertex_color"] = True
-            p["_vertex_color_attr"] = attr_name
-            p["base_color"] = tint
+        img, chain = _socket_linked_image_with_chain(color_sock)
+        if img is not None:
+            p["base_color_tex"] = export_image_texture(img, buf, textures, "srgb", chain=chain)
+            p["base_color"] = [1.0, 1.0, 1.0]
         else:
-            p["base_color"] = _socket_rgb(color_sock)
+            attr_info = _attribute_driven_color(color_sock)
+            if attr_info is not None:
+                attr_name, tint = attr_info
+                p["use_vertex_color"] = True
+                p["_vertex_color_attr"] = attr_name
+                p["base_color"] = tint
+            else:
+                p["base_color"] = _socket_rgb(color_sock)
     _apply_normal_perturbation(p, node.inputs.get("Normal"), buf, textures)
     return p
 
