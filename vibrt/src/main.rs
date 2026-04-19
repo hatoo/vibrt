@@ -242,9 +242,18 @@ fn render(scene: &LoadedScene, output: &std::path::Path) -> Result<()> {
     let tex_slots = principled::upload_textures(&scene.textures, &stream, &mut _tex_buffers)?;
 
     // --- Upload materials ---
+    // Colour-graph buffers live for the lifetime of the render; stash them
+    // so their CudaSlice drops are deferred.
+    let mut _color_graph_buffers: Vec<CudaSlice<u32>> = Vec::new();
     let mut mat_device_ptrs: Vec<optix_sys::CUdeviceptr> = Vec::new();
     for mat in &scene.file.materials {
-        let gpu = principled::make_material_data(mat, &tex_slots);
+        let graph = match &mat.color_graph {
+            Some(g) => {
+                principled::upload_color_graph(g, &tex_slots, &stream, &mut _color_graph_buffers)?
+            }
+            None => principled::ColorGraphGpu::default(),
+        };
+        let gpu = principled::make_material_data(mat, &tex_slots, graph);
         mat_device_ptrs.push(alloc_and_copy(&stream, &gpu)?);
     }
 
