@@ -1137,7 +1137,110 @@ def _node_color_transform(node, chain_input_name=None):
         return _clamp_transform(node)
     if bl in ("ShaderNodeMix", "ShaderNodeMixRGB"):
         return _mix_transform(node, chain_input_name)
+    if bl == "ShaderNodeMath":
+        return _math_transform(node, chain_input_name)
     return None
+
+
+def _math_transform(node, chain_input_name=None):
+    """Bake a scalar Math node into an RGB transform when every non-chain
+    input folds to a constant.
+
+    Acts on the three `Value` sockets in order (socket names are all "Value",
+    so identify by `identifier` — Blender suffixes them "Value_001" etc.).
+    The chain feeds one socket with a colour; we convert the other inputs to
+    scalars and run the op per-channel so bumps / factors keep their
+    pre-chain scale (classroom's paintedCeiling multiplies the inverted
+    ceiling_AO by 0.8 — without this the factor saturates to 1 and the baked
+    texture darkens twice as much as Cycles).
+    """
+    import numpy as np
+    op = getattr(node, "operation", "ADD")
+    use_clamp = bool(getattr(node, "use_clamp", False))
+    inputs = list(node.inputs)
+    chain_idx = next(
+        (i for i, inp in enumerate(inputs) if inp.identifier == chain_input_name),
+        -1,
+    )
+    if chain_idx < 0:
+        chain_idx = next((i for i, inp in enumerate(inputs) if inp.is_linked), -1)
+    if chain_idx < 0:
+        return None
+    other_vals: list[float] = []
+    for i, inp in enumerate(inputs):
+        if i == chain_idx:
+            continue
+        v = _resolve_constant_scalar(inp) if inp.is_linked else _socket_f(inp)
+        if v is None:
+            _warn(
+                f"math-chain:{node.as_pointer()}:{op}",
+                f"{_node_tag(node)}: op={op} non-chain input {inp.name!r} not "
+                f"foldable to a constant — effect not baked",
+            )
+            return None
+        other_vals.append(v)
+
+    a_name = inputs[chain_idx].identifier  # stable key across Blender versions
+    id_tuple = (
+        "Math", op, use_clamp, a_name,
+        tuple(round(float(v), 6) for v in other_vals),
+    )
+
+    def _finish(out):
+        if use_clamp:
+            out = np.clip(out, 0.0, 1.0)
+        return out.astype(np.float32)
+
+    # Chain side is always the "A" operand in the op; the other constant(s)
+    # become "B" (and "C" for ternary ops). Non-commutative ops split on
+    # chain_idx so SUBTRACT(chain=0) stays "chain - k" but SUBTRACT(chain=1)
+    # becomes "k - chain".
+    b = other_vals[0] if other_vals else 0.0
+    if op == "ADD":
+        def apply(rgb):
+            return _finish(rgb + b)
+    elif op == "SUBTRACT":
+        if chain_idx == 0:
+            def apply(rgb):
+                return _finish(rgb - b)
+        else:
+            def apply(rgb):
+                return _finish(b - rgb)
+    elif op == "MULTIPLY":
+        def apply(rgb):
+            return _finish(rgb * b)
+    elif op == "DIVIDE":
+        if chain_idx == 0:
+            def apply(rgb):
+                denom = b if abs(b) > 1e-12 else 1.0
+                return _finish(rgb / denom)
+        else:
+            def apply(rgb):
+                return _finish(np.where(rgb == 0.0, 0.0, b / np.where(rgb == 0.0, 1.0, rgb)))
+    elif op == "POWER":
+        if chain_idx == 0:
+            def apply(rgb):
+                return _finish(np.power(np.maximum(rgb, 0.0), b))
+        else:
+            def apply(rgb):
+                return _finish(np.power(max(b, 0.0), rgb))
+    elif op == "MULTIPLY_ADD" and len(other_vals) >= 2:
+        c = other_vals[1]
+        def apply(rgb):
+            return _finish(rgb * b + c)
+    elif op == "MINIMUM":
+        def apply(rgb):
+            return _finish(np.minimum(rgb, b))
+    elif op == "MAXIMUM":
+        def apply(rgb):
+            return _finish(np.maximum(rgb, b))
+    else:
+        _warn(
+            f"math-op:{op}",
+            f"{_node_tag(node)}: op={op!r} not baked — chain short-circuited",
+        )
+        return None
+    return id_tuple, apply
 
 
 def _rgbcurve_transform(node):
