@@ -92,5 +92,11 @@ pub fn make_material_data(
         sss_radius: mat.sss_radius,
         sss_anisotropy: mat.sss_anisotropy.clamp(-0.99, 0.99),
         use_vertex_color: if mat.use_vertex_color { 1 } else { 0 },
+        // ColorGraph plumbing: scene_loader fills these in a follow-up pass
+        // once the flat node buffer is allocated. Leave null here so
+        // materials without a graph produce a well-defined 0 pointer.
+        color_graph_nodes: 0,
+        color_graph_len: 0,
+        color_graph_output: 0,
     }
 }

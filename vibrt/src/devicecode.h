@@ -2,6 +2,19 @@
 
 #include <optix_types.h>
 
+/// Single node in a material's colour graph. Layout mirrors
+/// `gpu_types::ColorGraphNode` on the Rust side.
+struct ColorGraphNode {
+  unsigned int tag;
+  unsigned int payload[15];
+};
+
+#define COLOR_NODE_CONST 0u
+#define COLOR_NODE_IMAGE_TEX 1u
+#define COLOR_NODE_MIX 2u
+#define COLOR_NODE_INVERT 3u
+#define COLOR_NODE_MATH 4u
+
 struct PrincipledGpu {
   float base_color[3];
   float metallic;
@@ -45,6 +58,9 @@ struct PrincipledGpu {
   float sss_radius[3];
   float sss_anisotropy;
   int use_vertex_color;
+  ColorGraphNode *color_graph_nodes;
+  int color_graph_len;
+  int color_graph_output;
 };
 
 struct HitGroupData {

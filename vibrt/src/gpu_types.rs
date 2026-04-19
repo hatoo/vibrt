@@ -1,6 +1,39 @@
 //! GPU struct types shared between host and device.
 //! Layout must match `devicecode.h` exactly.
 
+/// Single node in a material's colour graph. The graph is a sequential
+/// list; each node reads from earlier nodes by index and writes one RGB
+/// value. The device-side evaluator allocates a small stack of `float3`
+/// slots (one per node) and runs through them in order.
+///
+/// Fields are type-punned into `payload[]` (u32 for indices / tags,
+/// bit-cast float for constants). Host side fills the packing; device
+/// side mirrors the layout via the same struct in `devicecode.h`.
+///
+/// Payload layout per tag (`payload[i]` as u32 unless noted):
+///   Const       [0..3] = rgb (float bitcast)
+///   ImageTex    [0] = tex_ptr_lo, [1] = tex_ptr_hi, [2] = w, [3] = h,
+///               [4] = channels, [5..11] = uv_transform (6 floats)
+///   Mix         [0] = in_a, [1] = in_b, [2] = blend_type, [3] = fac_src
+///               (0=const, 1=node), [4] = fac_node, [5] = clamp (0/1),
+///               [6] = fac_const (float)
+///   Invert      [0] = in, [1] = fac (float)
+///   Math        [0] = in, [1] = op, [2] = clamp (0/1),
+///               [3] = b_const (float), [4] = c_const (float)
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct ColorGraphNode {
+    pub tag: u32,
+    pub payload: [u32; 15],
+}
+
+// Must stay in sync with `devicecode.h` and `scene_loader.rs`.
+pub const COLOR_NODE_CONST: u32 = 0;
+pub const COLOR_NODE_IMAGE_TEX: u32 = 1;
+pub const COLOR_NODE_MIX: u32 = 2;
+pub const COLOR_NODE_INVERT: u32 = 3;
+pub const COLOR_NODE_MATH: u32 = 4;
+
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct PrincipledGpu {
@@ -48,6 +81,14 @@ pub struct PrincipledGpu {
     pub sss_anisotropy: f32,
     /// i32 used as bool — multiply base_color by interpolated vertex color.
     pub use_vertex_color: i32,
+    /// Optional colour graph replacing `base_color_tex`. Non-null pointer +
+    /// positive `color_graph_len` means "evaluate this graph to derive the
+    /// base colour and ignore `base_color_tex`".
+    pub color_graph_nodes: optix_sys::CUdeviceptr,
+    pub color_graph_len: i32,
+    /// Index into `color_graph_nodes` whose output is the final colour.
+    /// Defaults to `color_graph_len - 1`.
+    pub color_graph_output: i32,
 }
 
 #[repr(C)]
