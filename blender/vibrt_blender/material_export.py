@@ -2416,10 +2416,36 @@ def _from_mix(node, buf, textures, mat_name: str) -> dict:
         return out
 
     fac_sock = node.inputs[0]
-    fac = _socket_f(fac_sock) if not fac_sock.is_linked else 0.5
-    primary = p1 if fac < 0.5 else p2
-    other = p2 if fac < 0.5 else p1
+    # color_fac drives the base_color blend; rough_fac drives the roughness
+    # blend. For clearcoat-style Fresnel mixes the second branch is a specular
+    # overlay (visible only near grazing), so we keep the body colour from
+    # slot 1 but borrow some of the overlay's lower roughness so highlights
+    # stay sharp.
+    if fac_sock.is_linked:
+        src = fac_sock.links[0].from_node
+        src_sock = fac_sock.links[0].from_socket.name.lower()
+        if src.bl_idname == "ShaderNodeFresnel" or (
+            src.bl_idname == "ShaderNodeLayerWeight" and src_sock == "fresnel"
+        ):
+            color_fac = 0.0
+            rough_fac = 0.3
+        else:
+            color_fac = 0.5
+            rough_fac = 0.5
+    else:
+        color_fac = _socket_f(fac_sock)
+        rough_fac = color_fac
+
+    primary = p1 if color_fac < 0.5 else p2
+    other = p2 if color_fac < 0.5 else p1
     out = dict(primary)
+    if "base_color_tex" not in out and "color_graph" not in out:
+        bc1, bc2 = p1["base_color"], p2["base_color"]
+        out["base_color"] = [
+            bc1[i] * (1.0 - color_fac) + bc2[i] * color_fac for i in range(3)
+        ]
+    if "roughness_tex" not in out:
+        out["roughness"] = p1["roughness"] * (1.0 - rough_fac) + p2["roughness"] * rough_fac
     out["emission"] = [max(a, b) for a, b in zip(primary["emission"], other["emission"])]
     out["transmission"] = max(primary["transmission"], other["transmission"])
     return out
