@@ -913,16 +913,27 @@ static __device__ BsdfEval eval_bsdf(const MaterialEval &e, float3 wo,
   float F0_d =
       ((e.ior - 1.0f) / (e.ior + 1.0f)) * ((e.ior - 1.0f) / (e.ior + 1.0f));
 
-  // Weights for MIS between lobes
+  // Coat Fresnel parameters (used both for MIS weighting and the coat BRDF).
+  PrincipledGpu *mc = e.mat;
+  float coat_w_mat = mc->coat_weight;
+  float coat_alpha = fmaxf(mc->coat_roughness * mc->coat_roughness, 1e-4f);
+  float cF0 = ((mc->coat_ior - 1.0f) / (mc->coat_ior + 1.0f)) *
+              ((mc->coat_ior - 1.0f) / (mc->coat_ior + 1.0f));
+
+  // Weights for MIS between lobes. Coat gets `coat_weight·F_coat(V)` so its
+  // sampling budget follows the actual lobe intensity at this view angle —
+  // at grazing the coat dominates, at normal it contributes weakly.
   float w_diffuse = (1.0f - e.metallic) * (1.0f - e.transmission);
   float w_spec = e.metallic + (1.0f - e.metallic) * (1.0f - e.transmission);
   float w_trans = (1.0f - e.metallic) * e.transmission;
-  float w_sum = w_diffuse + w_spec + w_trans;
+  float w_coat = coat_w_mat * schlick_scalar(NoV, cF0);
+  float w_sum = w_diffuse + w_spec + w_trans + w_coat;
   if (w_sum <= 0.0f)
     return r;
   float p_diff = w_diffuse / w_sum;
   float p_spec = w_spec / w_sum;
   float p_trans = w_trans / w_sum;
+  float p_coat = w_coat / w_sum;
 
   // Subsurface (approximate): wraparound Lambert + radius-weighted tint.
   // Not a true random-walk SSS but captures the characteristic "wax / skin /
@@ -1001,25 +1012,25 @@ static __device__ BsdfEval eval_bsdf(const MaterialEval &e, float3 wo,
     r.pdf += p_spec * pdf_spec;
 
     // --- Coat (clearcoat): additive isotropic GGX dielectric above base. ---
-    PrincipledGpu *mc = e.mat;
-    float coat_w = mc->coat_weight;
-    if (coat_w > 0.0f) {
-      float coat_alpha = fmaxf(mc->coat_roughness * mc->coat_roughness, 1e-4f);
-      float cF0 =
-          ((mc->coat_ior - 1.0f) / (mc->coat_ior + 1.0f)) *
-          ((mc->coat_ior - 1.0f) / (mc->coat_ior + 1.0f));
+    if (coat_w_mat > 0.0f) {
       float Fc = schlick_scalar(VoH, cF0);
       float cD = ggx_D(NoH, coat_alpha);
       float cG = smith_G1(NoV, coat_alpha) * smith_G1(NoL, coat_alpha);
-      float coat_f = coat_w * Fc * cD * cG / fmaxf(4.0f * NoV * NoL, 1e-8f);
+      float coat_f = coat_w_mat * Fc * cD * cG / fmaxf(4.0f * NoV * NoL, 1e-8f);
       // Round-trip coat transmission attenuates base lobes: (1-F) on entry
-      // and on exit. Coat is not a sampling lobe, so its density stays out
-      // of r.pdf (adding it there would bias MIS without the sampler ever
-      // being able to produce a coat-distributed direction).
-      float T_view = 1.0f - coat_w * schlick_scalar(NoV, cF0);
-      float T_light = 1.0f - coat_w * schlick_scalar(NoL, cF0);
+      // and on exit.
+      float T_view = 1.0f - coat_w_mat * schlick_scalar(NoV, cF0);
+      float T_light = 1.0f - coat_w_mat * schlick_scalar(NoL, cF0);
       r.f = r.f * (T_view * T_light);
       r.f = r.f + make_float3(coat_f, coat_f, coat_f) * NoL;
+      // Isotropic GGX VNDF density for the coat-sampler. Narrow car-paint
+      // clearcoats (coat_roughness ≈ 0.1) are hard for the broad base-spec
+      // sampler to hit, so without this branch coat contributions arrive
+      // almost entirely through NEE and highlights from environment /
+      // indirect bounces fall several-× short of Cycles.
+      float pdf_coat = cD * smith_G1(NoV, coat_alpha) /
+                       fmaxf(4.0f * NoV, 1e-12f);
+      r.pdf += p_coat * pdf_coat;
     }
 
     // --- Sheen: soft grazing-angle lobe on top of diffuse. Symmetric in
@@ -1101,14 +1112,22 @@ static __device__ BsdfSample sample_bsdf(const MaterialEval &e, float3 wo,
   if (NoV <= 0.0f)
     return s;
 
+  // Coat weight mirrors eval_bsdf: scale by F_coat(V) so sampling budget
+  // follows the actual coat intensity at this view angle (grazing >> normal).
+  float coat_w_mat = e.mat->coat_weight;
+  float coat_alpha = fmaxf(e.mat->coat_roughness * e.mat->coat_roughness, 1e-4f);
+  float cF0 = ((e.mat->coat_ior - 1.0f) / (e.mat->coat_ior + 1.0f)) *
+              ((e.mat->coat_ior - 1.0f) / (e.mat->coat_ior + 1.0f));
   float w_diffuse = (1.0f - e.metallic) * (1.0f - e.transmission);
   float w_spec = e.metallic + (1.0f - e.metallic) * (1.0f - e.transmission);
   float w_trans = (1.0f - e.metallic) * e.transmission;
-  float total = w_diffuse + w_spec + w_trans;
+  float w_coat = coat_w_mat * schlick_scalar(NoV, cF0);
+  float total = w_diffuse + w_spec + w_trans + w_coat;
   if (total <= 0.0f)
     return s;
   float p_diff = w_diffuse / total;
   float p_spec = w_spec / total;
+  float p_trans = w_trans / total;
 
   float u = rng.next();
   float u1 = rng.next();
@@ -1137,7 +1156,7 @@ static __device__ BsdfSample sample_bsdf(const MaterialEval &e, float3 wo,
     // let trace_path add BSDF-sampled emission directly.
     if (e.alpha <= 0.02f * 0.02f)
       s.specular = true;
-  } else {
+  } else if (u < p_diff + p_spec + p_trans) {
     // Rough-dielectric transmission
     float eta = e.ior;
     float3 Vlocal = make_float3(dot3(wo, e.T), dot3(wo, e.B), dot3(wo, e.Ns));
@@ -1163,6 +1182,19 @@ static __device__ BsdfSample sample_bsdf(const MaterialEval &e, float3 wo,
         return s;
     }
     if (e.alpha <= 0.02f * 0.02f)
+      s.specular = true;
+  } else {
+    // Coat: isotropic GGX VNDF on coat_alpha. Always reflects, so no
+    // Fresnel reflect/transmit branch here.
+    float3 Vlocal = make_float3(dot3(wo, e.T), dot3(wo, e.B), dot3(wo, e.Ns));
+    float3 Hlocal = sample_ggx_vndf(Vlocal, coat_alpha, u1, u2);
+    float3 H = normalize3(e.T * Hlocal.x + e.B * Hlocal.y + e.Ns * Hlocal.z);
+    float VoH = dot3(wo, H);
+    float3 wi = normalize3(H * (2.0f * VoH) - wo);
+    if (dot3(e.Ns, wi) <= 0.0f)
+      return s;
+    s.wi = wi;
+    if (coat_alpha <= 0.02f * 0.02f)
       s.specular = true;
   }
 
@@ -1254,6 +1286,10 @@ static __device__ float3 direct_light(const MaterialEval &e, float3 P,
       if (d > 1e-4f) {
         float3 wi = ld / d;
         float cos_light = -dot3(make_f3(ar.normal), wi);
+        // Two-sided rects emit from both faces — take |cos_light| so
+        // surface points on either side of the panel see it.
+        if (ar.two_sided != 0u)
+          cos_light = fabsf(cos_light);
         if (cos_light > 0.0f && shadow_visible(P, wi, d)) {
           BsdfEval b = eval_bsdf(e, wo, wi);
           float area = ar.size_u * ar.size_v;
@@ -1460,14 +1496,26 @@ static __device__ int intersect_rect_lights(float3 origin, float3 dir,
   float t_best = t_max;
   for (int i = 0; i < params.num_rect_lights; i++) {
     AreaRectLight &ar = params.rect_lights[i];
+    // Hidden emitters don't occlude camera/specular rays — they only
+    // contribute via NEE. Skipping them here also prevents a hidden rect
+    // in front of a visible one from shadowing the latter.
+    if (ar.camera_visible == 0u)
+      continue;
     float3 normal = make_f3(ar.normal);
     float3 corner = make_f3(ar.corner);
     float3 u_axis = make_f3(ar.u_axis);
     float3 v_axis = make_f3(ar.v_axis);
     float denom = dot3(normal, dir);
     // Hit the emissive face when the ray is heading against the normal.
-    if (denom >= -1e-6f)
-      continue;
+    // Two-sided rects (emissive meshes) emit from both faces, so the
+    // sign of `denom` doesn't matter beyond being non-zero.
+    if (ar.two_sided == 0u) {
+      if (denom >= -1e-6f)
+        continue;
+    } else {
+      if (fabsf(denom) < 1e-6f)
+        continue;
+    }
     float t = dot3(corner - origin, normal) / denom;
     if (t <= t_min || t >= t_best)
       continue;
@@ -1514,8 +1562,10 @@ static __device__ float3 trace_path(float3 origin, float3 dir, RNG &rng) {
     float t_rect;
     int rect_idx = intersect_rect_lights(origin, dir, 1e-4f, t_geom, t_rect);
     if (rect_idx >= 0) {
-      // Hit an area light in front of any geometry. Add emission on primary
-      // rays and after specular bounces; NEE covers it for diffuse paths.
+      // Hit a camera-visible area light in front of any geometry. Hidden
+      // rects are pre-filtered by intersect_rect_lights and never reach
+      // here, so they don't occlude primary/specular rays. Add emission
+      // on primary rays and after specular bounces; NEE covers diffuse.
       if (bounce == 0 || last_specular) {
         float3 em =
             throughput * make_f3(params.rect_lights[rect_idx].emission);

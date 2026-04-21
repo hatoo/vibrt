@@ -8,16 +8,112 @@ column-major via mathutils, our JSON schema expects row-major 16-float arrays).
 from __future__ import annotations
 
 import json
+import math
 import time
 from pathlib import Path
 
 import bpy
+import mathutils
 
 from . import material_export
 
 
 def _matrix_to_row_major(m) -> list[float]:
     return [m[i][j] for i in range(4) for j in range(4)]
+
+
+def _try_emissive_quad_as_rect_light(obj, obj_eval, mat_params):
+    """If obj_eval is a single-quad mesh with pure-emissive material, return
+    an AreaRect light JSON dict. Otherwise None.
+
+    Pure emissive = emission > 0 with base_color ≈ 0, no transmission, no
+    textures/graphs tinting the lobes. vibrt only importance-samples light
+    objects; emissive-mesh surfaces are hit via BSDF sampling alone, so
+    small bright panels (BMW27's hood light, classroom blackboard lights)
+    under-contribute to indirect illumination. Converting them to
+    `area_rect` routes them through NEE, recovering the several-× drop in
+    ambient lift vs Cycles.
+
+    The returned dict's `camera_visible` field mirrors Blender's
+    Ray Visibility → Camera flag so that authored "invisible light panel"
+    meshes (BMW27's `Light`) still contribute via NEE but aren't drawn as
+    a bright rectangle in the final image.
+    """
+    if mat_params is None:
+        return None
+    emission = mat_params.get("emission", [0, 0, 0])
+    if not any(e > 1e-6 for e in emission):
+        return None
+    bc = mat_params.get("base_color", [0, 0, 0])
+    if max(bc) > 0.01:
+        return None
+    if mat_params.get("transmission", 0.0) > 0.0:
+        return None
+    for k in ("base_color_tex", "color_graph", "normal_tex", "roughness_tex",
+              "metallic_tex", "bump_tex"):
+        if k in mat_params:
+            return None
+
+    mesh = obj_eval.data
+    if len(mesh.polygons) != 1:
+        return None
+    poly = mesh.polygons[0]
+    if len(poly.vertices) != 4:
+        return None
+
+    verts = [mesh.vertices[vi].co.copy() for vi in poly.vertices]
+    # Treat the quad's edge[0]=v1-v0 and edge[3]=v3-v0 as the U/V axes.
+    # Assumes a reasonably rectangular quad — sheared/twisted ones fold to
+    # an approximate axis-aligned rect, which is fine for light sampling
+    # purposes (the emission and area are preserved).
+    u_edge = verts[1] - verts[0]
+    v_edge = verts[3] - verts[0]
+    if u_edge.length < 1e-6 or v_edge.length < 1e-6:
+        return None
+
+    mw = obj_eval.matrix_world
+    m3 = mw.to_3x3()
+    center_w = mw @ ((verts[0] + verts[1] + verts[2] + verts[3]) * 0.25)
+    u_edge_w = m3 @ u_edge
+    v_edge_w = m3 @ v_edge
+    size_u = u_edge_w.length
+    size_v = v_edge_w.length
+    if size_u < 1e-6 or size_v < 1e-6:
+        return None
+    u_axis_w = u_edge_w / size_u
+    v_axis_w = v_edge_w / size_v
+    # Cross product gives the face normal; consistent with Blender's poly
+    # winding for a single 4-vert face. No need for the inverse-transpose
+    # trick (that only matters for shading normals under non-uniform scale).
+    normal_w = u_axis_w.cross(v_axis_w).normalized()
+
+    # vibrt's area_rect transform: columns are (U, V, N) axes in world space
+    # with translation at rect centre. scene_loader.rs reconstructs the rect
+    # by transforming (±0.5·size_u, ±0.5·size_v, 0) corners.
+    transform = [
+        u_axis_w.x, v_axis_w.x, normal_w.x, center_w.x,
+        u_axis_w.y, v_axis_w.y, normal_w.y, center_w.y,
+        u_axis_w.z, v_axis_w.z, normal_w.z, center_w.z,
+        0.0, 0.0, 0.0, 1.0,
+    ]
+
+    # Pass emission through 1:1. scene_loader.rs computes
+    # stored_emission = color · power / (area · π); choosing power = area·π
+    # makes the coefficient 1 so the rect radiance equals the source
+    # material's emission radiance.
+    area = size_u * size_v
+    return {
+        "type": "area_rect",
+        "transform": transform,
+        "size": [size_u, size_v],
+        "color": list(emission),
+        "power": area * math.pi,
+        "camera_visible": 1 if getattr(obj, "visible_camera", True) else 0,
+        # Blender emissive meshes radiate from both faces by default; a
+        # one-sided rect here would black-out whichever face Blender's
+        # vertex winding happens to orient away from the scene.
+        "two_sided": 1,
+    }
 
 
 def _write_f32(buf: bytearray, xs) -> dict:
@@ -649,13 +745,6 @@ def export_scene(
         else:
             obj_eval = obj.evaluated_get(depsgraph)
 
-        # Skip meshes that Cycles hides from camera — they're light portals
-        # (e.g. classroom's `windows` dayLight_portal) meant to inject light
-        # but never appear as geometry on the rendered image. Without this
-        # check the emissive portal bleeds over the ceiling / walls.
-        if obj_eval.type == "MESH" and not getattr(obj, "visible_camera", True):
-            continue
-
         if obj_eval.type == "MESH":
             slot_mat_ids: list[int] = []
             vc_attr_name: str | None = None
@@ -666,6 +755,29 @@ def export_scene(
                         vc_attr_name = material_vc_attr.get(slot.material.name)
             if not slot_mat_ids:
                 slot_mat_ids = [resolve_material(None)]
+
+            # Promote single-quad pure-emissive meshes to area_rect lights
+            # so NEE can find them. Runs before the visible_camera skip
+            # because Blender scenes routinely use camera-hidden meshes as
+            # emissive panels (BMW27's `Light`) — without promotion their
+            # contribution is entirely lost. The rect honours the original
+            # visible_camera flag so hidden panels stay hidden from the
+            # final image.
+            if len(slot_mat_ids) == 1 and not inst.is_instance:
+                rect = _try_emissive_quad_as_rect_light(
+                    obj, obj_eval, materials[slot_mat_ids[0]]
+                )
+                if rect is not None:
+                    lights_json.append(rect)
+                    continue
+
+            # Skip meshes that Cycles hides from camera — they're light
+            # portals (e.g. classroom's `windows` dayLight_portal) meant
+            # to inject light but never appear as geometry on the
+            # rendered image. Without this check the emissive portal
+            # bleeds over the ceiling / walls.
+            if not getattr(obj, "visible_camera", True):
+                continue
 
             mkey = f"{obj_eval.data.name}#{obj_eval.name}#vc={vc_attr_name}"
             mesh_id = mesh_cache.get(mkey)

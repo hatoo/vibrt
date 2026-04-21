@@ -152,9 +152,15 @@ pub struct AreaRectLight {
     pub u_axis: [f32; 3],
     pub size_v: f32,
     pub v_axis: [f32; 3],
-    pub _pad0: f32,
+    /// 1 = emits from both faces (Blender emissive-mesh default), 0 = one
+    /// sided (Blender Area Light). Controls both NEE cos_light sign and
+    /// camera-ray intersection.
+    pub two_sided: u32,
     pub normal: [f32; 3],
-    pub _pad1: f32,
+    /// 0 = hidden from primary/specular camera rays (NEE still samples it),
+    /// 1 = visible. Mirrors Cycles' "Ray Visibility → Camera" flag for
+    /// emissive-mesh panels authored as invisible light sources.
+    pub camera_visible: u32,
     pub emission: [f32; 3],
     pub power: f32,
 }

@@ -108,9 +108,9 @@ struct AreaRectLight {
   float u_axis[3];
   float size_v;
   float v_axis[3];
-  float _pad0;
+  unsigned int two_sided;
   float normal[3];
-  float _pad1;
+  unsigned int camera_visible;
   float emission[3];
   float power;
 };

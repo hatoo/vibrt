@@ -190,6 +190,8 @@ pub fn load_scene(json_path: &Path) -> Result<LoadedScene> {
                 size,
                 color,
                 power,
+                camera_visible,
+                two_sided,
             } => {
                 let t = transform::from_4x4_row_major(&t4);
                 // Local rectangle lies in XY with +Z normal, centred at origin.
@@ -211,9 +213,9 @@ pub fn load_scene(json_path: &Path) -> Result<LoadedScene> {
                     u_axis,
                     size_v: size[1],
                     v_axis,
-                    _pad0: 0.0,
+                    two_sided,
                     normal,
-                    _pad1: 0.0,
+                    camera_visible,
                     emission,
                     power,
                 });

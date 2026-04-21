@@ -292,6 +292,9 @@ fn default_coat_roughness() -> f32 {
 fn default_coat_ior() -> f32 {
     1.5
 }
+fn default_camera_visible() -> u32 {
+    1
+}
 fn default_sheen_tint() -> [f32; 3] {
     [1.0, 1.0, 1.0]
 }
@@ -370,6 +373,17 @@ pub enum LightDesc {
         size: [f32; 2],
         color: [f32; 3],
         power: f32,
+        /// 0 = hidden from primary/specular camera rays (NEE still samples
+        /// it), 1 = visible. Defaults to visible to preserve the behaviour
+        /// of existing hand-authored scenes.
+        #[serde(default = "default_camera_visible")]
+        camera_visible: u32,
+        /// 1 = emissive-mesh style (radiates from both faces, matches
+        /// Blender's default for emissive meshes). 0 = Blender-Area style
+        /// (single-sided). Default stays 0 so existing scenes are
+        /// unchanged.
+        #[serde(default)]
+        two_sided: u32,
     },
 }
 
