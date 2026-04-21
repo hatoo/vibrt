@@ -828,10 +828,11 @@ static __device__ MaterialEval eval_material(const PathVertex &v) {
                                make_float2(uv.x, uv.y + dv)).x;
       float h_my = sample_rgba(m->bump_tex, bw, bh, m->bump_tex_channels,
                                make_float2(uv.x, uv.y - dv)).x;
-      // Central-difference slope × user strength. Empirical 0.25 keeps the
-      // bump in a "subtle micro-relief" range at Strength=1.
-      float sx = -(h_px - h_mx) * m->bump_strength * 0.25f;
-      float sy = -(h_py - h_my) * m->bump_strength * 0.25f;
+      // Central-difference slope × user strength. Linear in bump_strength
+      // so Strength=1 reproduces Blender's default amplitude and the user
+      // doesn't need to pre-scale for an empirical "subtle" factor.
+      float sx = -(h_px - h_mx) * m->bump_strength;
+      float sy = -(h_py - h_my) * m->bump_strength;
       nm_t = normalize3(make_float3(sx, sy, 1.0f));
       any_perturb = true;
     }
