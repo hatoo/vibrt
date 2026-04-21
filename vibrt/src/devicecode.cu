@@ -804,7 +804,9 @@ static __device__ MaterialEval eval_material(const PathVertex &v) {
     e.metallic = e.metallic * t.x;
   }
   e.metallic = fminf(fmaxf(e.metallic, 0.0f), 1.0f);
-  e.roughness = fmaxf(e.roughness, 0.02f);
+  // No separate roughness floor — the alpha clamp below is the sampler's
+  // numerical safeguard; forcing a minimum roughness on top of it would
+  // silently turn artist-authored mirrors into slightly-rough dielectrics.
   e.alpha = fmaxf(e.roughness * e.roughness, 1e-4f);
 
   float3 Ns = v.Ns;
