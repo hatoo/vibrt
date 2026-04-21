@@ -843,7 +843,7 @@ static __device__ MaterialEval eval_material(const PathVertex &v) {
     float s = m->normal_strength;
     float3 nn = make_float3((n.x * 2.0f - 1.0f) * s,
                             (n.y * 2.0f - 1.0f) * s,
-                            fmaxf(n.z * 2.0f - 1.0f, 0.01f));
+                             n.z * 2.0f - 1.0f);
     nn = normalize3(nn);
     // Compose: treat nm_t as frame, re-express nn in its tangent basis.
     if (any_perturb) {
