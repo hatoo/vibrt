@@ -467,6 +467,7 @@ def _export_world(world, buf: bytearray, textures: list) -> dict:
             )
         strength = strength_sock.default_value
         color_sock = src.inputs["Color"]
+        col = list(color_sock.default_value)[:3]
         if color_sock.is_linked:
             linked = color_sock.links[0].from_node
             if linked.bl_idname == "ShaderNodeTexEnvironment":
@@ -487,13 +488,15 @@ def _export_world(world, buf: bytearray, textures: list) -> dict:
                         "rotation_z_rad": rotation_z_rad,
                         "strength": float(strength),
                     }
+            elif linked.bl_idname == "ShaderNodeRGB":
+                # Constant colour picker — read its Color output.
+                col = list(linked.outputs["Color"].default_value)[:3]
             else:
                 print(
                     f"[vibrt] warn: world {world.name!r}: Background Color "
                     f"driven by {linked.bl_idname} (expected "
                     f"ShaderNodeTexEnvironment) — using constant default"
                 )
-        col = list(color_sock.default_value)[:3]
         return {"type": "constant", "color": col, "strength": float(strength)}
 
     print(
