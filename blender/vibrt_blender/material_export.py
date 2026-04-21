@@ -2416,17 +2416,20 @@ def _from_mix(node, buf, textures, mat_name: str) -> dict:
         return out
 
     fac_sock = node.inputs[0]
+    fresnel_driven = False
+    if fac_sock.is_linked:
+        src = fac_sock.links[0].from_node
+        src_sock = fac_sock.links[0].from_socket.name.lower()
+        fresnel_driven = src.bl_idname == "ShaderNodeFresnel" or (
+            src.bl_idname == "ShaderNodeLayerWeight" and src_sock == "fresnel"
+        )
     # color_fac drives the base_color blend; rough_fac drives the roughness
     # blend. For clearcoat-style Fresnel mixes the second branch is a specular
     # overlay (visible only near grazing), so we keep the body colour from
     # slot 1 but borrow some of the overlay's lower roughness so highlights
     # stay sharp.
     if fac_sock.is_linked:
-        src = fac_sock.links[0].from_node
-        src_sock = fac_sock.links[0].from_socket.name.lower()
-        if src.bl_idname == "ShaderNodeFresnel" or (
-            src.bl_idname == "ShaderNodeLayerWeight" and src_sock == "fresnel"
-        ):
+        if fresnel_driven:
             color_fac = 0.0
             rough_fac = 0.3
         else:
@@ -2435,6 +2438,22 @@ def _from_mix(node, buf, textures, mat_name: str) -> dict:
     else:
         color_fac = _socket_f(fac_sock)
         rough_fac = color_fac
+
+    # Car-paint pattern: Fresnel-mix(body Glossy, clearcoat Glossy) is a
+    # metallic base with a sharp dielectric overlay. Principled can express it
+    # via its coat layer (dielectric Fresnel GGX), but our sampler only has one
+    # spec lobe — at the ratio body_rough≈0.5, coat_rough≈0.1 the coat's narrow
+    # D spikes produce fireflies. Use a single metallic lobe and bias roughness
+    # heavily toward the clearcoat so grazing highlights stay tight. Schlick
+    # takes care of the Fresnel-to-white transition at grazing on its own.
+    if fresnel_driven and t1 in glossy_like and t2 in glossy_like:
+        out = dict(p1)
+        if "roughness_tex" not in out:
+            rough_fac = 0.7
+            out["roughness"] = (
+                p1["roughness"] * (1.0 - rough_fac) + p2["roughness"] * rough_fac
+            )
+        return out
 
     primary = p1 if color_fac < 0.5 else p2
     other = p2 if color_fac < 0.5 else p1
