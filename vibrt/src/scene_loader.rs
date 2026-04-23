@@ -269,38 +269,22 @@ fn slice_bin(bin: &[u8], blob: BlobRef) -> Result<&[u8]> {
 }
 
 fn read_f32_vec(bytes: &[u8]) -> Vec<f32> {
-    // On little-endian hosts (all of our supported targets) the on-disk f32
-    // byte layout matches native, so this collapses to a single memcpy
-    // instead of n iterations with four bounds-checked `bytes[i*4+k]` reads
-    // and a Vec::push per element. On a 1GB scene that was ~0.5s of pure
-    // scalar overhead.
-    #[cfg(not(target_endian = "little"))]
-    compile_error!("scene.bin is written little-endian; big-endian load is not supported");
-    let n = bytes.len() / 4;
-    let mut out: Vec<f32> = Vec::with_capacity(n);
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            bytes.as_ptr(),
-            out.as_mut_ptr() as *mut u8,
-            n * 4,
-        );
-        out.set_len(n);
-    }
-    out
+    // `chunks_exact(4)` is an ExactSizeIterator so `collect()` allocates once.
+    // On LE hosts `f32::from_le_bytes` is a direct reinterpret and LLVM lowers
+    // the whole pattern to a memcpy-shaped loop. The previous scalar form did
+    // four bounds-checked `bytes[i*4+k]` reads and a `Vec::push` per element,
+    // costing ~0.5s on a 1GB scene.
+    bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
 }
 
 fn read_u32_vec(bytes: &[u8]) -> Vec<u32> {
-    let n = bytes.len() / 4;
-    let mut out: Vec<u32> = Vec::with_capacity(n);
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            bytes.as_ptr(),
-            out.as_mut_ptr() as *mut u8,
-            n * 4,
-        );
-        out.set_len(n);
-    }
-    out
+    bytes
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
 }
 
 fn sample_heightmap(tex: &LoadedTexture, u: f32, v: f32) -> f32 {
@@ -426,22 +410,13 @@ fn load_texture(desc: &TextureDesc, bin: &[u8]) -> Result<LoadedTexture> {
     let pixel_count = (desc.width * desc.height) as usize;
 
     // Channels == 4 is the common path (the exporter always writes RGBA).
-    // Memcpy the bin bytes straight into the final Vec<f32> and, when the
+    // Decode the bin bytes into the final Vec<f32> in one pass and, when the
     // source is sRGB, apply the transfer curve in place. The previous loader
     // always did a second pass that copied raw → out just to emit [r, g, b,
     // a] unchanged, which at classroom scale was ~1GB of redundant memcpy.
     let data = match desc.channels {
         4 => {
-            let n = pixel_count * 4;
-            let mut data: Vec<f32> = Vec::with_capacity(n);
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    bytes.as_ptr(),
-                    data.as_mut_ptr() as *mut u8,
-                    n * 4,
-                );
-                data.set_len(n);
-            }
+            let mut data = read_f32_vec(bytes);
             if srgb {
                 for c in data.chunks_exact_mut(4) {
                     c[0] = srgb_to_linear(c[0]);
