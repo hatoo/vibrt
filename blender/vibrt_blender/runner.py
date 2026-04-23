@@ -29,9 +29,12 @@ def run_render(
     output_path: Path,
     report,
     is_break,
+    denoise: bool = False,
 ) -> int:
     """Run vibrt; return exit code. Pipes stderr lines to `report`."""
     cmd = [exe, str(scene_json), "--output", str(output_path)]
+    if denoise:
+        cmd.append("--denoise")
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,

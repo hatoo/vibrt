@@ -55,6 +55,7 @@ class VibrtRenderEngine(bpy.types.RenderEngine):
             exr_path,
             self.report,
             self.test_break,
+            denoise=bool(getattr(scene, "vibrt_denoise", False)),
         )
         if code != 0:
             self.report({"ERROR"}, f"vibrt exited with code {code}")
