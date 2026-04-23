@@ -269,29 +269,36 @@ fn slice_bin(bin: &[u8], blob: BlobRef) -> Result<&[u8]> {
 }
 
 fn read_f32_vec(bytes: &[u8]) -> Vec<f32> {
+    // On little-endian hosts (all of our supported targets) the on-disk f32
+    // byte layout matches native, so this collapses to a single memcpy
+    // instead of n iterations with four bounds-checked `bytes[i*4+k]` reads
+    // and a Vec::push per element. On a 1GB scene that was ~0.5s of pure
+    // scalar overhead.
+    #[cfg(not(target_endian = "little"))]
+    compile_error!("scene.bin is written little-endian; big-endian load is not supported");
     let n = bytes.len() / 4;
-    let mut out = Vec::with_capacity(n);
-    for i in 0..n {
-        out.push(f32::from_le_bytes([
-            bytes[i * 4],
-            bytes[i * 4 + 1],
-            bytes[i * 4 + 2],
-            bytes[i * 4 + 3],
-        ]));
+    let mut out: Vec<f32> = Vec::with_capacity(n);
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            bytes.as_ptr(),
+            out.as_mut_ptr() as *mut u8,
+            n * 4,
+        );
+        out.set_len(n);
     }
     out
 }
 
 fn read_u32_vec(bytes: &[u8]) -> Vec<u32> {
     let n = bytes.len() / 4;
-    let mut out = Vec::with_capacity(n);
-    for i in 0..n {
-        out.push(u32::from_le_bytes([
-            bytes[i * 4],
-            bytes[i * 4 + 1],
-            bytes[i * 4 + 2],
-            bytes[i * 4 + 3],
-        ]));
+    let mut out: Vec<u32> = Vec::with_capacity(n);
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            bytes.as_ptr(),
+            out.as_mut_ptr() as *mut u8,
+            n * 4,
+        );
+        out.set_len(n);
     }
     out
 }
@@ -402,12 +409,12 @@ fn load_mesh(desc: &MeshDesc, bin: &[u8]) -> Result<LoadedMesh> {
 
 fn load_texture(desc: &TextureDesc, bin: &[u8]) -> Result<LoadedTexture> {
     let bytes = slice_bin(bin, desc.pixels)?;
-    let raw = read_f32_vec(bytes);
     let expected = (desc.width * desc.height * desc.channels) as usize;
-    if raw.len() != expected {
+    let got_floats = bytes.len() / 4;
+    if got_floats != expected {
         return Err(anyhow!(
             "texture pixel count mismatch: got {}, expected {} (w={} h={} c={})",
-            raw.len(),
+            got_floats,
             expected,
             desc.width,
             desc.height,
@@ -416,23 +423,49 @@ fn load_texture(desc: &TextureDesc, bin: &[u8]) -> Result<LoadedTexture> {
     }
 
     let srgb = desc.colorspace.eq_ignore_ascii_case("srgb");
-    let mut out = Vec::with_capacity((desc.width * desc.height * 4) as usize);
-    match desc.channels {
+    let pixel_count = (desc.width * desc.height) as usize;
+
+    // Channels == 4 is the common path (the exporter always writes RGBA).
+    // Memcpy the bin bytes straight into the final Vec<f32> and, when the
+    // source is sRGB, apply the transfer curve in place. The previous loader
+    // always did a second pass that copied raw → out just to emit [r, g, b,
+    // a] unchanged, which at classroom scale was ~1GB of redundant memcpy.
+    let data = match desc.channels {
+        4 => {
+            let n = pixel_count * 4;
+            let mut data: Vec<f32> = Vec::with_capacity(n);
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    bytes.as_ptr(),
+                    data.as_mut_ptr() as *mut u8,
+                    n * 4,
+                );
+                data.set_len(n);
+            }
+            if srgb {
+                for c in data.chunks_exact_mut(4) {
+                    c[0] = srgb_to_linear(c[0]);
+                    c[1] = srgb_to_linear(c[1]);
+                    c[2] = srgb_to_linear(c[2]);
+                    // alpha passes through unchanged
+                }
+            }
+            data
+        }
         3 => {
+            // 3-channel sources still require RGBA expansion; no way to skip
+            // the second pass here. Blender images from the addon are always
+            // 4-channel, so this path is only hit by hand-written test
+            // scenes.
+            let raw = read_f32_vec(bytes);
+            let mut out = Vec::with_capacity(pixel_count * 4);
             for c in raw.chunks_exact(3) {
                 let r = if srgb { srgb_to_linear(c[0]) } else { c[0] };
                 let g = if srgb { srgb_to_linear(c[1]) } else { c[1] };
                 let b = if srgb { srgb_to_linear(c[2]) } else { c[2] };
                 out.extend_from_slice(&[r, g, b, 1.0]);
             }
-        }
-        4 => {
-            for c in raw.chunks_exact(4) {
-                let r = if srgb { srgb_to_linear(c[0]) } else { c[0] };
-                let g = if srgb { srgb_to_linear(c[1]) } else { c[1] };
-                let b = if srgb { srgb_to_linear(c[2]) } else { c[2] };
-                out.extend_from_slice(&[r, g, b, c[3]]);
-            }
+            out
         }
         _ => {
             return Err(anyhow!(
@@ -440,10 +473,10 @@ fn load_texture(desc: &TextureDesc, bin: &[u8]) -> Result<LoadedTexture> {
                 desc.channels
             ))
         }
-    }
+    };
 
     Ok(LoadedTexture {
-        data: out,
+        data,
         width: desc.width,
         height: desc.height,
     })

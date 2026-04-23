@@ -134,7 +134,9 @@ fn main() -> Result<()> {
         .input
         .as_ref()
         .context("input scene.json required (or use --compile-only)")?;
+    let t_load = std::time::Instant::now();
     let mut scene = scene_loader::load_scene(input)?;
+    println!("Scene load: {:.2?}", t_load.elapsed());
 
     if let Some(v) = args.spp {
         scene.file.render.spp = v;
