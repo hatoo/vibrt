@@ -146,6 +146,24 @@ pub struct PrincipledMaterial {
     pub sss_weight: f32,
     #[serde(default = "default_sss_radius")]
     pub sss_radius: [f32; 3],
+    /// When > 0, the surface is shaded with a Kajiya-Kay hair lobe instead
+    /// of the standard diffuse+specular path. Triggered by Cycles'
+    /// `ShaderNodeBsdfHair` and MixShader'd fractions of it.
+    #[serde(default)]
+    pub hair_weight: f32,
+    /// Radians. Tilt of the specular cone away from perpendicular to the
+    /// tangent — Cycles' "Offset" slider on Hair BSDF (angular shift of the
+    /// highlight along the strand).
+    #[serde(default)]
+    pub hair_offset: f32,
+    /// [0,1]. Along-strand spread of the specular highlight.
+    #[serde(default = "default_hair_roughness")]
+    pub hair_roughness_u: f32,
+    /// [0,1]. Across-strand spread. Currently folded into the same cone
+    /// width; kept separate so the exporter can faithfully record Cycles'
+    /// RoughnessV and we can split the lobe later without a schema break.
+    #[serde(default = "default_hair_roughness")]
+    pub hair_roughness_v: f32,
     /// When true, multiply base_color by the mesh's interpolated vertex
     /// color (MeshDesc::vertex_colors). Set by the Blender exporter when a
     /// material drives its base colour via a ShaderNodeAttribute.
@@ -294,6 +312,10 @@ fn default_sss_radius() -> [f32; 3] {
 
 fn default_coat_roughness() -> f32 {
     0.03
+}
+fn default_hair_roughness() -> f32 {
+    // Matches Cycles Hair BSDF's default 0.3 on Roughness U/V.
+    0.3
 }
 fn default_coat_ior() -> f32 {
     1.5

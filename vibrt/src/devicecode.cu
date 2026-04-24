@@ -903,6 +903,44 @@ struct BsdfEval {
   float pdf;
 };
 
+// Kajiya-Kay hair: simplified tangent-aligned specular + "sin(T,L)" diffuse.
+// Not energy-conservative by construction — it's a classic approximation. The
+// specular uses the tilt-shifted H direction so the highlight cones forward
+// along the strand (Offset slider on Cycles' Hair BSDF). Sampling is plain
+// cosine-weighted hemisphere; MIS picks up the slack.
+static __device__ BsdfEval eval_hair(const MaterialEval &e, float3 wo,
+                                     float3 wi) {
+  BsdfEval r;
+  r.f = make_float3(0, 0, 0);
+  r.pdf = 0.0f;
+  float NoL = dot3(e.Ns, wi);
+  if (NoL <= 0.0f)
+    return r;
+
+  // Diffuse: peaks when light is perpendicular to the strand.
+  float TdotL = dot3(wi, e.T);
+  float sin_TL = sqrtf(fmaxf(1.0f - TdotL * TdotL, 0.0f));
+
+  // Specular: tangent-aligned cone. sin(offset) tilts the cone along T so the
+  // highlight shifts toward the tip of the strand (matches Cycles' "Offset").
+  float3 H = wo + wi;
+  float Hlen = sqrtf(fmaxf(dot3(H, H), 1e-12f));
+  H = H * (1.0f / Hlen);
+  float TdotH = dot3(H, e.T);
+  float tilt = sinf(e.mat->hair_offset);
+  float TdotH_eff = TdotH - tilt;
+  float cone = sqrtf(fmaxf(1.0f - TdotH_eff * TdotH_eff, 0.0f));
+  float exponent = 2.0f / fmaxf(e.mat->hair_roughness_u *
+                                    e.mat->hair_roughness_u,
+                                1e-4f);
+  float spec = powf(fmaxf(cone, 0.0f), exponent);
+
+  r.f = (e.base_color * sin_TL + make_float3(spec, spec, spec))
+        * (INV_PIf * NoL);
+  r.pdf = NoL * INV_PIf;
+  return r;
+}
+
 static __device__ BsdfEval eval_bsdf(const MaterialEval &e, float3 wo,
                                      float3 wi) {
   BsdfEval r;
@@ -910,14 +948,17 @@ static __device__ BsdfEval eval_bsdf(const MaterialEval &e, float3 wo,
   r.pdf = 0.0f;
 
   float NoV = dot3(e.Ns, wo);
+  if (NoV <= 0.0f)
+    return r;
+  if (e.mat->hair_weight > 0.5f)
+    return eval_hair(e, wo, wi);
+
   float NoL = dot3(e.Ns, wi);
   bool reflect = NoL > 0.0f;
   bool transmit = !reflect && e.transmission > 0.0f;
   // SSS can also contribute diffusely when the light is slightly behind the
   // surface (wraparound lobe).
   bool sss_backlit = !reflect && e.mat->sss_weight > 0.0f && NoL > -1.0f;
-  if (NoV <= 0.0f)
-    return r;
 
   float F0_d =
       ((e.ior - 1.0f) / (e.ior + 1.0f)) * ((e.ior - 1.0f) / (e.ior + 1.0f));
@@ -1120,6 +1161,22 @@ static __device__ BsdfSample sample_bsdf(const MaterialEval &e, float3 wo,
   float NoV = dot3(e.Ns, wo);
   if (NoV <= 0.0f)
     return s;
+
+  // Hair: cosine-weighted sample around Ns. Not optimal for the tangent
+  // cone lobe, but MIS against NEE covers for it and stratification is cheap.
+  if (e.mat->hair_weight > 0.5f) {
+    float u1 = rng.next();
+    float u2 = rng.next();
+    float r = sqrtf(u1);
+    float phi = 2.0f * M_PIf * u2;
+    float3 local = make_float3(r * cosf(phi), r * sinf(phi),
+                               sqrtf(fmaxf(0.0f, 1.0f - u1)));
+    s.wi = normalize3(e.T * local.x + e.B * local.y + e.Ns * local.z);
+    BsdfEval ev = eval_hair(e, wo, s.wi);
+    s.f = ev.f;
+    s.pdf = ev.pdf;
+    return s;
+  }
 
   // Coat weight mirrors eval_bsdf: scale by F_coat(V) so sampling budget
   // follows the actual coat intensity at this view angle (grazing >> normal).

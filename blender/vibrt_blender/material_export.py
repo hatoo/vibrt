@@ -2400,6 +2400,8 @@ def _resolve_shader(node, writer, textures, mat_name: str) -> dict:
         # Sheen has no native slot in the simplified Principled; treat the
         # Color input as a rough diffuse so the surface isn't blacked out.
         return _from_diffuse(node, writer, textures)
+    if bl == "ShaderNodeBsdfHair":
+        return _from_hair(node, writer, textures)
     if bl == "ShaderNodeMixShader":
         return _from_mix(node, writer, textures, mat_name)
     if bl == "ShaderNodeBsdfGlass":
@@ -2631,6 +2633,44 @@ def _from_diffuse(node, writer, textures) -> dict:
         else:
             p["base_color"] = _socket_rgb(color_sock)
     _apply_normal_perturbation(p, node.inputs.get("Normal"), writer, textures)
+    return p
+
+
+def _from_hair(node, writer, textures) -> dict:
+    """Map Cycles' classic Hair BSDF (Kajiya-Kay) to Principled params.
+
+    Sets `hair_weight = 1.0` so the kernel takes the Kajiya-Kay eval/sample
+    branch instead of the standard diffuse+specular path. Color feeds
+    `base_color` (with texture support). Offset / RoughnessU / RoughnessV are
+    read as scalar constants; linked inputs fall back through
+    `_warn_linked_scalar` (exact fold or warn). Tangent is intentionally
+    ignored — the kernel uses the per-hit tangent frame built from Ns, which
+    doesn't follow the strand direction but gives a qualitatively hair-like
+    look on triangle-mesh "hair caps". Proper UV-based tangent is follow-up.
+    """
+    p = _default_params()
+    p["hair_weight"] = 1.0
+    color_sock = node.inputs["Color"]
+    img, chain = _socket_linked_image_with_chain(color_sock)
+    if img is not None:
+        p["base_color_tex"] = export_image_texture(
+            img, writer, textures, "srgb", chain=chain
+        )
+        p["base_color"] = [1.0, 1.0, 1.0]
+    elif color_sock.is_linked:
+        rgb = _socket_constant_rgb(color_sock)
+        if rgb is not None:
+            p["base_color"] = rgb
+        else:
+            p["base_color"] = _socket_rgb(color_sock)
+    else:
+        p["base_color"] = _socket_rgb(color_sock)
+    if "Offset" in node.inputs:
+        p["hair_offset"] = _warn_linked_scalar(node, "Offset")
+    if "RoughnessU" in node.inputs:
+        p["hair_roughness_u"] = _warn_linked_scalar(node, "RoughnessU")
+    if "RoughnessV" in node.inputs:
+        p["hair_roughness_v"] = _warn_linked_scalar(node, "RoughnessV")
     return p
 
 
