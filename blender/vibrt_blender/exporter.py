@@ -619,6 +619,12 @@ def _export_light(obj, writer, textures: list) -> dict | None:
             "size": size,
             "color": col,
             "power": energy,
+            # Cycles' Ray Visibility → Camera flag. Junk Shop authors area
+            # lights that are supposed to illuminate the scene but never
+            # appear as bright rectangles in the final frame (e.g. `Area.027`,
+            # a 9×10 m panel over the roof). Without this flag the default
+            # on the Rust side (camera_visible=1) draws them as geometry.
+            "camera_visible": 1 if getattr(obj, "visible_camera", True) else 0,
         }
     print(
         f"[vibrt] warn: light {obj.name!r}: type={light.type!r} not supported "
