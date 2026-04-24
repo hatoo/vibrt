@@ -406,20 +406,113 @@ def _socket_f(sock) -> float:
     return float(sock.default_value)
 
 
-def _warn_linked_scalar(node, input_name: str) -> None:
-    """Warn (deduped) that a scalar input is linked but will be read as a
-    constant default. Use at call sites that don't attempt to export a
-    texture for the input — so the user sees why their driver node is ignored.
+def _warn_linked_scalar(node, input_name: str) -> float:
+    """Return the effective constant value for a scalar input socket.
+
+    If the socket is unlinked, returns its default. If linked, tries an
+    *exact* fold (Value / Math / Clamp / scalar Mix / Invert of a constant) —
+    those chains compute a single deterministic number, so we honour them
+    silently. Lossy paths (texture means, procedural mean-colour
+    substitution) still warn, because the renderer's scalar slot can't
+    carry per-pixel variation and hiding that would silently drop the
+    effect.
     """
     sock = node.inputs.get(input_name)
-    if sock is None or not sock.is_linked:
-        return
+    if sock is None:
+        return 0.0
+    if not sock.is_linked:
+        return _socket_f(sock)
+    resolved = _resolve_exact_scalar(sock)
+    if resolved is not None:
+        return resolved
     src = sock.links[0].from_node
     _warn(
         f"linked-scalar:{node.as_pointer()}:{input_name}",
         f"{_node_tag(node)}: input {input_name!r} linked to {src.bl_idname} "
         f"but not baked — using constant default ({sock.default_value})",
     )
+    return _socket_f(sock)
+
+
+def _resolve_exact_scalar(sock, depth: int = 0) -> float | None:
+    """Strict scalar fold: refuses texture means / procedural mean-colour
+    approximations so callers can distinguish a real constant from a guess.
+
+    Handles ShaderNodeValue, Math (via `_eval_math_constant`), Clamp,
+    scalar Mix, and Invert — all evaluating to a single deterministic float.
+    Anything else (TexImage, Attribute, Fresnel, ...) returns None.
+    """
+    if depth > 8:
+        return None
+    if not sock.is_linked:
+        dv = getattr(sock, "default_value", None)
+        if dv is None:
+            return None
+        try:
+            return float(dv)
+        except TypeError:
+            # RGBA socket default — collapse to sRGB luminance so Invert on
+            # an unlinked Color default still folds.
+            try:
+                return (0.2126 * float(dv[0]) + 0.7152 * float(dv[1])
+                        + 0.0722 * float(dv[2]))
+            except (TypeError, IndexError):
+                return None
+    link = sock.links[0]
+    src = link.from_node
+    bl = src.bl_idname
+    if bl == "ShaderNodeValue":
+        return float(src.outputs[0].default_value)
+    if bl == "ShaderNodeMath":
+        return _eval_math_constant(src, depth + 1)
+    if bl == "ShaderNodeClamp":
+        v = _resolve_exact_scalar(src.inputs["Value"], depth + 1)
+        if v is None:
+            return None
+        mn = _resolve_exact_scalar(src.inputs["Min"], depth + 1)
+        mx = _resolve_exact_scalar(src.inputs["Max"], depth + 1)
+        if mn is None or mx is None:
+            return None
+        mode = getattr(src, "clamp_type", "MINMAX")
+        if mode == "RANGE" and mn > mx:
+            mn, mx = mx, mn
+        return max(mn, min(mx, v))
+    if bl == "ShaderNodeMix" and getattr(src, "data_type", "RGBA") == "FLOAT":
+        fac_sock = next((i for i in src.inputs
+                         if i.name == "Factor" and i.type == "VALUE"), None)
+        a_sock = next((i for i in src.inputs
+                       if i.name == "A" and i.type == "VALUE"), None)
+        b_sock = next((i for i in src.inputs
+                       if i.name == "B" and i.type == "VALUE"), None)
+        if fac_sock is None or a_sock is None or b_sock is None:
+            return None
+        fa = _resolve_exact_scalar(fac_sock, depth + 1)
+        va = _resolve_exact_scalar(a_sock, depth + 1)
+        vb = _resolve_exact_scalar(b_sock, depth + 1)
+        if fa is None or va is None or vb is None:
+            return None
+        if bool(getattr(src, "clamp_factor", True)):
+            fa = max(0.0, min(1.0, fa))
+        out = va * (1.0 - fa) + vb * fa
+        if bool(getattr(src, "clamp_result", False)):
+            out = max(0.0, min(1.0, out))
+        return out
+    if bl == "ShaderNodeInvert":
+        fac_sock = src.inputs.get("Fac")
+        col_sock = src.inputs.get("Color")
+        if col_sock is None:
+            return None
+        if fac_sock is None:
+            fac = 1.0
+        else:
+            fac = _resolve_exact_scalar(fac_sock, depth + 1)
+            if fac is None:
+                return None
+        x = _resolve_exact_scalar(col_sock, depth + 1)
+        if x is None:
+            return None
+        return x * (1.0 - fac) + (1.0 - x) * fac
+    return None
 
 
 def _socket_constant_rgb(sock) -> list[float] | None:
@@ -2376,24 +2469,21 @@ def _from_principled(node, writer, textures) -> dict:
         p["roughness"] = _socket_f(node.inputs["Roughness"])
 
     if "IOR" in node.inputs:
-        _warn_linked_scalar(node, "IOR")
-        p["ior"] = _socket_f(node.inputs["IOR"])
+        p["ior"] = _warn_linked_scalar(node, "IOR")
     trans_name = (
         "Transmission Weight" if "Transmission Weight" in node.inputs
         else "Transmission" if "Transmission" in node.inputs
         else None
     )
     if trans_name:
-        _warn_linked_scalar(node, trans_name)
-        p["transmission"] = _socket_f(node.inputs[trans_name])
+        p["transmission"] = _warn_linked_scalar(node, trans_name)
 
     if "Emission" in node.inputs:
         p["emission"] = _emission_constant_color(node, node.inputs["Emission"])
     elif "Emission Color" in node.inputs:
         color = _emission_constant_color(node, node.inputs["Emission Color"])
         if "Emission Strength" in node.inputs:
-            _warn_linked_scalar(node, "Emission Strength")
-            strength = _socket_f(node.inputs["Emission Strength"])
+            strength = _warn_linked_scalar(node, "Emission Strength")
         else:
             strength = 1.0
         p["emission"] = [c * strength for c in color]
@@ -2403,15 +2493,13 @@ def _from_principled(node, writer, textures) -> dict:
     # Anisotropy (Blender Principled: "Anisotropic" + "Anisotropic Rotation").
     for name in ("Anisotropic", "Anisotropy"):
         if name in node.inputs:
-            _warn_linked_scalar(node, name)
-            a = _socket_f(node.inputs[name])
+            a = _warn_linked_scalar(node, name)
             if a != 0.0:
                 p["anisotropy"] = a
             break
     for name in ("Anisotropic Rotation", "Anisotropy Rotation"):
         if name in node.inputs:
-            _warn_linked_scalar(node, name)
-            r = _socket_f(node.inputs[name])
+            r = _warn_linked_scalar(node, name)
             if r != 0.0:
                 p["tangent_rotation"] = r * 2.0 * math.pi
             break
@@ -2420,21 +2508,18 @@ def _from_principled(node, writer, textures) -> dict:
     # legacy 3.x: "Clearcoat" / "Clearcoat Roughness").
     for name in ("Coat Weight", "Clearcoat"):
         if name in node.inputs:
-            _warn_linked_scalar(node, name)
-            w = _socket_f(node.inputs[name])
+            w = _warn_linked_scalar(node, name)
             if w > 0.0:
                 p["coat_weight"] = w
             break
     for name in ("Coat Roughness", "Clearcoat Roughness"):
         if name in node.inputs:
-            _warn_linked_scalar(node, name)
-            r = _socket_f(node.inputs[name])
+            r = _warn_linked_scalar(node, name)
             if r != 0.03:
                 p["coat_roughness"] = r
             break
     if "Coat IOR" in node.inputs:
-        _warn_linked_scalar(node, "Coat IOR")
-        ior = _socket_f(node.inputs["Coat IOR"])
+        ior = _warn_linked_scalar(node, "Coat IOR")
         if ior != 1.5:
             p["coat_ior"] = ior
 
@@ -2442,14 +2527,12 @@ def _from_principled(node, writer, textures) -> dict:
     # legacy: "Sheen" / "Sheen Tint" scalar).
     for name in ("Sheen Weight", "Sheen"):
         if name in node.inputs:
-            _warn_linked_scalar(node, name)
-            w = _socket_f(node.inputs[name])
+            w = _warn_linked_scalar(node, name)
             if w > 0.0:
                 p["sheen_weight"] = w
             break
     if "Sheen Roughness" in node.inputs:
-        _warn_linked_scalar(node, "Sheen Roughness")
-        r = _socket_f(node.inputs["Sheen Roughness"])
+        r = _warn_linked_scalar(node, "Sheen Roughness")
         if r != 0.5:
             p["sheen_roughness"] = r
     if "Sheen Tint" in node.inputs:
@@ -2471,8 +2554,7 @@ def _from_principled(node, writer, textures) -> dict:
     # by the simplified wrap-Lambert SSS in the renderer, so we don't emit it.
     for name in ("Subsurface Weight", "Subsurface"):
         if name in node.inputs:
-            _warn_linked_scalar(node, name)
-            w = _socket_f(node.inputs[name])
+            w = _warn_linked_scalar(node, name)
             if w > 0.0:
                 p["sss_weight"] = w
             break
@@ -2562,13 +2644,11 @@ def _from_glossy(node, writer, textures) -> dict:
         else:
             p["roughness"] = _socket_f(node.inputs["Roughness"])
     if "Anisotropy" in node.inputs:
-        _warn_linked_scalar(node, "Anisotropy")
-        a = _socket_f(node.inputs["Anisotropy"])
+        a = _warn_linked_scalar(node, "Anisotropy")
         if a != 0.0:
             p["anisotropy"] = a
     if "Rotation" in node.inputs:
-        _warn_linked_scalar(node, "Rotation")
-        r = _socket_f(node.inputs["Rotation"])
+        r = _warn_linked_scalar(node, "Rotation")
         if r != 0.0:
             p["tangent_rotation"] = r * 2.0 * math.pi
     _apply_normal_perturbation(p, node.inputs.get("Normal"), writer, textures)
@@ -2579,8 +2659,7 @@ def _from_glass(node, writer, textures) -> dict:
     p = _default_params()
     p["transmission"] = 1.0
     if "IOR" in node.inputs:
-        _warn_linked_scalar(node, "IOR")
-        p["ior"] = _socket_f(node.inputs["IOR"])
+        p["ior"] = _warn_linked_scalar(node, "IOR")
     img, chain = _socket_linked_image_with_chain(node.inputs["Color"])
     if img is not None:
         p["base_color_tex"] = export_image_texture(img, writer, textures, "srgb", chain=chain)
@@ -2602,8 +2681,7 @@ def _from_refraction(node, writer, textures) -> dict:
     p["transmission"] = 1.0
     p["metallic"] = 0.0
     if "IOR" in node.inputs:
-        _warn_linked_scalar(node, "IOR")
-        p["ior"] = _socket_f(node.inputs["IOR"])
+        p["ior"] = _warn_linked_scalar(node, "IOR")
     img, chain = _socket_linked_image_with_chain(node.inputs["Color"])
     if img is not None:
         p["base_color_tex"] = export_image_texture(img, writer, textures, "srgb", chain=chain)
@@ -2659,8 +2737,7 @@ def _from_emission(node, writer, textures) -> dict:
     color_sock = node.inputs["Color"]
     color = _emission_constant_color(node, color_sock)
     if "Strength" in node.inputs:
-        _warn_linked_scalar(node, "Strength")
-        strength = _socket_f(node.inputs["Strength"])
+        strength = _warn_linked_scalar(node, "Strength")
     else:
         strength = 1.0
     p["emission"] = [c * strength for c in color]

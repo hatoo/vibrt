@@ -685,6 +685,22 @@ def _export_world(world, writer, textures: list) -> dict:
             elif linked.bl_idname == "ShaderNodeRGB":
                 # Constant colour picker — read its Color output.
                 col = list(linked.outputs["Color"].default_value)[:3]
+            elif linked.bl_idname == "ShaderNodeBlackbody":
+                # Deterministic RGB from a constant temperature — fold to
+                # the exact linear colour Cycles would produce. We don't
+                # accept lossy chains (textures, procedurals): the renderer
+                # has no way to carry per-pixel variation into a constant
+                # background, and silently averaging would hide the drop.
+                temp_sock = linked.inputs.get("Temperature")
+                if temp_sock is not None and not temp_sock.is_linked:
+                    col = material_export._blackbody_to_linear_rgb(
+                        float(temp_sock.default_value)
+                    )
+                else:
+                    print(
+                        f"[vibrt] warn: world {world.name!r}: Blackbody "
+                        f"Temperature is linked — using constant default"
+                    )
             else:
                 print(
                     f"[vibrt] warn: world {world.name!r}: Background Color "
