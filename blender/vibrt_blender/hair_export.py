@@ -197,9 +197,14 @@ def _iter_strands(psys, scene_eval, obj_eval, log_tag: str):
     settings = psys.settings
     root_w, tip_w = _strand_widths(settings)
 
-    n_children = int(getattr(settings, "rendered_child_count", 0) or 0)
-    if n_children == 0:
-        n_children = int(getattr(settings, "child_nbr", 0) or 0)
+    # Both `rendered_child_count` and `child_nbr` are "children **per parent**"
+    # (Blender Python doc: ParticleSettings.rendered_child_count) — *not* a
+    # global total. The previous code divided by len(parents), which produced
+    # 8× too few children on junk_shop's Churros (8 parents × 200/parent →
+    # was emitting 200 total instead of 1600).
+    n_per_parent = int(getattr(settings, "rendered_child_count", 0) or 0)
+    if n_per_parent == 0:
+        n_per_parent = int(getattr(settings, "child_nbr", 0) or 0)
 
     child_radius = float(getattr(settings, "child_radius", 0.0) or 0.0)
     if child_radius <= 0.0:
@@ -210,19 +215,18 @@ def _iter_strands(psys, scene_eval, obj_eval, log_tag: str):
     for parent in parents:
         yield parent, root_w, tip_w
 
-    if n_children <= 0:
+    if n_per_parent <= 0:
         print(
             f"[vibrt] hair {log_tag}: no rendered children "
             f"({len(parents)} parent strand(s) only)"
         )
         return
 
-    rng = random.Random(hash((log_tag, n_children, child_radius)) & 0xFFFFFFFF)
-    n_per_parent = max(1, n_children // max(len(parents), 1))
+    rng = random.Random(hash((log_tag, n_per_parent, child_radius)) & 0xFFFFFFFF)
     total_children = n_per_parent * len(parents)
     print(
-        f"[vibrt] hair {log_tag}: {len(parents)} parent + ~{total_children} "
-        f"children @ {root_w*1000:.1f}-{tip_w*1000:.1f}mm"
+        f"[vibrt] hair {log_tag}: {len(parents)} parent + {total_children} "
+        f"children ({n_per_parent}/parent) @ {root_w*1000:.1f}-{tip_w*1000:.1f}mm"
     )
     for parent in parents:
         # Root tangent → in-plane basis (u, v). Children are "Simple" Cycles
