@@ -4,6 +4,7 @@ use crate::gpu_types::{AreaRectLight, PointLight, SpotLight, SunLight};
 use crate::scene_format::*;
 use crate::transform;
 use anyhow::{anyhow, Context, Result};
+use rayon::prelude::*;
 use serde::Deserialize;
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
@@ -104,9 +105,15 @@ pub fn load_scene_from_bytes<'a>(json_text: &str, bin: &'a [u8]) -> Result<Loade
         return Err(anyhow!("unsupported scene.json version: {}", file.version));
     }
 
+    // ~half of junk_shop's 142 textures are sRGB and pay a host-side
+    // pow-2.4 conversion in `load_texture` (linear ones are zero-copy).
+    // The conversion is the dominant scene-load cost on big scenes (~6 s
+    // single-threaded). Each texture loads independently, so par_iter
+    // straightforwardly buys an n-core speedup; rayon's work-stealing
+    // handles the size imbalance between huge JPGs and tiny lookup maps.
     let textures = file
         .textures
-        .iter()
+        .par_iter()
         .map(|t| load_texture(t, bin))
         .collect::<Result<Vec<_>>>()?;
     let mut meshes = file
@@ -493,17 +500,24 @@ fn load_texture<'a>(desc: &TextureDesc, bin: &'a [u8]) -> Result<LoadedTexture<'
         }
         4 => {
             // sRGB 4-channel: the linearisation has to write into a fresh
-            // buffer regardless. Folding copy+convert into a single pass
-            // skips the redundant `read_f32_vec` allocation that used to
-            // run before the in-place conversion.
+            // buffer regardless. Parallelise the per-pixel conversion across
+            // a worker pool — a single 4K base-color JPG is 16 M pixels of
+            // pow-2.4 and dominates load_scene on its own. par_chunks_mut
+            // gives each worker a contiguous range so there's no false
+            // sharing on the output buffer.
             let src = cast_f32_slice(bytes);
-            let mut out = Vec::with_capacity(src.len());
-            for c in src.chunks_exact(4) {
-                out.push(srgb_to_linear(c[0]));
-                out.push(srgb_to_linear(c[1]));
-                out.push(srgb_to_linear(c[2]));
-                out.push(c[3]);
-            }
+            let mut out: Vec<f32> = vec![0.0; src.len()];
+            const CHUNK: usize = 1 << 16; // 64K floats = 16K pixels per task
+            out.par_chunks_mut(CHUNK)
+                .zip(src.par_chunks(CHUNK))
+                .for_each(|(dst, s)| {
+                    for (d, c) in dst.chunks_exact_mut(4).zip(s.chunks_exact(4)) {
+                        d[0] = srgb_to_linear(c[0]);
+                        d[1] = srgb_to_linear(c[1]);
+                        d[2] = srgb_to_linear(c[2]);
+                        d[3] = c[3];
+                    }
+                });
             Cow::Owned(out)
         }
         3 => {
