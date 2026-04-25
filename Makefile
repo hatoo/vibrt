@@ -9,9 +9,13 @@
 #   make classroom-preview    # export + render a .blend-based scene
 #   make classroom-cycles     # render a .blend-based scene with Cycles (reference)
 #   make cycles-previews      # render every .blend scene with Cycles
-#   make addon                # rebuild blender/vibrt_blender.zip
-#   make dev-install          # junction the addon into Blender's user addons dir
-#   make clean                # remove generated scene.json, scene.bin, preview.png
+#   make addon                # rebuild blender/vibrt_blender.zip (Python only)
+#   make addon-with-native    # also build the PyO3 extension and bundle it
+#   make dev-install          # build vibrt_native.pyd, stage it next to the
+#                             # addon source, junction the addon dir into
+#                             # Blender's user-addons folder
+#   make clean                # remove generated scene.json, scene.bin,
+#                             # preview.png, addon zip, staged .pyd
 #
 # Overridable:
 #   PYTHON  (default: py)
@@ -55,7 +59,7 @@ DENOISE_FLAG     := $(if $(strip $(DENOISE)),--denoise)
 ADDON_ZIP     := blender/vibrt_blender.zip
 ADDON_SOURCES := $(wildcard blender/vibrt_blender/*.py)
 
-.PHONY: all scenes previews cycles-previews addon dev-install clean vibrt-build FORCE $(SCENES) $(PREVIEW_TARGETS) $(BLEND_PREVIEW_TARGETS) $(BLEND_CYCLES_TARGETS)
+.PHONY: all scenes previews cycles-previews addon addon-with-native dev-install clean vibrt-build FORCE $(SCENES) $(PREVIEW_TARGETS) $(BLEND_PREVIEW_TARGETS) $(BLEND_CYCLES_TARGETS)
 
 FORCE:
 
@@ -108,7 +112,6 @@ $(ADDON_ZIP): $(ADDON_SOURCES) blender/build_addon.py
 # available out of the box. Falls through to the same zip target with the
 # extra `--with-native` flag, which invokes `cargo build --features python`
 # and copies `vibrt_native.dll` (or platform equivalent) into the zip.
-.PHONY: addon-with-native
 addon-with-native: $(ADDON_SOURCES) blender/build_addon.py
 	$(PYTHON) blender/build_addon.py --with-native
 
@@ -125,4 +128,7 @@ dev-install:
 	$(PYTHON) blender/dev_install.py
 
 clean:
-	rm -f $(SCENE_JSONS) $(SCENE_BINS) $(PREVIEW_PNGS) $(BLEND_PREVIEW_PNGS) $(BLEND_CYCLES_PNGS) $(ADDON_ZIP)
+	rm -f $(SCENE_JSONS) $(SCENE_BINS) $(PREVIEW_PNGS) $(BLEND_PREVIEW_PNGS) $(BLEND_CYCLES_PNGS) $(ADDON_ZIP) \
+	      blender/vibrt_blender/vibrt_native.pyd \
+	      blender/vibrt_blender/vibrt_native.so \
+	      blender/vibrt_blender/vibrt_native.dylib
