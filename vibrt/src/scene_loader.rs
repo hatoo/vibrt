@@ -16,6 +16,10 @@ pub struct LoadedMesh {
     /// f32 x 3 per vertex; empty when the mesh has no vertex colour attribute
     /// referenced by any material. See `MeshDesc::vertex_colors`.
     pub vertex_colors: Vec<f32>,
+    /// f32 x 3 per vertex; empty when the mesh has no authored tangent (the
+    /// common case — only hair ribbon meshes ship one today). See
+    /// `MeshDesc::tangents`.
+    pub tangents: Vec<f32>,
 }
 
 pub struct LoadedTexture {
@@ -358,6 +362,10 @@ fn load_mesh(desc: &MeshDesc, bin: &[u8]) -> Result<LoadedMesh> {
         Some(b) => read_f32_vec(slice_bin(bin, b)?),
         None => Vec::new(),
     };
+    let tangents = match desc.tangents {
+        Some(b) => read_f32_vec(slice_bin(bin, b)?),
+        None => Vec::new(),
+    };
 
     if indices.len() % 3 != 0 {
         return Err(anyhow!("mesh index count is not a multiple of 3"));
@@ -380,6 +388,13 @@ fn load_mesh(desc: &MeshDesc, bin: &[u8]) -> Result<LoadedMesh> {
             vertices.len()
         ));
     }
+    if !tangents.is_empty() && tangents.len() != vertices.len() {
+        return Err(anyhow!(
+            "mesh tangents len {} != vertices len {} (expected f32x3 per vertex)",
+            tangents.len(),
+            vertices.len()
+        ));
+    }
 
     Ok(LoadedMesh {
         vertices,
@@ -388,6 +403,7 @@ fn load_mesh(desc: &MeshDesc, bin: &[u8]) -> Result<LoadedMesh> {
         indices,
         material_indices,
         vertex_colors,
+        tangents,
     })
 }
 

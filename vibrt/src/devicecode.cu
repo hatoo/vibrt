@@ -890,7 +890,22 @@ static __device__ MaterialEval eval_material(const PathVertex &v) {
     Ns = normalize3(T * nm_t.x + B * nm_t.y + Ns * nm_t.z);
   }
   e.Ns = Ns;
-  build_frame(e.Ns, e.T, e.B);
+  // If closesthit interpolated an authored tangent (hair strand axis), use
+  // it as the anisotropy / hair tangent after re-orthogonalising against the
+  // possibly-perturbed shading normal. Otherwise fall back to a synthetic
+  // tangent — the previous behaviour for every non-hair surface.
+  if (dot3(v.T, v.T) > 0.5f) {
+    float3 Tperp = v.T - e.Ns * dot3(v.T, e.Ns);
+    float Tn2 = dot3(Tperp, Tperp);
+    if (Tn2 > 1e-8f) {
+      e.T = Tperp * (1.0f / sqrtf(Tn2));
+      e.B = normalize3(cross3(e.Ns, e.T));
+    } else {
+      build_frame(e.Ns, e.T, e.B);
+    }
+  } else {
+    build_frame(e.Ns, e.T, e.B);
+  }
 
   // Anisotropic α. Disney remap: aspect = sqrt(1 - 0.9·|aniso|).
   float aniso = fminf(fmaxf(m->anisotropy, -1.0f), 1.0f);
@@ -1449,11 +1464,24 @@ extern "C" __global__ void __closesthit__ch() {
     uv.y = b0 * uv0.y + bary.x * uv1.y + bary.y * uv2.y;
   }
 
-  // Tangent from dP/du
-  float3 T = make_float3(1, 0, 0);
-  float3 B = cross3(Ns, T);
-  if (dot3(B, B) < 1e-6f) {
-    T = make_float3(0, 1, 0);
+  // Authored per-vertex tangent (currently only emitted for hair ribbons).
+  // Read in object space so the strand axis sits in the same frame as the
+  // ribbon vertices, then transform alongside the normal. Zero means "no
+  // authored tangent" — eval_material falls back to build_frame() in that
+  // case, preserving the shader's existing isotropic behaviour.
+  float3 T = make_float3(0.0f, 0.0f, 0.0f);
+  if (hg->tangents != nullptr) {
+    float3 t0 = make_f3(&hg->tangents[i0 * 3]);
+    float3 t1 = make_f3(&hg->tangents[i1 * 3]);
+    float3 t2 = make_f3(&hg->tangents[i2 * 3]);
+    float3 T_local = t0 * b0 + t1 * bary.x + t2 * bary.y;
+    if (dot3(T_local, T_local) > 1e-12f) {
+      float3 Tw = optixTransformVectorFromObjectToWorldSpace(T_local);
+      float Tlen2 = dot3(Tw, Tw);
+      if (Tlen2 > 1e-12f) {
+        T = Tw * (1.0f / sqrtf(Tlen2));
+      }
+    }
   }
 
   float3 vc = make_float3(1.0f, 1.0f, 1.0f);

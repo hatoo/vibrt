@@ -86,6 +86,13 @@ pub struct MeshDesc {
     /// `use_vertex_color` set.
     #[serde(default)]
     pub vertex_colors: Option<BlobRef>,
+    /// f32 x 3 per vertex; optional. Object-space tangent direction authored
+    /// by the exporter — used by the hair Kajiya-Kay lobe to read the strand
+    /// axis at the hit point. When present, the device interpolates it
+    /// barycentrically and overrides the default build_frame() tangent. The
+    /// exporter only emits this for hair ribbon meshes today.
+    #[serde(default)]
+    pub tangents: Option<BlobRef>,
 }
 
 #[derive(Deserialize)]

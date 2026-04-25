@@ -285,6 +285,7 @@ fn render(scene: &LoadedScene, output: &std::path::Path, denoise: bool) -> Resul
         d_uvs: optix_sys::CUdeviceptr,
         d_mat_indices: optix_sys::CUdeviceptr,
         d_vertex_colors: optix_sys::CUdeviceptr,
+        d_tangents: optix_sys::CUdeviceptr,
         num_verts: i32,
     }
     let mut _buffers: Vec<CudaSlice<u8>> = Vec::new();
@@ -367,6 +368,14 @@ fn render(scene: &LoadedScene, output: &std::path::Path, denoise: bool) -> Resul
         } else {
             0
         };
+        let d_tangents = if !m.tangents.is_empty() {
+            let s = stream.clone_htod(&m.tangents).cuda()?;
+            let p = dptr_f32(&s, &stream);
+            _f32_buffers.push(s);
+            p
+        } else {
+            0
+        };
 
         meshes_gpu.push(MeshGpu {
             handle,
@@ -376,6 +385,7 @@ fn render(scene: &LoadedScene, output: &std::path::Path, denoise: bool) -> Resul
             d_uvs,
             d_mat_indices,
             d_vertex_colors,
+            d_tangents,
             num_verts: num_verts as i32,
         });
 
@@ -435,6 +445,7 @@ fn render(scene: &LoadedScene, output: &std::path::Path, denoise: bool) -> Resul
             materials: materials_ptr,
             num_materials,
             vertex_colors: m.d_vertex_colors,
+            tangents: m.d_tangents,
         };
         tri_hg_records.push(SbtRecord::new(&hit_rg_pg, hg)?);
         tri_hg_records.push(SbtRecord::new(&hit_shadow_pg, hg)?);

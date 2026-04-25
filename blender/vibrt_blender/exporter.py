@@ -15,7 +15,7 @@ from pathlib import Path
 import bpy
 import mathutils
 
-from . import material_export
+from . import hair_export, material_export
 
 
 def _matrix_to_row_major(m) -> list[float]:
@@ -868,6 +868,30 @@ def export_scene(
                     if not getattr(obj, "visible_shadow", True):
                         obj_desc["cast_shadow"] = False
                     objects.append(obj_desc)
+
+                    # Hair particle systems on this object: tessellate to
+                    # ribbons + emit a sibling mesh/object. Skipped for
+                    # instance copies — each particle system is owned by the
+                    # source object and we'd otherwise duplicate the hair
+                    # for every linked instance.
+                    if not inst.is_instance and any(
+                        ps.settings.type == "HAIR"
+                        for ps in obj_eval.particle_systems
+                    ):
+                        hair_pair = hair_export.export_hair(
+                            obj,
+                            obj_eval,
+                            scene,
+                            writer,
+                            resolve_material,
+                            obj_eval.name,
+                        )
+                        if hair_pair is not None:
+                            hair_mesh, hair_obj = hair_pair
+                            hair_mesh_id = len(meshes)
+                            meshes.append(hair_mesh)
+                            hair_obj["mesh"] = hair_mesh_id
+                            objects.append(hair_obj)
                 elif obj_eval.type == "LIGHT":
                     light = _export_light(obj_eval, writer, textures)
                     if light is not None:

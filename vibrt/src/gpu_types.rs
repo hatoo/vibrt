@@ -130,6 +130,10 @@ pub struct HitGroupData {
     pub num_materials: i32,
     /// f32 x 3 per vertex. 0 when the mesh has no vertex color attribute.
     pub vertex_colors: optix_sys::CUdeviceptr,
+    /// f32 x 3 per vertex (object-space). 0 when the mesh has no authored
+    /// tangent — the device falls back to its default build_frame() tangent
+    /// in that case. Currently only hair ribbon meshes ship a tangent blob.
+    pub tangents: optix_sys::CUdeviceptr,
 }
 
 #[repr(C)]

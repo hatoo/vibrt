@@ -90,6 +90,7 @@ struct HitGroupData {
   PrincipledGpu **materials;
   int num_materials;
   float *vertex_colors; // f32x3 per vertex, nullptr if absent
+  float *tangents;      // f32x3 per vertex (object space), nullptr if absent
 };
 
 struct PointLight {
