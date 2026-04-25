@@ -9,6 +9,10 @@ use serde::Deserialize;
 #[derive(Deserialize)]
 pub struct SceneFile {
     pub version: u32,
+    /// Filename of the sibling .bin blob. Resolved relative to the JSON path
+    /// by `load_scene_from_path`; ignored by `load_scene_from_bytes` (the
+    /// in-process renderer hands the buffer directly).
+    #[allow(dead_code)]
     pub binary: String,
     pub render: RenderSettings,
     pub camera: CameraDesc,
@@ -25,7 +29,7 @@ pub struct SceneFile {
     pub world: Option<WorldDesc>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Copy, Clone)]
 pub struct RenderSettings {
     pub width: u32,
     pub height: u32,

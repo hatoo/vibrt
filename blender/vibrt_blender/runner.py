@@ -1,4 +1,16 @@
-"""Discover and invoke the vibrt binary."""
+"""Discover and invoke the vibrt renderer.
+
+Two paths exist:
+
+- `run_render_inproc` calls the bundled `vibrt_native` PyO3 extension directly,
+  handing it the in-memory `(scene.json, scene.bin)` buffers produced by
+  `exporter.export_scene_to_memory`. No disk roundtrip, no subprocess.
+- `run_render` is the legacy fallback: write the buffers to a temp dir, spawn
+  `vibrt.exe`, stream its stdout into Blender's Info panel. Used when the
+  native extension isn't bundled (e.g. fresh checkout that hasn't run
+  `cargo build --features python` yet) or when in-process rendering errors
+  out and the engine wants a second chance.
+"""
 
 from __future__ import annotations
 
@@ -21,6 +33,57 @@ def find_executable() -> str | None:
     if which:
         return which
     return None
+
+
+def find_native_module():
+    """Import `vibrt_native` if it's bundled with the addon. Returns the
+    module on success, or None on `ImportError` (extension not built yet,
+    binary missing, ABI mismatch). Callers fall back to `run_render` (the
+    subprocess path) when this is None.
+    """
+    try:
+        from . import vibrt_native  # type: ignore  # ships as a .pyd next to __init__.py
+        return vibrt_native
+    except ImportError:
+        return None
+
+
+def run_render_inproc(
+    scene_json: str,
+    scene_bin: bytes,
+    report,
+    is_break,
+    denoise: bool = False,
+):
+    """Render `(scene.json, scene.bin)` in-process via `vibrt_native`.
+
+    Returns a `(height, width, 4)` float32 numpy ndarray (linear RGBA, the
+    same buffer the GPU writes — bottom-left origin matching Blender's
+    `Image.pixels`). Raises `ImportError` if the extension isn't available;
+    raises `RuntimeError` for vibrt errors; raises `KeyboardInterrupt` if
+    the user aborted via Esc.
+    """
+    native = find_native_module()
+    if native is None:
+        raise ImportError("vibrt_native not available (build with --features python)")
+
+    def log_cb(msg: str) -> None:
+        # Filter out empty lines so the Info panel stays tidy. Strip CR
+        # which Windows can introduce when stdout-style messages arrive.
+        s = msg.rstrip()
+        if s:
+            report({"INFO"}, s)
+
+    def cancel_cb() -> bool:
+        # `is_break()` is the engine's `test_break` — flips when the user
+        # hits Esc. Wrap it because PyO3 wants a plain truthiness check.
+        try:
+            return bool(is_break())
+        except Exception:
+            return False
+
+    opts = {"denoise": bool(denoise)}
+    return native.render(scene_json, scene_bin, opts, log_cb, cancel_cb)
 
 
 def run_render(

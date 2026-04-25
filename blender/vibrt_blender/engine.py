@@ -23,7 +23,58 @@ class VibrtRenderEngine(bpy.types.RenderEngine):
         rd = scene.render
         width = int(rd.resolution_x * rd.resolution_percentage / 100.0)
         height = int(rd.resolution_y * rd.resolution_percentage / 100.0)
+        denoise = bool(getattr(scene, "vibrt_denoise", False))
 
+        # Prefer the in-process renderer when the bundled `vibrt_native.pyd`
+        # is importable — it skips the JSON+bin disk roundtrip (~12 GB on
+        # junk_shop, ~15 s of pure I/O round-trip). Fall back to the
+        # subprocess path if the extension is missing or errors out so a
+        # broken pyd doesn't take the addon down with it.
+        if runner.find_native_module() is not None:
+            try:
+                self._render_in_process(depsgraph, width, height, denoise)
+                return
+            except KeyboardInterrupt:
+                self.report({"WARNING"}, "Render cancelled")
+                return
+            except Exception as e:
+                self.report(
+                    {"WARNING"},
+                    f"In-process render failed ({e!r}) — falling back to subprocess",
+                )
+
+        self._render_via_subprocess(depsgraph, width, height, denoise)
+
+    def _render_in_process(
+        self,
+        depsgraph: bpy.types.Depsgraph,
+        width: int,
+        height: int,
+        denoise: bool,
+    ) -> None:
+        self.update_stats("vibrt", "Exporting scene...")
+        json_str, bin_bytes = exporter.export_scene_to_memory(depsgraph)
+
+        self.update_stats("vibrt", "Rendering...")
+        pixels = runner.run_render_inproc(
+            json_str,
+            bin_bytes,
+            self.report,
+            self.test_break,
+            denoise=denoise,
+        )
+        # `pixels` is float32 (h, w, 4), bottom-left origin (matches the
+        # `.raw` path's encoding — see image_io::save_image's `.raw` branch).
+        self.update_stats("vibrt", "Loading result...")
+        _push_pixels_into_render_result(self, pixels, width, height)
+
+    def _render_via_subprocess(
+        self,
+        depsgraph: bpy.types.Depsgraph,
+        width: int,
+        height: int,
+        denoise: bool,
+    ) -> None:
         exe = runner.find_executable()
         if exe is None:
             self.report(
@@ -55,7 +106,7 @@ class VibrtRenderEngine(bpy.types.RenderEngine):
             exr_path,
             self.report,
             self.test_break,
-            denoise=bool(getattr(scene, "vibrt_denoise", False)),
+            denoise=denoise,
         )
         if code != 0:
             self.report({"ERROR"}, f"vibrt exited with code {code}")
@@ -68,6 +119,45 @@ class VibrtRenderEngine(bpy.types.RenderEngine):
         _load_exr_into_render_result(self, exr_path, width, height)
 
     # Fallback: this addon does not support viewport IPR (yet).
+
+
+def _push_pixels_into_render_result(engine, pixels, width: int, height: int):
+    """Copy a float32 (h, w, 4) ndarray into the Combined pass.
+
+    Matches the `.raw`-loader path's expectations: bottom-left origin, RGBA
+    floats. Used by the in-process render path so we skip both the on-disk
+    `.raw` file and Blender's EXR loader entirely.
+    """
+    arr = pixels
+    if arr.shape[0] != height or arr.shape[1] != width or arr.shape[2] != 4:
+        engine.report(
+            {"ERROR"},
+            f"native render returned shape {arr.shape}, expected ({height}, {width}, 4)",
+        )
+        return
+
+    result = engine.begin_result(0, 0, width, height)
+    render_layer = result.layers[0]
+    combined = None
+    try:
+        combined = render_layer.passes.find_by_name("Combined", "")
+    except TypeError:
+        combined = render_layer.passes.find_by_name("Combined")
+    if combined is None:
+        for p in render_layer.passes:
+            if p.name == "Combined":
+                combined = p
+                break
+    if combined is None:
+        engine.end_result(result)
+        engine.report({"ERROR"}, "Combined pass not found in render result")
+        return
+    flat = arr.ravel()
+    if hasattr(combined.rect, "foreach_set"):
+        combined.rect.foreach_set(flat)
+    else:
+        combined.rect = [tuple(flat[i:i + 4]) for i in range(0, len(flat), 4)]
+    engine.end_result(result)
 
 
 def _load_exr_into_render_result(engine, raw_path: Path, width: int, height: int):

@@ -4,6 +4,7 @@ use crate::gpu_types::{AreaRectLight, PointLight, SpotLight, SunLight};
 use crate::scene_format::*;
 use crate::transform;
 use anyhow::{anyhow, Context, Result};
+use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
 pub struct LoadedMesh {
@@ -49,20 +50,39 @@ pub struct LoadedScene {
     pub envmap_rgb: Option<(Vec<f32>, u32, u32)>,
 }
 
-pub fn load_scene(json_path: &Path) -> Result<LoadedScene> {
+/// Read scene.json + the scene.bin it references from disk.
+///
+/// Thin wrapper over [`load_scene_from_bytes`] used by the CLI binary. The
+/// in-process Python path skips this and calls `load_scene_from_bytes`
+/// directly so the addon never has to spill its scene to disk.
+pub fn load_scene_from_path(json_path: &Path) -> Result<LoadedScene> {
     let json_text = std::fs::read_to_string(json_path)
         .with_context(|| format!("reading {}", json_path.display()))?;
-    let file: SceneFile = serde_json::from_str(&json_text).context("parsing scene.json")?;
+    // Probe just the `binary` field so we don't pay a full SceneFile parse
+    // twice. The full parse happens inside load_scene_from_bytes.
+    #[derive(Deserialize)]
+    struct BinaryRef {
+        binary: String,
+    }
+    let probe: BinaryRef = serde_json::from_str(&json_text)
+        .context("parsing scene.json (locating .bin reference)")?;
+    let scene_dir: PathBuf = json_path.parent().unwrap_or(Path::new(".")).to_path_buf();
+    let binary_path = scene_dir.join(&probe.binary);
+    let bin = std::fs::read(&binary_path)
+        .with_context(|| format!("reading {}", binary_path.display()))?;
+    load_scene_from_bytes(&json_text, &bin)
+}
+
+/// Parse an in-memory scene.json + scene.bin pair into a [`LoadedScene`].
+///
+/// Used by both the CLI ([`load_scene_from_path`]) and the in-process Python
+/// renderer (which builds these buffers without touching disk).
+pub fn load_scene_from_bytes(json_text: &str, bin: &[u8]) -> Result<LoadedScene> {
+    let file: SceneFile = serde_json::from_str(json_text).context("parsing scene.json")?;
 
     if file.version != 1 {
         return Err(anyhow!("unsupported scene.json version: {}", file.version));
     }
-
-    let scene_dir: PathBuf = json_path.parent().unwrap_or(Path::new(".")).to_path_buf();
-    let binary_path = scene_dir.join(&file.binary);
-    let bin = std::fs::read(&binary_path)
-        .with_context(|| format!("reading {}", binary_path.display()))?;
-    let bin: &[u8] = &bin;
 
     let textures = file
         .textures

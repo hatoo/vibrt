@@ -7,6 +7,7 @@ column-major via mathutils, our JSON schema expects row-major 16-float arrays).
 
 from __future__ import annotations
 
+import io
 import json
 import math
 import time
@@ -117,47 +118,125 @@ def _try_emissive_quad_as_rect_light(obj, obj_eval, mat_params):
 
 
 class BinWriter:
-    """Streaming writer for scene.bin.
+    """Streaming writer for scene.bin. Three sink types are supported:
 
-    Each `write_*` appends the blob's bytes directly to the open file via
-    `numpy.ndarray.tofile(f)` (one `fwrite` per blob) and returns a
-    `{"offset", "len"}` BlobRef. Offsets are tracked with `f.tell()` so there
-    is no bytearray intermediate to hold the whole scene.bin in RAM — writes
-    stream through the stdlib buffered writer to the OS as they are produced.
+    - **Real disk file** (`bin_path.open("wb")`, used by the CLI export):
+      writes use `numpy.ndarray.tofile(f)` for a direct `fwrite` per blob,
+      no temporary bytes copy. NTFS write-behind absorbs the I/O.
+    - **Pre-allocated `bytearray`** (used by `export_scene_to_memory`):
+      direct memoryview slice assignment, one memcpy per blob, no realloc
+      grows. This is the fast path for handing scene.bin to vibrt_native
+      without bouncing through disk.
+    - **`io.BytesIO`**: fallback for callers that prefer the file-like API.
+      Each blob goes through `f.write(arr)` (buffer-protocol, no tobytes
+      copy), but BytesIO grows incrementally, so very large bins pay a
+      log-N realloc penalty.
+
+    Unified by `tell()` and `write_f32`/`write_u32` returning the same
+    `{"offset", "len"}` BlobRef. Pad bytes (16-byte alignment) are written
+    after every blob.
     """
-    __slots__ = ("f",)
+    __slots__ = ("f", "_mode", "_buf", "_mv", "_off", "_pad_used")
 
     _PAD = b"\x00" * 16
 
+    _MODE_FILE = "file"
+    _MODE_BYTESIO = "bytesio"
+    _MODE_BYTEARRAY = "bytearray"
+
     def __init__(self, f):
         self.f = f
+        self._buf = None
+        self._mv = None
+        self._off = 0
+        self._pad_used = 0
+        if isinstance(f, bytearray):
+            # Bytearray sink: pre-sized buffer + memoryview slice writes.
+            self._mode = self._MODE_BYTEARRAY
+            self._buf = f
+            self._mv = memoryview(f)
+        else:
+            try:
+                f.fileno()
+                self._mode = self._MODE_FILE
+            except (AttributeError, OSError):
+                self._mode = self._MODE_BYTESIO
 
     def tell(self) -> int:
+        if self._mode == self._MODE_BYTEARRAY:
+            return self._off
         return self.f.tell()
+
+    def close(self) -> None:
+        """Release any memoryview holding the underlying bytearray, so the
+        caller can resize / trim it. No-op for the file / BytesIO modes.
+        """
+        if self._mv is not None:
+            self._mv.release()
+            self._mv = None
+
+    def _ensure_capacity(self, needed: int) -> None:
+        """For the bytearray sink, grow the buffer if `needed` would overflow.
+        Doubles the existing capacity to amortise the cost when our upfront
+        estimate underruns the actual size.
+        """
+        cur = len(self._buf)
+        if needed <= cur:
+            return
+        new_cap = max(needed, cur * 2 if cur else needed)
+        # `bytearray.extend` over a zero-filled region in one shot — single
+        # realloc, single memset.
+        self._buf.extend(b"\x00" * (new_cap - cur))
+        # memoryview must be re-acquired after extend; the previous one is
+        # invalidated by the resize.
+        self._mv = memoryview(self._buf)
+
+    def _write_blob(self, arr_or_bytes, length: int) -> None:
+        if self._mode == self._MODE_FILE:
+            if hasattr(arr_or_bytes, "nbytes"):
+                arr_or_bytes.tofile(self.f)
+            else:
+                self.f.write(arr_or_bytes)
+            return
+        if self._mode == self._MODE_BYTESIO:
+            self.f.write(arr_or_bytes)
+            return
+        # Bytearray sink: zero-copy memoryview write.
+        self._ensure_capacity(self._off + length)
+        if hasattr(arr_or_bytes, "nbytes"):
+            # numpy arrays support the buffer protocol but aren't directly
+            # assignable to a `B`-format memoryview slice without a cast.
+            self._mv[self._off:self._off + length] = (
+                memoryview(arr_or_bytes).cast("B")
+            )
+        else:
+            # `bytes` / `bytearray` / pre-existing memoryview: direct slice.
+            self._mv[self._off:self._off + length] = arr_or_bytes
+        self._off += length
 
     def write_f32(self, xs) -> dict:
         """Write a float32 blob. `xs` may be numpy or any array-like."""
         import numpy as np
         arr = xs if isinstance(xs, np.ndarray) else np.asarray(xs, dtype=np.float32)
         arr = np.ascontiguousarray(arr, dtype=np.float32)
-        off = self.f.tell()
-        arr.tofile(self.f)
+        off = self.tell()
         length = int(arr.nbytes)
+        self._write_blob(arr, length)
         pad = (-length) & 15
         if pad:
-            self.f.write(self._PAD[:pad])
+            self._write_blob(self._PAD[:pad], pad)
         return {"offset": off, "len": length}
 
     def write_u32(self, xs) -> dict:
         import numpy as np
         arr = xs if isinstance(xs, np.ndarray) else np.asarray(xs, dtype=np.uint32)
         arr = np.ascontiguousarray(arr, dtype=np.uint32)
-        off = self.f.tell()
-        arr.tofile(self.f)
+        off = self.tell()
         length = int(arr.nbytes)
+        self._write_blob(arr, length)
         pad = (-length) & 15
         if pad:
-            self.f.write(self._PAD[:pad])
+            self._write_blob(self._PAD[:pad], pad)
         return {"offset": off, "len": length}
 
 
@@ -731,6 +810,77 @@ def export_scene(
     bin_path: Path,
     texture_pct: int | None = None,
 ):
+    """Write scene.json + scene.bin to disk (existing CLI / tooling path)."""
+    with bin_path.open("wb") as f:
+        scene_dict = _export_into(
+            depsgraph, BinWriter(f), texture_pct, bin_path.name
+        )
+    t_jw = time.perf_counter()
+    json_path.write_text(json.dumps(scene_dict, indent=2))
+    # `_export_into` already logged the export-time breakdown; the disk-write
+    # cost itself is small (a JSON serialise + Path.write_text).
+    print(f"[vibrt]   json_write={time.perf_counter() - t_jw:.2f}s")
+
+
+def export_scene_to_memory(
+    depsgraph: bpy.types.Depsgraph,
+    texture_pct: int | None = None,
+) -> tuple[str, bytearray]:
+    """Build scene.json (string) + scene.bin (bytearray) in RAM.
+
+    Used by the in-process Python renderer (`runner.run_render_inproc`) so
+    the 11+ GB texture buffer never has to spill to disk on its way to
+    `vibrt_native.render`. The returned `(json_str, bin_buf)` are handed
+    straight across the FFI boundary.
+
+    The bin buffer is a `bytearray`, not `bytes`, so the renderer can read
+    it via the buffer protocol without forcing a final `bytes()` copy
+    (~12 GB of memcpy on junk_shop). vibrt_native.render is bytearray-aware.
+    """
+    # Pre-size the buffer in one allocation so bytearray's growth strategy
+    # doesn't end up doing exponential reallocs as it crosses 11 GB. Estimate
+    # = sum of pixel bytes (16/pixel for RGBA f32, scaled by texture_pct)
+    # plus 25% headroom for meshes / colour-graph LUTs / etc. If the estimate
+    # is short, BytearrayWriter falls back to growing — same cost as today;
+    # if it's long, we trim with `del buf[written:]` (a metadata change, not
+    # a realloc).
+    pct = (texture_pct or 100) / 100.0
+    estimated = 0
+    for img in bpy.data.images:
+        w, h = int(img.size[0]), int(img.size[1])
+        if w > 0 and h > 0:
+            sw = max(1, int(round(w * pct)))
+            sh = max(1, int(round(h * pct)))
+            estimated += sw * sh * 16
+    estimated = int(estimated * 1.25) + 4 * 1024 * 1024
+
+    buf = bytearray(estimated) if estimated > 0 else bytearray()
+    writer = BinWriter(buf)
+    scene_dict = _export_into(depsgraph, writer, texture_pct, "<in-memory>")
+    written = writer.tell()
+    # Release the memoryview before trimming — bytearray refuses to resize
+    # while a `memoryview` is keeping its buffer pinned ("Existing exports of
+    # data: object cannot be re-sized").
+    writer.close()
+    if len(buf) != written:
+        del buf[written:]
+    return json.dumps(scene_dict, indent=2), buf
+
+
+def _export_into(
+    depsgraph: bpy.types.Depsgraph,
+    writer: "BinWriter",
+    texture_pct: int | None,
+    binary_filename: str,
+) -> dict:
+    """Drive the export, writing blobs through `writer`. Returns the
+    JSON-serialisable scene dict; caller decides whether to dump it to disk
+    or pass it across an FFI.
+
+    `binary_filename` lands in `scene_json["binary"]` to satisfy the schema.
+    The Rust loader uses this to resolve the .bin file when loading from a
+    path; the in-memory loader (`load_scene_from_bytes`) ignores it.
+    """
     t0 = time.perf_counter()
     material_export.reset_stats()
     mesh_s = 0.0
@@ -769,8 +919,8 @@ def export_scene(
     material_export.begin_export(max_pixel_count, texture_pct=texture_pct)
 
     try:
-        with bin_path.open("wb") as f:
-            writer = BinWriter(f)
+        # Single-arm `try/finally` so we always reach `material_export.end_export()`.
+        if True:
 
             def resolve_material(mat) -> int:
                 if mat is None:
@@ -924,7 +1074,7 @@ def export_scene(
     print(f"[vibrt] spp={spp}")
     scene_json = {
         "version": 1,
-        "binary": bin_path.name,
+        "binary": binary_filename,
         "render": {
             "width": width,
             "height": height,
@@ -941,13 +1091,11 @@ def export_scene(
         "world": world,
     }
 
-    t_dump = time.perf_counter()
-    json_blob = json.dumps(scene_json, indent=2)
-    json_dump_s = time.perf_counter() - t_dump
-
-    t_jw = time.perf_counter()
-    json_path.write_text(json_blob)
-    json_write_s = time.perf_counter() - t_jw
+    # JSON serialise + write happens in the caller now; keep the dump out of
+    # this hot path so `_export_into` can be reused for both file and memory
+    # call sites.
+    json_dump_s = 0.0
+    json_write_s = 0.0
 
     dt = time.perf_counter() - t0
     stats = material_export.pop_stats()
@@ -993,3 +1141,4 @@ def export_scene(
     if stats["slow_materials"]:
         desc = ", ".join(f"{n}({d:.2f}s)" for n, d in stats["slow_materials"])
         print(f"[vibrt]   slow materials: {desc}")
+    return scene_json

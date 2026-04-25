@@ -104,6 +104,14 @@ $(foreach s,$(BLEND_SCENES),$(eval $(call BLEND_CYCLES_RULE,$(s))))
 $(ADDON_ZIP): $(ADDON_SOURCES) blender/build_addon.py
 	$(PYTHON) blender/build_addon.py
 
+# Bundle the PyO3 extension so the addon's in-process render path is
+# available out of the box. Falls through to the same zip target with the
+# extra `--with-native` flag, which invokes `cargo build --features python`
+# and copies `vibrt_native.dll` (or platform equivalent) into the zip.
+.PHONY: addon-with-native
+addon-with-native: $(ADDON_SOURCES) blender/build_addon.py
+	$(PYTHON) blender/build_addon.py --with-native
+
 dev-install:
 	$(PYTHON) blender/dev_install.py
 

@@ -5,6 +5,12 @@
 __pycache__/
 *.pyc
 blender/vibrt_blender.zip
+# Native PyO3 extension staged by `python blender/build_addon.py --with-native`
+# and dropped into the addon source dir so dev-junctioned Blender installs pick
+# it up. Build artifact; rebuild with cargo, don't commit.
+blender/vibrt_blender/vibrt_native.pyd
+blender/vibrt_blender/vibrt_native.so
+blender/vibrt_blender/vibrt_native.dylib
 .claude/
 test_scenes/classroom/
 test_scenes/uv_probe/
