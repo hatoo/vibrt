@@ -154,6 +154,15 @@ struct LaunchParams {
   float cam_w[3];
   float cam_lens_radius;
   float cam_focal_distance;
+  // Near/far clip distances along the primary ray. Matches Cycles'
+  // Camera Clip Start / Clip End — lone_monk's 1.12 m clip_start is
+  // what skips the alcove wall the camera sits behind.
+  float cam_clip_start;
+  float cam_clip_end;
+  // Sensor lens shift (Blender Camera.shift_x / shift_y). Translates
+  // the projection centre on the sensor.
+  float cam_shift_x;
+  float cam_shift_y;
 
   OptixTraversableHandle traversable;
 

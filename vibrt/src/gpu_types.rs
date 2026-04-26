@@ -230,6 +230,17 @@ pub struct LaunchParams {
     pub cam_w: [f32; 3],
     pub cam_lens_radius: f32,
     pub cam_focal_distance: f32,
+    /// World-space distance below which primary rays don't intersect
+    /// geometry (= Blender camera's `clip_start`). Mirrors Cycles' near
+    /// clip plane; without it the lone_monk camera, which sits just
+    /// behind an alcove wall, would only ever see that wall.
+    pub cam_clip_start: f32,
+    pub cam_clip_end: f32,
+    /// Lens shift offsets in sensor-normalised units (Blender
+    /// `shift_x`, `shift_y`). Translates the projection centre across
+    /// the sensor — applied as an NDC offset in raygen.
+    pub cam_shift_x: f32,
+    pub cam_shift_y: f32,
 
     pub traversable: optix_sys::OptixTraversableHandle,
 

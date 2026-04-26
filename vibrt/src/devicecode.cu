@@ -471,6 +471,14 @@ static __forceinline__ __device__ float power_heuristic(float pa, float pb) {
 // Solid-angle PDF of the envmap importance sampler for a given world-space dir.
 // Inverse of sample_envmap: maps (theta, phi) back to the texel and reads the
 // luminance, normalised by envmap_integral.
+//
+// Sampling distribution: each pixel (x, y) is picked with discrete probability
+// P(x, y) = lum_raw × sin(θ_y) / Z, where Z = Σ lum_raw × sin(θ_y) =
+// envmap_integral. The pixel covers solid-angle Ω = (2π² sin θ) / (W·H), so the
+// solid-angle pdf is P / Ω = lum_raw × W·H / (2π² × Z) — no sin θ in the
+// denominator, and `lum` must come from the raw texel (no world_strength) so
+// the strength factor stays on the radiance side and direct-light contribution
+// scales correctly with `world_strength`.
 static __device__ float envmap_pdf(float3 dir) {
   if (params.world_type != 1 || params.envmap_integral <= 0.0f)
     return 0.0f;
@@ -488,13 +496,10 @@ static __device__ float envmap_pdf(float3 dir) {
   int x = min((int)(u * w), w - 1);
   int y = min((int)(v * h), h - 1);
   const float *px = &params.envmap_data[(y * w + x) * 3];
-  float3 L = make_float3(px[0], px[1], px[2]) * params.world_strength;
-  float lum = luminance(L);
-  float sin_t = sinf(theta);
-  if (sin_t <= 0.0f)
-    return 0.0f;
-  return lum * (float)(w * h) /
-         (2.0f * M_PIf * M_PIf * sin_t * params.envmap_integral);
+  float lum_raw =
+      0.2126f * px[0] + 0.7152f * px[1] + 0.0722f * px[2];
+  return lum_raw * (float)(w * h) /
+         (2.0f * M_PIf * M_PIf * params.envmap_integral);
 }
 
 static __device__ EnvSample sample_envmap(RNG &rng) {
@@ -525,10 +530,14 @@ static __device__ EnvSample sample_envmap(RNG &rng) {
   const float *px = &params.envmap_data[(y * w + x) * 3];
   s.L = make_float3(px[0], px[1], px[2]) * params.world_strength;
 
-  float lum = luminance(s.L);
-  if (sin_t > 0.0f && params.envmap_integral > 0.0f) {
-    s.pdf = lum * (float)(w * h) /
-            (2.0f * M_PIf * M_PIf * sin_t * params.envmap_integral);
+  // pdf is over raw texel luminance only — see envmap_pdf for the derivation.
+  // Folding world_strength into `lum` here would cancel out of the
+  // L/pdf ratio in NEE and make contribution invariant to `world_strength`.
+  float lum_raw =
+      0.2126f * px[0] + 0.7152f * px[1] + 0.0722f * px[2];
+  if (params.envmap_integral > 0.0f) {
+    s.pdf = lum_raw * (float)(w * h) /
+            (2.0f * M_PIf * M_PIf * params.envmap_integral);
   }
   return s;
 }
@@ -2231,8 +2240,10 @@ extern "C" __global__ void __raygen__rg() {
   // Denoiser guide AOVs: one un-jittered primary ray into the first surface.
   // Keeps guides crisp (no sub-pixel averaging) and cheap (one trace/pixel).
   if (params.albedo_aov != nullptr || params.normal_aov != nullptr) {
-    float px0 = (2.0f * ((float)idx.x + 0.5f) / (float)dim.x) - 1.0f;
-    float py0 = (2.0f * ((float)idx.y + 0.5f) / (float)dim.y) - 1.0f;
+    float px0 = (2.0f * ((float)idx.x + 0.5f) / (float)dim.x) - 1.0f
+                + 2.0f * params.cam_shift_x;
+    float py0 = (2.0f * ((float)idx.y + 0.5f) / (float)dim.y) - 1.0f
+                + 2.0f * params.cam_shift_y;
     float3 dir0 = normalize3(U * px0 + V * py0 + W);
     PathVertex v;
     v.hit = 0;
@@ -2240,7 +2251,10 @@ extern "C" __global__ void __raygen__rg() {
     // should describe the *visible* surface (the wall behind a smoke
     // cube), not the invisible volume container. Capped to a few
     // iterations so a pathological scene can't loop forever.
-    float3 origin = eye;
+    // Push the AOV ray origin forward by clip_start so the denoiser
+    // guides describe the *visible* surface (the one beyond the near
+    // clip plane), matching what the SPP loop below sees.
+    float3 origin = eye + dir0 * params.cam_clip_start;
     for (int i = 0; i < VOL_STACK_MAX + 2; i++) {
       v.hit = 0;
       unsigned int hi, lo;
@@ -2288,10 +2302,15 @@ extern "C" __global__ void __raygen__rg() {
     RNG rng(pixel, s, 0u);
     float jx = rng.next();
     float jy = rng.next();
-    float px = (2.0f * ((float)idx.x + jx) / (float)dim.x) - 1.0f;
-    float py = (2.0f * ((float)idx.y + jy) / (float)dim.y) - 1.0f;
+    float px = (2.0f * ((float)idx.x + jx) / (float)dim.x) - 1.0f
+               + 2.0f * params.cam_shift_x;
+    float py = (2.0f * ((float)idx.y + jy) / (float)dim.y) - 1.0f
+               + 2.0f * params.cam_shift_y;
     float3 dir = normalize3(U * px + V * py + W);
-    float3 origin = eye;
+    // Honour Cycles' Camera "Clip Start" by moving the ray origin
+    // forward — anything closer than clip_start is invisible to the
+    // first hit (and therefore to NEE as well).
+    float3 origin = eye + dir * params.cam_clip_start;
 
     if (params.cam_lens_radius > 0.0f) {
       float u1 = rng.next();

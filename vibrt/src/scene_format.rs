@@ -93,6 +93,27 @@ pub struct CameraDesc {
     pub lens_radius: f32,
     #[serde(default = "one_f32")]
     pub focal_distance: f32,
+    /// Cycles' "Clip Start". Primary rays skip geometry closer than this
+    /// — the lone_monk camera sits just behind an alcove wall that the
+    /// 1.12m clip_start hides; without it the wall fills the frame and
+    /// no scene structure shows through.
+    #[serde(default)]
+    pub clip_start: f32,
+    /// Cycles' "Clip End". Caps the primary ray's travel; defaults large
+    /// when missing so heritage scenes still render to infinity.
+    #[serde(default = "default_clip_end")]
+    pub clip_end: f32,
+    /// Lens shift in sensor-normalised units (Blender's `Camera.shift_x` /
+    /// `shift_y`). Both are zero for un-shifted cameras; lone_monk's
+    /// `shift_y = 0.071` aims the frame slightly above the optical axis.
+    #[serde(default)]
+    pub shift_x: f32,
+    #[serde(default)]
+    pub shift_y: f32,
+}
+
+fn default_clip_end() -> f32 {
+    1.0e20
 }
 
 fn one_f32() -> f32 {

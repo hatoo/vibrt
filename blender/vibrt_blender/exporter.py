@@ -438,6 +438,18 @@ def _export_camera(scene, cam_obj, aspect: float) -> dict:
         "fov_y_rad": fov_y,
         "lens_radius": lens_radius,
         "focal_distance": focal_distance,
+        # Cycles' "Clip Start" — primary rays don't intersect anything
+        # closer than this. Lone_monk has 1.12m clip_start to skip a
+        # close-up alcove wall the camera is positioned just behind;
+        # without honouring this the wall fills the entire frame.
+        "clip_start": float(cam.clip_start),
+        "clip_end": float(cam.clip_end),
+        # Lens shift (in sensor units; multiply by 2/sensor for NDC
+        # offset). Also drives Cycles' lone_monk view: shift_y=0.07
+        # tilts the rendered frame slightly upward so the arches above
+        # the alcove come into view.
+        "shift_x": float(cam.shift_x),
+        "shift_y": float(cam.shift_y),
     }
 
 
@@ -772,10 +784,14 @@ def _bake_sky_world_to_pixels(world, w: int = 1024, h: int = 512):
     # here.
     cam_data = bpy.data.cameras.new("__vibrt_sky_bake_cam")
     cam_data.type = 'PANO'
-    try:
-        cam_data.cycles.panorama_type = 'EQUIRECTANGULAR'
-    except Exception:
-        pass
+    # `panorama_type` lives on Camera directly in Blender 4.x+ (it used to be
+    # under `cam_data.cycles.panorama_type` in 3.x, but that attribute is gone
+    # by 4.x — silently falling back to the default `FISHEYE_EQUISOLID` here
+    # would render only the camera's front hemisphere into a circular disc,
+    # leaving ~80% of the equirect grid black and dropping the sun disc
+    # entirely. So we set it on the top-level Camera and treat any failure as
+    # a hard error (the addon's required Blender version is 4.x+).
+    cam_data.panorama_type = 'EQUIRECTANGULAR'
     cam = bpy.data.objects.new("__vibrt_sky_bake_cam", cam_data)
     cam.location = (0.0, 0.0, 0.0)
     cam.rotation_euler = (0.0, 0.0, 0.0)
