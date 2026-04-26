@@ -99,28 +99,30 @@ fn one_f32() -> f32 {
     1.0
 }
 
-#[derive(Deserialize, Copy, Clone)]
-pub struct BlobRef {
-    pub offset: u64,
-    pub len: u64,
-}
+/// Index into the caller-supplied `mesh_blobs: &[&[u8]]` slice. Each blob
+/// is a contiguous byte buffer that the loader reinterprets as f32 / u32
+/// according to the field's declared type. Replaces the old
+/// `BlobRef { offset, len }` — the bin used to be one giant bytearray and
+/// every field stored an offset into it; now each blob is its own numpy
+/// array on the Python side, parked into a list, and addressed by index.
+pub type BlobIdx = u32;
 
 #[derive(Deserialize)]
 pub struct MeshDesc {
     /// f32 x 3 per vertex
-    pub vertices: BlobRef,
+    pub vertices: BlobIdx,
     /// f32 x 3 per vertex; optional
     #[serde(default)]
-    pub normals: Option<BlobRef>,
+    pub normals: Option<BlobIdx>,
     /// f32 x 2 per vertex; optional
     #[serde(default)]
-    pub uvs: Option<BlobRef>,
+    pub uvs: Option<BlobIdx>,
     /// u32 x 3 per triangle
-    pub indices: BlobRef,
+    pub indices: BlobIdx,
     /// u32 per triangle — index into ObjectDesc::materials.
     /// When absent, the whole mesh uses ObjectDesc::material.
     #[serde(default)]
-    pub material_indices: Option<BlobRef>,
+    pub material_indices: Option<BlobIdx>,
     /// Grayscale heightmap (texture index). Sampled at vertex UVs; offsets
     /// each vertex along its normal by `sampled * displacement_strength`.
     /// Applied once at scene-load before BLAS construction.
@@ -133,14 +135,14 @@ pub struct MeshDesc {
     /// the hit and multiplied into base_color when the material has
     /// `use_vertex_color` set.
     #[serde(default)]
-    pub vertex_colors: Option<BlobRef>,
+    pub vertex_colors: Option<BlobIdx>,
     /// f32 x 3 per vertex; optional. Object-space tangent direction authored
     /// by the exporter — used by the hair Kajiya-Kay lobe to read the strand
     /// axis at the hit point. When present, the device interpolates it
     /// barycentrically and overrides the default build_frame() tangent. The
     /// exporter only emits this for hair ribbon meshes today.
     #[serde(default)]
-    pub tangents: Option<BlobRef>,
+    pub tangents: Option<BlobIdx>,
 }
 
 #[derive(Deserialize)]

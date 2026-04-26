@@ -57,22 +57,24 @@ pub struct LoadedScene<'bin> {
     pub envmap_rgb: Option<(Vec<f32>, u32, u32)>,
 }
 
-/// Parse an in-memory scene.json + scene.bin pair into a [`LoadedScene`].
+/// Parse an in-memory `scene.json` plus per-blob byte buffers into a
+/// [`LoadedScene`]. Mesh and texture payloads are borrowed from the
+/// caller-owned slices wherever possible; only sRGB textures and
+/// displacement-modified mesh vertices end up with owned `Vec`s.
 ///
-/// Mesh and texture payloads are borrowed from `bin` wherever possible;
-/// only sRGB textures and displacement-modified mesh vertices end up with
-/// owned `Vec`s. The returned scene's lifetime is tied to `bin`'s.
+/// `mesh_blobs` is the list of caller-owned byte buffers indexed by
+/// `MeshDesc.vertices` / `.indices` / etc. — one entry per blob. Each
+/// blob is reinterpreted as f32 or u32 by `bytemuck::cast_slice`
+/// according to the field's declared type. There is no longer a single
+/// concatenated bin: each blob is independently a Python numpy array
+/// passed directly across PyO3 as `PyBuffer<u8>`.
 ///
-/// `texture_arrays` is the optional list of caller-owned f32 slices that
-/// `TextureDesc::array_index` references. The in-process FFI exporter
-/// uses this to skip the bin's texture-concatenation memcpy: each
-/// texture's pixel buffer is passed directly across PyO3 instead of
-/// being re-stitched into a giant bytearray. The CLI / disk path passes
-/// an empty slice — every texture there ships with a `pixels` BlobRef
-/// pointing into the bin.
+/// `texture_arrays` is the parallel list for `TextureDesc.array_index`,
+/// kept separate because Rust takes texture data as typed
+/// `Vec<PyBuffer<f32>>` for the GPU upload path.
 pub fn load_scene_from_bytes<'a>(
     json_text: &str,
-    bin: &'a [u8],
+    mesh_blobs: &[&'a [u8]],
     texture_arrays: &[&'a [f32]],
 ) -> Result<LoadedScene<'a>> {
     let file: SceneFile = serde_json::from_str(json_text).context("parsing scene.json")?;
@@ -95,7 +97,7 @@ pub fn load_scene_from_bytes<'a>(
     let mut meshes = file
         .meshes
         .iter()
-        .map(|m| load_mesh(m, bin))
+        .map(|m| load_mesh(m, mesh_blobs))
         .collect::<Result<Vec<_>>>()?;
     for (mi, mdesc) in file.meshes.iter().enumerate() {
         if let (Some(tex_id), s) = (mdesc.displacement_tex, mdesc.displacement_strength) {
@@ -279,27 +281,21 @@ pub fn load_scene_from_bytes<'a>(
     })
 }
 
-fn slice_bin(bin: &[u8], blob: BlobRef) -> Result<&[u8]> {
-    let start = blob.offset as usize;
-    let end = start
-        .checked_add(blob.len as usize)
-        .ok_or_else(|| anyhow!("blob offset+len overflow"))?;
-    if end > bin.len() {
-        return Err(anyhow!(
-            "blob out of range: offset={} len={} bin_len={}",
-            blob.offset,
-            blob.len,
-            bin.len()
-        ));
-    }
-    Ok(&bin[start..end])
+/// Pick a blob from `mesh_blobs` by index. Bounded error on overflow.
+fn lookup_blob<'a>(blobs: &[&'a [u8]], idx: BlobIdx) -> Result<&'a [u8]> {
+    blobs.get(idx as usize).copied().ok_or_else(|| {
+        anyhow!(
+            "blob index {} out of range (have {} blobs)",
+            idx,
+            blobs.len()
+        )
+    })
 }
 
-/// Reinterpret the bin slice as `&[f32]` without copying. Falls back to a
+/// Reinterpret a blob's bytes as `&[f32]` without copying. Falls back to a
 /// fresh `Vec<f32>` only when the slice is misaligned (bytemuck panics
-/// otherwise) — which never happens for blobs the exporter writes (BlobRefs
-/// are always written at 16-byte-aligned offsets), but the fallback keeps
-/// us safe against hand-authored test bins.
+/// otherwise) — numpy float32 arrays are always at-least-4-byte aligned,
+/// so the fallback fires only on hand-crafted test buffers.
 fn cast_f32_slice(bytes: &[u8]) -> Cow<'_, [f32]> {
     match bytemuck::try_cast_slice::<u8, f32>(bytes) {
         Ok(s) => Cow::Borrowed(s),
@@ -384,27 +380,27 @@ fn apply_displacement(mesh: &mut LoadedMesh, tex: &LoadedTexture, strength: f32)
     }
 }
 
-fn load_mesh<'a>(desc: &MeshDesc, bin: &'a [u8]) -> Result<LoadedMesh<'a>> {
-    let vertices = cast_f32_slice(slice_bin(bin, desc.vertices)?);
+fn load_mesh<'a>(desc: &MeshDesc, blobs: &[&'a [u8]]) -> Result<LoadedMesh<'a>> {
+    let vertices = cast_f32_slice(lookup_blob(blobs, desc.vertices)?);
     let normals = match desc.normals {
-        Some(b) => cast_f32_slice(slice_bin(bin, b)?),
+        Some(idx) => cast_f32_slice(lookup_blob(blobs, idx)?),
         None => Cow::Owned(Vec::new()),
     };
     let uvs = match desc.uvs {
-        Some(b) => cast_f32_slice(slice_bin(bin, b)?),
+        Some(idx) => cast_f32_slice(lookup_blob(blobs, idx)?),
         None => Cow::Owned(Vec::new()),
     };
-    let indices = cast_u32_slice(slice_bin(bin, desc.indices)?);
+    let indices = cast_u32_slice(lookup_blob(blobs, desc.indices)?);
     let material_indices = match desc.material_indices {
-        Some(b) => cast_u32_slice(slice_bin(bin, b)?),
+        Some(idx) => cast_u32_slice(lookup_blob(blobs, idx)?),
         None => Cow::Owned(Vec::new()),
     };
     let vertex_colors = match desc.vertex_colors {
-        Some(b) => cast_f32_slice(slice_bin(bin, b)?),
+        Some(idx) => cast_f32_slice(lookup_blob(blobs, idx)?),
         None => Cow::Owned(Vec::new()),
     };
     let tangents = match desc.tangents {
-        Some(b) => cast_f32_slice(slice_bin(bin, b)?),
+        Some(idx) => cast_f32_slice(lookup_blob(blobs, idx)?),
         None => Cow::Owned(Vec::new()),
     };
 

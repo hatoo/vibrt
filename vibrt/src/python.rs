@@ -1,11 +1,11 @@
 //! PyO3 bindings — gated by the `python` Cargo feature.
 //!
-//! Exposes a single `render(scene_json, scene_bin, opts, log_cb=None,
-//! cancel_cb=None) -> ndarray` function that the Blender addon calls instead
-//! of spawning `vibrt.exe`. The scene is handed across the FFI boundary as
-//! `(json: &str, bin: &[u8])` — both borrow Python-owned buffers for the
-//! duration of the call, so the 11 GB texture blob never leaves Python's
-//! heap.
+//! Exposes a single `render(scene_json, mesh_blobs, opts, log_cb=None,
+//! cancel_cb=None, texture_arrays=None) -> ndarray` function that the
+//! Blender addon calls. Scene data crosses the FFI boundary as a `&str`
+//! plus two lists of buffer-protocol-pinned numpy arrays (mesh blobs as
+//! bytes, texture pixels as f32) — never copied; Rust borrows for the
+//! duration of the call.
 //!
 //! All CUDA / OptiX work happens inside `py.allow_threads(...)` so the GIL
 //! is released for the entire render. Progress callbacks reacquire the GIL
@@ -93,30 +93,26 @@ fn parse_options(opts: &Bound<'_, PyDict>) -> PyResult<RenderOptions> {
 }
 
 /// Render an in-memory scene and return a `(height, width, 4)` float32 numpy
-/// array. Equivalent to the CLI's `vibrt scene.json --output out.exr` minus
-/// the disk roundtrip.
+/// array.
 ///
-/// `scene_bin` accepts any buffer-protocol object (`bytes`, `bytearray`,
-/// `memoryview`, numpy array, ...). Using a `bytearray` from
-/// `exporter.export_scene_to_memory` skips the `bytes()` finalisation copy
-/// that bouncing through `bytes` would otherwise pay (~12 GB on junk_shop).
+/// `mesh_blobs` is the per-blob byte-buffer list referenced by
+/// `MeshDesc.vertices` / `.indices` / etc. — one numpy array per blob,
+/// passed across PyO3 as `PyBuffer<u8>` (Python-side `.view(np.uint8)`
+/// reinterprets f32 / u32 arrays without copying). The Rust loader picks
+/// each entry by index and `bytemuck::cast_slice`s it to the field's type.
 ///
-/// `texture_arrays` is the optional per-texture pixel-array list that the
-/// in-process exporter produces. Each entry is a contiguous f32 RGBA
-/// buffer; `TextureDesc.array_index` in `scene_json` indexes into it. When
-/// the list is empty (or omitted), every texture descriptor must carry a
-/// `pixels` BlobRef pointing into `scene_bin` instead — the disk-path
-/// fallback. Splitting textures off the bin sidesteps the bytearray-
-/// growth memcpy spikes; on junk_shop that's ~6 s saved.
+/// `texture_arrays` is the parallel list for `TextureDesc.array_index` —
+/// kept separate because Rust takes texture data as typed
+/// `Vec<PyBuffer<f32>>` for the GPU upload path.
 #[pyfunction]
 #[pyo3(signature = (
-    scene_json, scene_bin, opts, log_cb = None, cancel_cb = None,
+    scene_json, mesh_blobs, opts, log_cb = None, cancel_cb = None,
     texture_arrays = None,
 ))]
 fn render<'py>(
     py: Python<'py>,
     scene_json: &str,
-    scene_bin: PyBuffer<u8>,
+    mesh_blobs: Vec<PyBuffer<u8>>,
     opts: &Bound<'py, PyDict>,
     log_cb: Option<PyObject>,
     cancel_cb: Option<PyObject>,
@@ -129,23 +125,24 @@ fn render<'py>(
         cancelled: false,
     };
 
-    if !scene_bin.is_c_contiguous() {
-        return Err(PyRuntimeError::new_err(
-            "scene_bin must be C-contiguous (got a non-contiguous buffer)",
-        ));
+    // Build `&[&[u8]]` from the buffer list. Each PyBuffer pins its
+    // source numpy array for the duration of this scope, so the slices
+    // we hand to the loader stay valid through `allow_threads`.
+    let mut blob_slices: Vec<&[u8]> = Vec::with_capacity(mesh_blobs.len());
+    for (i, b) in mesh_blobs.iter().enumerate() {
+        if !b.is_c_contiguous() {
+            return Err(PyRuntimeError::new_err(format!(
+                "mesh_blobs[{}] must be C-contiguous",
+                i
+            )));
+        }
+        let p = b.buf_ptr() as *const u8;
+        let n = b.item_count();
+        // SAFETY: PyBuffer holds a buffer-protocol view; the source is
+        // pinned and cannot be resized while we hold it.
+        blob_slices.push(unsafe { std::slice::from_raw_parts(p, n) });
     }
-    let bin_ptr = scene_bin.buf_ptr() as *const u8;
-    let bin_len = scene_bin.item_count();
-    // SAFETY: PyBuffer holds a refcounted "buffer view" via the Python
-    // buffer protocol — while it's alive, the source object is pinned and
-    // cannot be resized or reallocated. The slice we construct lives only
-    // inside the closure below, which finishes before `scene_bin` (and its
-    // PyBuffer) is dropped at function exit.
-    let bin_slice: &[u8] = unsafe { std::slice::from_raw_parts(bin_ptr, bin_len) };
 
-    // Resolve texture arrays the same way: each PyBuffer<f32> is pinned for
-    // the duration of this call. Build `&[&[f32]]` so scene_loader can
-    // borrow without needing to know about PyO3.
     let arrays = texture_arrays.unwrap_or_default();
     let mut tex_slices: Vec<&[f32]> = Vec::with_capacity(arrays.len());
     for (i, b) in arrays.iter().enumerate() {
@@ -157,17 +154,14 @@ fn render<'py>(
         }
         let p = b.buf_ptr() as *const f32;
         let n = b.item_count();
-        // SAFETY: same buffer-protocol pinning argument as `bin_slice`.
         tex_slices.push(unsafe { std::slice::from_raw_parts(p, n) });
     }
 
     // Run the whole pipeline without the GIL so CUDA driver threads don't
-    // deadlock against the Python interpreter. The `&str` borrow is fine
-    // across allow_threads because Python-owned strings are immutable; the
-    // pinned PyBuffers make `bin_slice` and `tex_slices` similarly safe.
+    // deadlock against the Python interpreter.
     let render_result: anyhow::Result<RenderOutput> = py.allow_threads(|| {
         let t_load = std::time::Instant::now();
-        let scene = load_scene_from_bytes(scene_json, bin_slice, &tex_slices)?;
+        let scene = load_scene_from_bytes(scene_json, &blob_slices, &tex_slices)?;
         progress.log(&format!("Scene load: {:.2?}", t_load.elapsed()));
         render_to_pixels(&scene, &ro, &mut progress)
     });

@@ -23,13 +23,14 @@ def find_native_module():
 
 def run_render_inproc(
     scene_json: str,
-    scene_bin: bytes,
+    mesh_blobs,
     report,
     is_break,
     denoise: bool = False,
     texture_arrays=None,
 ):
-    """Render `(scene.json, scene.bin)` in-process via `vibrt_native`.
+    """Render `(scene.json, mesh_blobs, texture_arrays)` in-process via
+    `vibrt_native`.
 
     Returns a `(height, width, 4)` float32 numpy ndarray (linear RGBA, the
     same buffer the GPU writes — bottom-left origin matching Blender's
@@ -37,11 +38,12 @@ def run_render_inproc(
     raises `RuntimeError` for vibrt errors; raises `KeyboardInterrupt` if
     the user aborted via Esc.
 
-    `texture_arrays`, when supplied, is the per-texture pixel-array list
-    produced by `exporter.export_scene_to_memory`. The Rust loader resolves
-    each `TextureDesc.array_index` against it, so texture pixels can be
-    handed across PyO3 directly instead of being concatenated into the bin.
+    `mesh_blobs` is the per-blob byte-buffer list (mesh / index / vertex-
+    color / colour-graph LUT data). Each entry is a numpy array; the Rust
+    side picks them by `MeshDesc.array_index` references in the JSON.
+    `texture_arrays` is the parallel list for `TextureDesc.array_index`.
     """
+    import numpy as np
     native = find_native_module()
     if native is None:
         raise ImportError("vibrt_native not available (build with --features python)")
@@ -61,8 +63,12 @@ def run_render_inproc(
         except Exception:
             return False
 
+    # Reinterpret each typed (f32 / u32) blob as a uint8 view so PyO3 can
+    # take it as `PyBuffer<u8>`. `.view(np.uint8)` is a no-copy reinterpret.
+    blobs_u8 = [b if b.dtype == np.uint8 else b.view(np.uint8) for b in mesh_blobs]
+
     opts = {"denoise": bool(denoise)}
     return native.render(
-        scene_json, scene_bin, opts, log_cb, cancel_cb,
+        scene_json, blobs_u8, opts, log_cb, cancel_cb,
         texture_arrays=texture_arrays,
     )

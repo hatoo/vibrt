@@ -50,12 +50,12 @@ class VibrtRenderEngine(bpy.types.RenderEngine):
         denoise: bool,
     ) -> None:
         self.update_stats("vibrt", "Exporting scene...")
-        json_str, bin_bytes, texture_arrays = exporter.export_scene_to_memory(depsgraph)
+        json_str, mesh_blobs, texture_arrays = exporter.export_scene_to_memory(depsgraph)
 
         self.update_stats("vibrt", "Rendering...")
         pixels = runner.run_render_inproc(
             json_str,
-            bin_bytes,
+            mesh_blobs,
             self.report,
             self.test_break,
             denoise=denoise,

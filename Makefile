@@ -47,10 +47,14 @@ ADDON_SOURCES := $(wildcard blender/vibrt_blender/*.py)
 
 FORCE:
 
-# Pure-Python unit tests (no Blender / CUDA required). Currently covers
-# the export-time const folder for color graphs.
+# Pure-Python unit tests (no Blender / CUDA required). Each test file
+# runs as a standalone script; we glob the directory so adding a new
+# test_*.py picks it up automatically.
 test:
-	$(PYTHON) blender/vibrt_blender/test_color_fold.py
+	@for f in blender/vibrt_blender/test_*.py; do \
+		echo "=== $$f ==="; \
+		$(PYTHON) $$f || exit 1; \
+	done
 
 # Build the PyO3 extension and stage it next to the addon source. Cargo is
 # incremental, so this is a no-op when nothing changed. `make dev-install`
