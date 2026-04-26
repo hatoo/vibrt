@@ -3517,6 +3517,148 @@ def _emission_constant_color(node, color_sock) -> list[float]:
     return _socket_rgb(color_sock)
 
 
+def _try_alpha_cutout_mixshader(node, n1, n2, p1, p2, fac_sock, writer, textures):
+    """Detect `MixShader(Principled, Transparent, fac=texture)` and emit a
+    single Principled surface with the leaf base-colour in RGB and the
+    opacity mask in alpha, plus an `alpha_threshold` so the kernel cuts
+    out the non-leaf areas.
+
+    Returns the merged params dict, or None when the pattern doesn't fit
+    (one of the shaders isn't Principled / Transparent, the mask isn't a
+    bakeable texture, neither side has a base-colour texture, etc.).
+    """
+    import numpy as np
+    if n1 is None or n2 is None:
+        return None
+    # Identify the Principled side and which Mix index it sits on.
+    if n1.bl_idname == "ShaderNodeBsdfPrincipled" and n2.bl_idname == "ShaderNodeBsdfTransparent":
+        principled_node, principled_params, principled_idx = n1, p1, 1
+    elif n2.bl_idname == "ShaderNodeBsdfPrincipled" and n1.bl_idname == "ShaderNodeBsdfTransparent":
+        principled_node, principled_params, principled_idx = n2, p2, 2
+    else:
+        return None
+    # Resolve the opacity mask. We need a TexImage (with optional chain)
+    # so we can sample the per-pixel alpha; folded constants would imply
+    # uniform opacity which the kernel already handles via base alpha.
+    mask_img, mask_chain = _socket_linked_image_with_chain(fac_sock)
+    if mask_img is None or not isinstance(mask_img, bpy.types.Image):
+        return None
+    if mask_img.size[0] == 0 or mask_img.size[1] == 0:
+        mask_img.update()
+    mw, mh = int(mask_img.size[0]), int(mask_img.size[1])
+    if mw == 0 or mh == 0:
+        return None
+    # Sample the mask pixels and bake the opacity chain into them. We
+    # only need the luminance, so the chain's RGB output is fine.
+    mask_pix = np.empty(mw * mh * 4, dtype=np.float32)
+    mask_img.pixels.foreach_get(mask_pix)
+    if mask_chain:
+        mask_pix, _ = _bake_chain(
+            mask_pix, mw, mh,
+            "srgb" if mask_img.colorspace_settings.name.lower().startswith("srgb")
+            else "linear",
+            mask_chain,
+        )
+    mask_rgba = mask_pix.reshape((mh, mw, 4))
+    # Convert to a single alpha channel (luminance of RGB).
+    alpha = (
+        0.2126 * mask_rgba[..., 0]
+        + 0.7152 * mask_rgba[..., 1]
+        + 0.0722 * mask_rgba[..., 2]
+    )
+    # Index 1 gets shader1 when fac == 0, so a mask whose dark pixels
+    # mark "leaf" needs no inversion. Principled at index 2 swaps the
+    # convention (fac == 1 picks Principled) so flip the mask there.
+    if principled_idx == 1:
+        alpha = 1.0 - alpha
+    alpha = np.clip(alpha, 0.0, 1.0).astype(np.float32)
+
+    # Resolve the leaf colour. Walk the Principled's Base Color directly
+    # so we get the underlying TexImage + chain (the upstream
+    # `_resolve_shader` already exported it as `base_color_tex`, but we
+    # need the raw pixels here to merge with the mask).
+    bc_sock = principled_node.inputs.get("Base Color")
+    bc_img = None
+    bc_chain = ()
+    bc_const = None
+    if bc_sock is not None and bc_sock.is_linked:
+        bc_img, bc_chain = _socket_linked_image_with_chain(bc_sock)
+    if bc_img is None or not isinstance(bc_img, bpy.types.Image):
+        # No leaf texture — fall back to the principled side's constant
+        # base_color tinted by the alpha mask. The kernel will multiply
+        # base_color × base_color_tex at sample time, and the alpha mask
+        # alone is enough to silhouette the leaf.
+        bc_const = list(principled_params.get("base_color", [1.0, 1.0, 1.0]))
+        leaf_rgb = np.tile(np.array(bc_const, dtype=np.float32), (mh, mw, 1))
+        cw, ch = mw, mh
+        leaf_colorspace = "linear"
+    else:
+        if bc_img.size[0] == 0 or bc_img.size[1] == 0:
+            bc_img.update()
+        cw, ch = int(bc_img.size[0]), int(bc_img.size[1])
+        if cw == 0 or ch == 0:
+            return None
+        leaf_pix = np.empty(cw * ch * 4, dtype=np.float32)
+        bc_img.pixels.foreach_get(leaf_pix)
+        leaf_colorspace = (
+            "srgb" if bc_img.colorspace_settings.name.lower().startswith("srgb")
+            else "linear"
+        )
+        if bc_chain:
+            leaf_pix, leaf_colorspace = _bake_chain(
+                leaf_pix, cw, ch, leaf_colorspace, bc_chain,
+            )
+        leaf_rgb = leaf_pix.reshape((ch, cw, 4))[..., :3]
+
+    # If mask and leaf differ in resolution, resample the mask up/down to
+    # match the leaf — the leaf carries the per-pixel detail and is
+    # usually the higher-resolution buffer.
+    if (mw, mh) != (cw, ch):
+        alpha_4 = np.repeat(alpha[..., None], 4, axis=-1)
+        alpha_4 = _resample_bilinear(alpha_4, ch, cw)
+        alpha = alpha_4[..., 0]
+    rgba = np.concatenate(
+        [leaf_rgb.astype(np.float32),
+         alpha[..., None].astype(np.float32)],
+        axis=-1,
+    )
+    # Stash through `_PreBakedTexture` so dedup works and the texture
+    # hits the same write_texture_pixels code path everything else uses.
+    cache_key = (
+        f"__bushcutout__{principled_node.as_pointer()}__"
+        f"{(bc_img.name if bc_img else 'const')}__{mask_img.name}__"
+        f"{leaf_colorspace}"
+    )
+    pb = _PreBakedTexture(rgb=leaf_rgb.astype(np.float32),
+                          w=cw, h=ch, cache_key=cache_key)
+    # _export_prebaked stamps alpha=1 across the board; bypass it by
+    # stitching the desc ourselves with our combined RGBA pixels.
+    for i, t in enumerate(textures):
+        if t.get("_key") == cache_key:
+            tex_id = i
+            break
+    else:
+        flat = np.ascontiguousarray(rgba, dtype=np.float32).reshape(-1)
+        desc = {
+            "width": int(cw),
+            "height": int(ch),
+            "channels": 4,
+            "colorspace": leaf_colorspace,
+            "_key": cache_key,
+            **writer.write_texture_pixels(flat),
+        }
+        textures.append(desc)
+        tex_id = len(textures) - 1
+
+    out = dict(principled_params)
+    out["base_color_tex"] = tex_id
+    out["base_color"] = [1.0, 1.0, 1.0]  # the texture already carries the leaf colour
+    if bc_const is not None and "base_color_tex" not in principled_params:
+        out["base_color"] = bc_const
+    out["alpha_threshold"] = 0.5
+    return out
+
+
 def _from_mix(node, writer, textures, mat_name: str) -> dict:
     """Shader Mix: lerp Principled params by the constant Factor.
 
@@ -3560,6 +3702,22 @@ def _from_mix(node, writer, textures, mat_name: str) -> dict:
             return out
         return dict(p1)
     if fac_sock.is_linked:
+        # Special case: MixShader(Principled, Transparent, fac=texture) is
+        # Blender's canonical alpha-cutout idiom for vegetation / decals.
+        # `fac=0` selects shader1, `fac=1` selects shader2 — for
+        # MixShader(Principled, Transparent) that means a black mask
+        # picks the leaf and a white mask makes it invisible, exactly
+        # what `LeafSet*_Opacity.jpg` encodes. Lone_monk's bush ribbons
+        # used to render as solid green stripes because we'd lerp the
+        # Principled params at fac=0.5 and lose the silhouette
+        # entirely. Bake the leaf base-colour with the opacity dropped
+        # into its alpha channel and set `alpha_threshold` so the
+        # kernel cuts holes through the ribbon.
+        baked = _try_alpha_cutout_mixshader(
+            node, n1, n2, p1, p2, fac_sock, writer, textures
+        )
+        if baked is not None:
+            return baked
         # Try to fold the factor to a scalar (constant-driven Math /
         # procedural → mean).
         fac = _resolve_constant_scalar(fac_sock)

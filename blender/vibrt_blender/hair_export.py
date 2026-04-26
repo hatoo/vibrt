@@ -73,11 +73,19 @@ def _initial_perp(axis: np.ndarray, seed: int) -> np.ndarray:
 
 def _strand_to_ribbon(
     points: np.ndarray, root_w: float, tip_w: float, seed: int
-) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
-    """Build per-corner (positions, normals, tangents) for one strand.
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
+    """Build per-corner (positions, normals, tangents, uvs) for one strand.
 
     Output layout: 3 corners per triangle, 2 triangles per segment, (N-1)
     segments per strand → 6*(N-1) corners. Caller concatenates across strands.
+
+    UVs are laid out so a leaf-card / petal texture stretches across the
+    full ribbon: U sweeps along the strand width (0 = left edge, 1 =
+    right edge), V along the strand length (0 at root, 1 at tip). This
+    matches Cycles' default "Generated" hair UVs and is what artists
+    paint their alpha-cutout decals against (lone_monk's bush ribbons,
+    grass blades).
+
     Returns None for degenerate strands.
     """
     n = points.shape[0]
@@ -114,6 +122,7 @@ def _strand_to_ribbon(
     positions = np.empty((n_corners, 3), dtype=np.float32)
     normals = np.empty((n_corners, 3), dtype=np.float32)
     tangents = np.empty((n_corners, 3), dtype=np.float32)
+    uvs = np.empty((n_corners, 2), dtype=np.float32)
 
     for i in range(n_segs):
         seg_axis = axes[i] + axes[i + 1]
@@ -140,7 +149,18 @@ def _strand_to_ribbon(
         tangents[base + 3] = axes[i]
         tangents[base + 4] = axes[i + 1]
         tangents[base + 5] = axes[i + 1]
-    return positions, normals, tangents
+        # U sweeps strand width (0 left, 1 right), V sweeps length
+        # (root → tip). The ribbon's L corner is U=0, R is U=1; v[i]
+        # parameterises the segment's start, v[i+1] its end.
+        v0 = float(t_param[i])
+        v1 = float(t_param[i + 1])
+        uvs[base + 0] = (0.0, v0)
+        uvs[base + 1] = (0.0, v1)
+        uvs[base + 2] = (1.0, v0)
+        uvs[base + 3] = (1.0, v0)
+        uvs[base + 4] = (0.0, v1)
+        uvs[base + 5] = (1.0, v1)
+    return positions, normals, tangents, uvs
 
 
 def _strand_widths(settings) -> tuple[float, float]:
@@ -331,6 +351,7 @@ def export_hair(
     pos_chunks: list[np.ndarray] = []
     nrm_chunks: list[np.ndarray] = []
     tan_chunks: list[np.ndarray] = []
+    uv_chunks: list[np.ndarray] = []
 
     psys_seed_base = abs(hash(log_tag)) & 0xFFFFFFFF
     for psys_i, psys in enumerate(hair_psys):
@@ -342,10 +363,11 @@ def export_hair(
             ribbon = _strand_to_ribbon(points, root_w, tip_w, seed)
             if ribbon is None:
                 continue
-            p, n, t = ribbon
+            p, n, t, uv = ribbon
             pos_chunks.append(p)
             nrm_chunks.append(n)
             tan_chunks.append(t)
+            uv_chunks.append(uv)
 
     for psys in hair_psys:
         try:
@@ -359,6 +381,7 @@ def export_hair(
     positions = np.concatenate(pos_chunks).astype(np.float32, copy=False)
     normals = np.concatenate(nrm_chunks).astype(np.float32, copy=False)
     tangents = np.concatenate(tan_chunks).astype(np.float32, copy=False)
+    uvs = np.concatenate(uv_chunks).astype(np.float32, copy=False)
     n_corners = positions.shape[0]
     if n_corners % 3 != 0:
         # Should be impossible because every strand contributes 6*(N-1)
@@ -374,7 +397,7 @@ def export_hair(
     mesh_desc = {
         "vertices": writer.write_f32(positions.reshape(-1)),
         "normals": writer.write_f32(normals.reshape(-1)),
-        "uvs": None,
+        "uvs": writer.write_f32(uvs.reshape(-1)),
         "indices": writer.write_u32(indices),
         "tangents": writer.write_f32(tangents.reshape(-1)),
     }
