@@ -599,6 +599,249 @@ def _export_light(obj, writer, textures: list) -> dict | None:
     return None
 
 
+# Cache populated by `prebake_sky_envmaps_for_world` (called from
+# `RenderEngine.update()` — see engine.py). `_export_world` consumes
+# entries here when it sees a `ShaderNodeTexSky` node.
+#
+# Why a cache? The bake uses `bpy.ops.render.render` against a temp scene,
+# which Blender silently turns into an all-zero render when invoked from
+# inside `RenderEngine.render()`. Calling it from `update()` instead
+# (which Blender invokes BEFORE handing control to render()) works fine.
+# The exporter, which runs inside render(), reads the cache to get
+# already-baked pixels.
+_SKY_BAKE_CACHE: dict[str, tuple] = {}
+
+
+def _sky_node_cache_key(world, sky_node) -> str:
+    """Stable key tying a baked envmap to (world, all Sky Texture controls).
+
+    Anything that affects the rendered sky pixels participates in the key
+    so a scene that flips `sun_elevation` or `turbidity` between renders
+    re-bakes correctly.
+    """
+    return (
+        f"__sky__{world.name}__{sky_node.sky_type}__1024x512__"
+        f"se{sky_node.sun_elevation:.5f}_"
+        f"sr{sky_node.sun_rotation:.5f}_"
+        f"t{sky_node.turbidity:.4f}_"
+        f"a{sky_node.altitude:.2f}_"
+        f"ad{sky_node.air_density:.4f}_"
+        f"dd{sky_node.aerosol_density:.4f}_"
+        f"od{sky_node.ozone_density:.4f}_"
+        f"sd{int(sky_node.sun_disc)}_"
+        f"ss{sky_node.sun_size:.6f}_"
+        f"si{sky_node.sun_intensity:.4f}_"
+        f"ga{sky_node.ground_albedo:.4f}"
+    )
+
+
+def _world_sky_node(world):
+    """Return the ShaderNodeTexSky driving Background.Color, or None."""
+    if world is None or not world.use_nodes or world.node_tree is None:
+        return None
+    out = world.node_tree.nodes.get("World Output")
+    if out is None:
+        out = next(
+            (n for n in world.node_tree.nodes
+             if n.bl_idname == "ShaderNodeOutputWorld"),
+            None,
+        )
+    if out is None:
+        return None
+    surf = out.inputs.get("Surface")
+    if surf is None or not surf.is_linked:
+        return None
+    bg = surf.links[0].from_node
+    if bg.bl_idname != "ShaderNodeBackground":
+        return None
+    col = bg.inputs.get("Color")
+    if col is None or not col.is_linked:
+        return None
+    src = col.links[0].from_node
+    if src.bl_idname != "ShaderNodeTexSky":
+        return None
+    return src
+
+
+def prebake_sky_envmaps_for_world(world, w: int = 1024, h: int = 512) -> None:
+    """If `world`'s Background.Color is driven by a ShaderNodeTexSky, bake
+    it into `_SKY_BAKE_CACHE`. Safe to call repeatedly: returns early on
+    cache hit. Must be called from `RenderEngine.update()` (or other
+    non-render context) — see _SKY_BAKE_CACHE comment.
+
+    No-op for worlds that don't use Sky Texture, so engine.py can call
+    this unconditionally before every render.
+    """
+    sky = _world_sky_node(world)
+    if sky is None:
+        return
+    key = _sky_node_cache_key(world, sky)
+    if key in _SKY_BAKE_CACHE:
+        return
+    t0 = time.perf_counter()
+    try:
+        baked = _bake_sky_world_to_pixels(world, w=w, h=h)
+    except Exception as ex:
+        _emit(
+            f"[vibrt] warn: world {world.name!r}: failed to bake "
+            f"ShaderNodeTexSky ({sky.sky_type}) via Cycles in update(): "
+            f"{ex} — world background will fall back to constant"
+        )
+        return
+    if baked is None:
+        _emit(
+            f"[vibrt] warn: world {world.name!r}: Sky Texture "
+            f"({sky.sky_type}) bake produced no pixels — world background "
+            f"will fall back to constant"
+        )
+        return
+    _SKY_BAKE_CACHE[key] = baked
+    _emit(
+        f"[vibrt] world {world.name!r}: pre-baked ShaderNodeTexSky "
+        f"({sky.sky_type}) to a {baked[1]}x{baked[2]} envmap in "
+        f"{time.perf_counter() - t0:.2f}s"
+    )
+
+
+def clear_sky_bake_cache() -> None:
+    """Drop all cached envmap pixel buffers. Called between renders so
+    edits to the Sky Texture are picked up; the cache is per-process and
+    would otherwise stay alive forever."""
+    _SKY_BAKE_CACHE.clear()
+
+
+def _bake_sky_world_to_pixels(world, w: int = 1024, h: int = 512):
+    """Bake the world's procedural Sky Texture (Nishita / Hosek-Wilkie /
+    Preetham) into a numpy `(h, w, 3)` float32 linear-RGB array.
+
+    `ShaderNodeTexSky` has no Python eval entry-point, so we ask Cycles to
+    do the work: a temp scene with a PANO/EQUIRECTANGULAR camera at the
+    origin renders the world to a 32-bit-float OpenEXR, which we load
+    back in and read into numpy. The temp scene contains zero geometry,
+    so this is fast (~0.25 s for 1024×512 in a CPU build) and doesn't
+    depend on the user's scene contents. Cycles' equirectangular camera
+    uses the same spherical convention as ShaderNodeTexEnvironment, so
+    the result plugs into the existing envmap branch with
+    `rotation_z_rad = 0.0`, matching how an authored env-map .exr would
+    behave. (`sun_rotation` and the rest of the Sky Texture's controls
+    are already folded into the rendered pixels.)
+
+    Returns `(rgb, w, h)` where `rgb` is contiguous float32 of shape
+    `(h, w, 3)` in linear RGB. Returns `None` on any failure path; the
+    caller is expected to log a warning and fall back.
+    """
+    import os
+    import tempfile
+    import numpy as np
+
+    tmp = bpy.data.scenes.new("__vibrt_sky_bake_scene")
+    tmp.world = world
+    tmp.render.engine = "CYCLES"
+    # Sky Texture is smooth — a handful of samples is enough; this is the
+    # render budget for the bake itself, not the user's final render.
+    try:
+        tmp.cycles.samples = 16
+        tmp.cycles.use_denoising = False
+    except Exception:
+        pass
+    tmp.render.resolution_x = int(w)
+    tmp.render.resolution_y = int(h)
+    tmp.render.resolution_percentage = 100
+    tmp.render.image_settings.file_format = 'OPEN_EXR'
+    tmp.render.image_settings.color_mode = 'RGB'
+    tmp.render.image_settings.color_depth = '32'
+    # Don't punch through the world background — we want to capture it.
+    tmp.render.film_transparent = False
+    # Output linear-light pixels straight from the renderer (no display
+    # transform / Filmic curve / exposure tweaks). The downstream texture
+    # pipeline marks the texture `colorspace="linear"` and the engine
+    # samples it as raw radiance.
+    try:
+        tmp.view_settings.view_transform = 'Raw'
+        tmp.view_settings.look = 'None'
+        tmp.view_settings.exposure = 0.0
+        tmp.view_settings.gamma = 1.0
+    except Exception:
+        pass
+
+    # PANO/EQUIRECTANGULAR camera at world origin. Cycles uses the
+    # "physics" sphere convention: u sweeps phi around the up-axis (Z),
+    # v sweeps theta from north (+Z) to south (-Z). Camera default
+    # orientation (0,0,0 Euler) has -Z forward / +Y up — exactly the
+    # frame ShaderNodeTexEnvironment expects, so no rotation is needed
+    # here.
+    cam_data = bpy.data.cameras.new("__vibrt_sky_bake_cam")
+    cam_data.type = 'PANO'
+    try:
+        cam_data.cycles.panorama_type = 'EQUIRECTANGULAR'
+    except Exception:
+        pass
+    cam = bpy.data.objects.new("__vibrt_sky_bake_cam", cam_data)
+    cam.location = (0.0, 0.0, 0.0)
+    cam.rotation_euler = (0.0, 0.0, 0.0)
+    tmp.collection.objects.link(cam)
+    tmp.camera = cam
+
+    # Render to a unique temp .exr; we read the pixels back into numpy
+    # and unlink.
+    fd, exr_path = tempfile.mkstemp(prefix="vibrt_sky_", suffix=".exr")
+    os.close(fd)
+    tmp.render.filepath = exr_path
+    img_loaded = None
+    rgb = None
+    try:
+        # Pass the scene name explicitly so the operator targets our temp
+        # scene instead of bpy.context.scene (we don't switch the window
+        # context, so this is the only way to direct the render). Note:
+        # Blender silently produces an all-zero image when this runs from
+        # inside `RenderEngine.render()` — the bake MUST be called from
+        # `RenderEngine.update()` (or another non-rendering context). The
+        # caller (engine.py) drives that.
+        bpy.ops.render.render(scene=tmp.name, write_still=True)
+        img_loaded = bpy.data.images.load(exr_path)
+        # Mark linear so colourspace conversion is skipped on read.
+        img_loaded.colorspace_settings.name = 'Non-Color'
+        iw, ih = int(img_loaded.size[0]), int(img_loaded.size[1])
+        if iw == 0 or ih == 0:
+            return None
+        ch = int(img_loaded.channels) or 4
+        # Read RGBA into a flat numpy buffer, then drop the alpha channel
+        # — envmaps are always 3-channel radiance for vibrt. We do this
+        # while the .exr is still on disk, because Blender's image data
+        # is lazily decoded; deleting the file before this read can yield
+        # an "image has no data" error on subsequent renders.
+        flat = np.empty(iw * ih * ch, dtype=np.float32)
+        img_loaded.pixels.foreach_get(flat)
+        arr = flat.reshape((ih, iw, ch))
+        rgb = np.ascontiguousarray(arr[..., :3], dtype=np.float32)
+    finally:
+        try:
+            if img_loaded is not None:
+                bpy.data.images.remove(img_loaded, do_unlink=True)
+        except Exception:
+            pass
+        # Tear down the temp scene and camera.
+        try:
+            bpy.data.objects.remove(cam, do_unlink=True)
+        except Exception:
+            pass
+        try:
+            bpy.data.cameras.remove(cam_data, do_unlink=True)
+        except Exception:
+            pass
+        try:
+            bpy.data.scenes.remove(tmp, do_unlink=True)
+        except Exception:
+            pass
+        try:
+            os.unlink(exr_path)
+        except Exception:
+            pass
+    if rgb is None:
+        return None
+    return rgb, int(w), int(h)
+
+
 def _export_world(world, writer, textures: list) -> dict:
     if world is None or not world.use_nodes:
         col = list(world.color)[:3] if world else [0.05, 0.05, 0.05]
@@ -652,6 +895,41 @@ def _export_world(world, writer, textures: list) -> dict:
                         "type": "envmap",
                         "texture": tex_id,
                         "rotation_z_rad": rotation_z_rad,
+                        "strength": float(strength),
+                    }
+            elif linked.bl_idname == "ShaderNodeTexSky":
+                # Procedural sky (Nishita / Hosek-Wilkie / Preetham). The
+                # actual bake — a tiny equirectangular Cycles render of
+                # the sky world — runs in `RenderEngine.update()` (see
+                # engine.py and `prebake_sky_envmaps_for_world`); it
+                # CANNOT run inside the exporter because we're already
+                # inside `RenderEngine.render()`, and Cycles silently
+                # produces an all-zero image for nested renders. Here we
+                # just look up the cached pixels and route them through
+                # `_PreBakedTexture` so they land on the world dict as a
+                # regular envmap.
+                key = _sky_node_cache_key(world, linked)
+                baked = _SKY_BAKE_CACHE.get(key)
+                if baked is None:
+                    _emit(
+                        f"[vibrt] warn: world {world.name!r}: "
+                        f"ShaderNodeTexSky ({linked.sky_type}) was not "
+                        f"pre-baked (key={key!r}) — falling back to "
+                        f"constant background. Was the engine.update() "
+                        f"hook invoked?"
+                    )
+                else:
+                    rgb, bw, bh = baked
+                    pb = material_export._PreBakedTexture(
+                        rgb=rgb, w=bw, h=bh, cache_key=key,
+                    )
+                    tex_id = material_export.export_image_texture(
+                        pb, writer, textures, colorspace="linear"
+                    )
+                    return {
+                        "type": "envmap",
+                        "texture": tex_id,
+                        "rotation_z_rad": 0.0,
                         "strength": float(strength),
                     }
             elif linked.bl_idname == "ShaderNodeRGB":

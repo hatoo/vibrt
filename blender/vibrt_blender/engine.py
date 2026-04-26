@@ -23,6 +23,29 @@ class VibrtRenderEngine(bpy.types.RenderEngine):
     bl_use_preview = False
     bl_use_shading_nodes_custom = False
 
+    def update(self, data=None, depsgraph=None):
+        # `update()` is Blender's "prepare-to-render" hook. We use it to
+        # pre-bake any procedural Sky Texture (Nishita / Hosek-Wilkie /
+        # Preetham) the user has on their World — that involves running a
+        # nested `bpy.ops.render.render` against a temp scene, which
+        # Blender silently turns into an all-zero render if invoked from
+        # `render()` but works fine here. Pixels land in the
+        # `_SKY_BAKE_CACHE` keyed by the Sky Texture's controls; the
+        # exporter (which runs inside render()) reads from the cache.
+        scene = bpy.context.scene if data is None else (
+            getattr(data, "scene", None) or bpy.context.scene
+        )
+        try:
+            exporter.clear_sky_bake_cache()
+            exporter.prebake_sky_envmaps_for_world(scene.world)
+        except Exception as ex:
+            # Don't take down the whole render if the bake fails — emit a
+            # visible warning and let _export_world fall back to constant.
+            self.report(
+                {"WARNING"},
+                f"vibrt: sky pre-bake in update() failed: {ex}",
+            )
+
     def render(self, depsgraph: bpy.types.Depsgraph):
         scene = depsgraph.scene_eval
         rd = scene.render
