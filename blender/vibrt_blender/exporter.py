@@ -55,8 +55,12 @@ def _try_emissive_quad_as_rect_light(obj, obj_eval, mat_params):
     if mat_params.get("transmission", 0.0) > 0.0:
         return None
     for k in ("base_color_tex", "color_graph", "normal_tex", "roughness_tex",
-              "metallic_tex", "bump_tex"):
+              "metallic_tex", "bump_tex", "emission_tex"):
         if k in mat_params:
+            # An emission texture (cloud panel, billboard, screen) carries
+            # per-pixel detail the constant-radiance area_rect can't
+            # reproduce. Promoting it to a rect light would render it as a
+            # uniform glowing rectangle and drop the cloud / image.
             return None
 
     mesh = obj_eval.data
