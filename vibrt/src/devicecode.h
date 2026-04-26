@@ -19,6 +19,16 @@ struct ColorGraphNode {
 #define COLOR_NODE_BRIGHT_CONTRAST 7u
 #define COLOR_NODE_VERTEX_COLOR 8u
 
+/// Homogeneous volume parameters. Mirrors `gpu_types::VolumeGpu`.
+struct Volume {
+  float sigma_t[3];
+  float _pad0;
+  float sigma_s[3];
+  float _pad1;
+  float emission[3];
+  float anisotropy;
+};
+
 struct PrincipledGpu {
   float base_color[3];
   float metallic;
@@ -76,6 +86,8 @@ struct PrincipledGpu {
   ColorGraphNode *color_graph_nodes;
   int color_graph_len;
   int color_graph_output;
+  Volume *volume;       // nullptr if the material has no volume
+  int volume_only;      // 1 if Surface socket is unlinked (boundary is invisible)
 };
 
 struct HitGroupData {
@@ -177,6 +189,10 @@ struct LaunchParams {
   // `normal_aov` is in camera space: X=right, Y=up, Z=forward.
   float *albedo_aov;
   float *normal_aov;
+
+  // Global homogeneous volume that fills the scene (atmospheric haze).
+  // nullptr = vacuum. Always sits at the bottom of the volume stack.
+  Volume *world_volume;
 };
 
 struct RayGenData {};

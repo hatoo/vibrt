@@ -285,6 +285,110 @@ static __forceinline__ __device__ float3 f_avg_schlick(float3 F0) {
          make_float3(1.0f / 21.0f, 1.0f / 21.0f, 1.0f / 21.0f);
 }
 
+// ---------- Volumes (homogeneous, Henyey-Greenstein phase) ----------
+
+// Maximum nesting depth for mesh-bounded volumes within a single ray. Four is
+// generous: real scenes top out at "two overlapping volumes" (e.g. a fog cube
+// inside a smoke cube). World volume sits implicitly below the stack.
+#define VOL_STACK_MAX 4
+
+struct VolumeStack {
+  const Volume *entries[VOL_STACK_MAX];
+  int depth;
+};
+
+static __forceinline__ __device__ const Volume *
+volume_stack_top(const VolumeStack &s) {
+  if (s.depth > 0)
+    return s.entries[s.depth - 1];
+  return params.world_volume; // may be nullptr (vacuum)
+}
+
+static __forceinline__ __device__ void
+volume_stack_push(VolumeStack &s, const Volume *v) {
+  if (v == nullptr)
+    return;
+  if (s.depth < VOL_STACK_MAX)
+    s.entries[s.depth++] = v;
+  // Overflow silently — losing the deepest nesting is preferable to corrupt
+  // memory; the scene would already be pathological at this nesting depth.
+}
+
+static __forceinline__ __device__ void
+volume_stack_pop(VolumeStack &s, const Volume *v) {
+  // Pop by reference equality scanned from top. BVH order isn't strict LIFO
+  // (a back-face exit can come before the matching front-face entry was
+  // recorded if rays miss tessellation), so a strict pop would desync.
+  for (int i = s.depth - 1; i >= 0; i--) {
+    if (s.entries[i] == v) {
+      for (int j = i; j < s.depth - 1; j++)
+        s.entries[j] = s.entries[j + 1];
+      s.depth--;
+      return;
+    }
+  }
+}
+
+// Average per-channel σ_t — used as the scalar pdf for distance sampling.
+// We then track per-channel beam transmittance separately so chromatic
+// volumes don't lose colour information through the sampler.
+static __forceinline__ __device__ float vol_sigma_t_avg(const Volume *v) {
+  return (v->sigma_t[0] + v->sigma_t[1] + v->sigma_t[2]) * (1.0f / 3.0f);
+}
+
+static __forceinline__ __device__ float3 vol_beam_transmittance(const Volume *v,
+                                                                float t) {
+  return make_float3(expf(-v->sigma_t[0] * t), expf(-v->sigma_t[1] * t),
+                     expf(-v->sigma_t[2] * t));
+}
+
+// Closed-form path emission integral over [0, t] for a homogeneous volume:
+//   ∫_0^t exp(-σ_t s) σ_e ds = σ_e/σ_t · (1 - exp(-σ_t t))   (per channel)
+// Computed deterministically — no MC noise from emissive media. Falls back
+// to σ_e · t in the σ_t→0 limit (Beer-Lambert is identity, integrand = σ_e).
+static __device__ float3 vol_path_emission(const Volume *v, float t) {
+  float3 e = make_float3(v->emission[0], v->emission[1], v->emission[2]);
+  if (e.x <= 0.0f && e.y <= 0.0f && e.z <= 0.0f)
+    return make_float3(0, 0, 0);
+  auto component = [t](float sig_t, float em) {
+    if (em <= 0.0f)
+      return 0.0f;
+    if (sig_t < 1e-8f)
+      return em * t;
+    return em * (1.0f - expf(-sig_t * t)) / sig_t;
+  };
+  return make_float3(component(v->sigma_t[0], e.x),
+                     component(v->sigma_t[1], e.y),
+                     component(v->sigma_t[2], e.z));
+}
+
+// Henyey-Greenstein phase function p(cos θ) and importance sampling.
+// p(μ) = (1 - g²) / (4π · (1 + g² - 2g·μ)^(3/2))
+static __forceinline__ __device__ float phase_hg_eval(float g, float cos_theta) {
+  float g2 = g * g;
+  float denom = 1.0f + g2 - 2.0f * g * cos_theta;
+  return (1.0f - g2) /
+         (4.0f * M_PIf * sqrtf(fmaxf(denom, 1e-12f)) * fmaxf(denom, 1e-12f));
+}
+
+// Sample a scatter direction from HG phase, returned in the local frame
+// {x = T_perp1, y = T_perp2, z = forward}. Caller transforms to world.
+static __device__ float3 phase_hg_sample(float g, float u1, float u2,
+                                         float &pdf) {
+  float cos_theta;
+  if (fabsf(g) < 1e-3f) {
+    cos_theta = 1.0f - 2.0f * u1; // isotropic
+  } else {
+    float k = (1.0f - g * g) / (1.0f - g + 2.0f * g * u1);
+    cos_theta = (1.0f + g * g - k * k) / (2.0f * g);
+  }
+  cos_theta = fmaxf(-1.0f, fminf(1.0f, cos_theta));
+  float sin_theta = sqrtf(fmaxf(0.0f, 1.0f - cos_theta * cos_theta));
+  float phi = 2.0f * M_PIf * u2;
+  pdf = phase_hg_eval(g, cos_theta);
+  return make_float3(sin_theta * cosf(phi), sin_theta * sinf(phi), cos_theta);
+}
+
 // ---------- Path tracing payload ----------
 struct PathVertex {
   float3 P;  // hit position
@@ -443,6 +547,85 @@ static __device__ bool shadow_visible(float3 P, float3 dir, float tmax) {
                  OPTIX_RAY_FLAG_DISABLE_CLOSESTHIT,
              1, 2, 1, miss_flag);
   return miss_flag != 0;
+}
+
+// Same visibility query, but returns RGB beam transmittance through any
+// volumes the shadow ray traverses on its way to the light. Volume-only
+// boundaries are walked iteratively (CH fires on the radiance hit group,
+// updates the local stack, and we re-trace from the next epsilon).
+//
+// Returns (0, 0, 0) on opaque occlusion. Capped at `VOL_STACK_MAX * 4`
+// trace iterations to bound the worst case (alternating boundary
+// crossings); past that we conservatively assume the light is unreachable
+// — pathological scenes only.
+static __device__ float3 shadow_transmittance(float3 P, float3 dir, float tmax,
+                                              VolumeStack stack) {
+  // Fast path: no volumes anywhere. Standard binary visibility.
+  if (params.world_volume == nullptr && stack.depth == 0) {
+    return shadow_visible(P, dir, tmax) ? make_float3(1, 1, 1)
+                                        : make_float3(0, 0, 0);
+  }
+
+  float3 tr = make_float3(1, 1, 1);
+  float3 cur_origin = P;
+  float remaining = tmax;
+  const int max_iters = VOL_STACK_MAX * 4 + 4;
+
+  for (int iter = 0; iter < max_iters; iter++) {
+    if (remaining <= 1e-4f)
+      return tr;
+
+    // Trace using the radiance ray type so CH fires and we get hit info.
+    PathVertex v;
+    v.hit = 0;
+    unsigned int hi, lo;
+    pack_ptr(&v, hi, lo);
+    optixTrace(params.traversable, cur_origin, dir, 1e-4f, remaining - 1e-3f,
+               0.0f, OptixVisibilityMask(0x02), OPTIX_RAY_FLAG_NONE, 0, 2, 0,
+               hi, lo);
+
+    const Volume *cur_vol = volume_stack_top(stack);
+    float t_seg;
+    if (v.hit == 0) {
+      t_seg = remaining; // ran out before any geometry
+    } else {
+      float3 d = v.P - cur_origin;
+      t_seg = sqrtf(dot3(d, d));
+    }
+
+    // Beam transmittance through the current volume on this segment.
+    if (cur_vol != nullptr) {
+      tr = tr * vol_beam_transmittance(cur_vol, t_seg);
+      if (luminance(tr) < 1e-6f)
+        return make_float3(0, 0, 0);
+    }
+
+    if (v.hit == 0)
+      return tr; // reached light
+
+    // Surface in the way. If it's a pure volume container, update stack and
+    // continue past it; otherwise it occludes (transparent-shadow handling
+    // for transmissive materials still happens via __anyhit__ah).
+    if (v.mat != nullptr && v.mat->volume != nullptr &&
+        v.mat->volume_only != 0) {
+      bool entering = dot3(v.Ng, dir) < 0.0f;
+      if (entering)
+        volume_stack_push(stack, v.mat->volume);
+      else
+        volume_stack_pop(stack, v.mat->volume);
+      // Advance just past the surface. Use ray dir (not Ng) — we want to
+      // stay on the same side of the boundary we just crossed.
+      float p_scale =
+          fmaxf(fmaxf(fabsf(v.P.x), fabsf(v.P.y)), fabsf(v.P.z));
+      float eps = fmaxf(1e-4f, p_scale * 1e-5f);
+      cur_origin = v.P + dir * eps;
+      remaining -= t_seg + eps;
+      continue;
+    }
+    return make_float3(0, 0, 0); // opaque occlusion
+  }
+  // Exceeded the iteration cap — conservatively block.
+  return make_float3(0, 0, 0);
 }
 
 // ---------- Colour graph evaluator ----------
@@ -1306,8 +1489,18 @@ static __device__ BsdfSample sample_bsdf(const MaterialEval &e, float3 wo,
 }
 
 // ---------- Direct lighting (NEE) ----------
+//
+// `vstack` is the shadow ray's starting volume stack. For surface NEE this is
+// the same stack `trace_path` is currently maintaining; for in-scatter volume
+// NEE the caller does the same thing (the scatter point is *inside* the
+// current volume, not on a boundary, so the stack starts unchanged).
+//
+// `shadow_transmittance` returns RGB so each light contribution is attenuated
+// by the per-channel volume transmittance. On scenes without volumes it
+// short-circuits to the legacy binary `shadow_visible` path.
 static __device__ float3 direct_light(const MaterialEval &e, float3 P,
-                                      float3 wo, RNG &rng) {
+                                      float3 wo, RNG &rng,
+                                      const VolumeStack &vstack) {
   float3 L = make_float3(0, 0, 0);
 
   // Point lights: sample centre (simple)
@@ -1318,10 +1511,11 @@ static __device__ float3 direct_light(const MaterialEval &e, float3 P,
     if (d < 1e-4f)
       continue;
     float3 wi = ld / d;
-    if (!shadow_visible(P, wi, d))
+    float3 vis = shadow_transmittance(P, wi, d, vstack);
+    if (luminance(vis) <= 0.0f)
       continue;
     BsdfEval b = eval_bsdf(e, wo, wi);
-    L = L + b.f * make_f3(pl.emission) / fmaxf(d * d, 1e-6f);
+    L = L + b.f * vis * make_f3(pl.emission) / fmaxf(d * d, 1e-6f);
   }
 
   // Sun lights: sample within cone
@@ -1339,10 +1533,11 @@ static __device__ float3 direct_light(const MaterialEval &e, float3 P,
     build_frame(dir, T, B);
     float3 wi =
         normalize3(T * (st * cosf(phi)) + B * (st * sinf(phi)) + dir * ct);
-    if (!shadow_visible(P, wi, 1e20f))
+    float3 vis = shadow_transmittance(P, wi, 1e20f, vstack);
+    if (luminance(vis) <= 0.0f)
       continue;
     BsdfEval b = eval_bsdf(e, wo, wi);
-    L = L + b.f * make_f3(sl.emission);
+    L = L + b.f * vis * make_f3(sl.emission);
   }
 
   // Spot lights
@@ -1363,10 +1558,12 @@ static __device__ float3 direct_light(const MaterialEval &e, float3 P,
           (cos_a - sp.cos_outer) / fmaxf(sp.cos_inner - sp.cos_outer, 1e-4f);
       falloff = t * t * (3.0f - 2.0f * t);
     }
-    if (!shadow_visible(P, wi, d))
+    float3 vis = shadow_transmittance(P, wi, d, vstack);
+    if (luminance(vis) <= 0.0f)
       continue;
     BsdfEval b = eval_bsdf(e, wo, wi);
-    L = L + b.f * make_f3(sp.emission) * falloff / fmaxf(d * d, 1e-6f);
+    L = L + b.f * vis * make_f3(sp.emission) * falloff /
+                fmaxf(d * d, 1e-6f);
   }
 
   // Area rect lights: sample one proportional to power
@@ -1391,14 +1588,17 @@ static __device__ float3 direct_light(const MaterialEval &e, float3 P,
         // surface points on either side of the panel see it.
         if (ar.two_sided != 0u)
           cos_light = fabsf(cos_light);
-        if (cos_light > 0.0f && shadow_visible(P, wi, d)) {
-          BsdfEval b = eval_bsdf(e, wo, wi);
-          float area = ar.size_u * ar.size_v;
-          float pdf_area = 1.0f / fmaxf(area, 1e-8f);
-          float pdf_solid = pdf_area * d2 / cos_light;
-          float pdf = pdf_solid * pmf_light;
-          if (pdf > 0.0f) {
-            L = L + b.f * make_f3(ar.emission) / pdf;
+        if (cos_light > 0.0f) {
+          float3 vis = shadow_transmittance(P, wi, d, vstack);
+          if (luminance(vis) > 0.0f) {
+            BsdfEval b = eval_bsdf(e, wo, wi);
+            float area = ar.size_u * ar.size_v;
+            float pdf_area = 1.0f / fmaxf(area, 1e-8f);
+            float pdf_solid = pdf_area * d2 / cos_light;
+            float pdf = pdf_solid * pmf_light;
+            if (pdf > 0.0f) {
+              L = L + b.f * vis * make_f3(ar.emission) / pdf;
+            }
           }
         }
       }
@@ -1408,15 +1608,139 @@ static __device__ float3 direct_light(const MaterialEval &e, float3 P,
   // Envmap: one importance sample, MIS-weighted against BSDF sampling.
   if (params.world_type == 1 && params.envmap_integral > 0.0f) {
     EnvSample es = sample_envmap(rng);
-    if (es.pdf > 0.0f && shadow_visible(P, es.dir, 1e20f)) {
-      BsdfEval b = eval_bsdf(e, wo, es.dir);
-      if (b.pdf > 0.0f) {
-        float w = power_heuristic(es.pdf, b.pdf);
-        L = L + b.f * es.L * (w / es.pdf);
+    if (es.pdf > 0.0f) {
+      float3 vis = shadow_transmittance(P, es.dir, 1e20f, vstack);
+      if (luminance(vis) > 0.0f) {
+        BsdfEval b = eval_bsdf(e, wo, es.dir);
+        if (b.pdf > 0.0f) {
+          float w = power_heuristic(es.pdf, b.pdf);
+          L = L + b.f * vis * es.L * (w / es.pdf);
+        }
       }
     }
   }
 
+  return L;
+}
+
+// In-scatter NEE for volume scatter events. Same lights as `direct_light`
+// but the BSDF role is played by the HG phase function and there's no
+// `MaterialEval` — the scatter point is in free space inside `vol`.
+//
+// `wi_world` is the incoming ray direction (so wo_world = -wi_world is the
+// "outgoing" direction back toward the scatter event's predecessor); the
+// phase function depends on the angle between wi_world and the chosen
+// shadow direction. PDFs aren't MIS-weighted against phase sampling here —
+// volume MIS only matters at scatter events that are followed by another
+// MIS-able interaction, and one-sample importance sampling of the lights
+// is already a substantial improvement over BSDF-only.
+static __device__ float3 direct_light_volume(float3 P, float3 wi_world,
+                                              const Volume *vol,
+                                              const VolumeStack &vstack,
+                                              RNG &rng) {
+  float3 L = make_float3(0, 0, 0);
+  float g = vol->anisotropy;
+
+  auto add = [&](float3 wi, float3 emission, float3 vis) {
+    float cos_t = dot3(wi_world, wi);
+    float ph = phase_hg_eval(g, cos_t);
+    L = L + vis * emission * ph;
+  };
+
+  for (int i = 0; i < params.num_point_lights; i++) {
+    PointLight &pl = params.point_lights[i];
+    float3 ld = make_f3(pl.position) - P;
+    float d = sqrtf(dot3(ld, ld));
+    if (d < 1e-4f)
+      continue;
+    float3 wi = ld / d;
+    float3 vis = shadow_transmittance(P, wi, d, vstack);
+    if (luminance(vis) <= 0.0f)
+      continue;
+    add(wi, make_f3(pl.emission) / fmaxf(d * d, 1e-6f), vis);
+  }
+  for (int i = 0; i < params.num_sun_lights; i++) {
+    SunLight &sl = params.sun_lights[i];
+    float3 dir = make_f3(sl.direction);
+    float cos_a = sl.cos_angle;
+    float u1 = rng.next();
+    float u2 = rng.next();
+    float ct = 1.0f - u1 * (1.0f - cos_a);
+    float st = sqrtf(fmaxf(0.0f, 1.0f - ct * ct));
+    float phi = 2.0f * M_PIf * u2;
+    float3 T, B;
+    build_frame(dir, T, B);
+    float3 wi =
+        normalize3(T * (st * cosf(phi)) + B * (st * sinf(phi)) + dir * ct);
+    float3 vis = shadow_transmittance(P, wi, 1e20f, vstack);
+    if (luminance(vis) <= 0.0f)
+      continue;
+    add(wi, make_f3(sl.emission), vis);
+  }
+  for (int i = 0; i < params.num_spot_lights; i++) {
+    SpotLight &sp = params.spot_lights[i];
+    float3 ld = make_f3(sp.position) - P;
+    float d = sqrtf(dot3(ld, ld));
+    if (d < 1e-4f)
+      continue;
+    float3 wi = ld / d;
+    float cos_a = dot3(make_f3(sp.direction), -wi);
+    if (cos_a <= sp.cos_outer)
+      continue;
+    float falloff = 1.0f;
+    if (cos_a < sp.cos_inner) {
+      float t =
+          (cos_a - sp.cos_outer) / fmaxf(sp.cos_inner - sp.cos_outer, 1e-4f);
+      falloff = t * t * (3.0f - 2.0f * t);
+    }
+    float3 vis = shadow_transmittance(P, wi, d, vstack);
+    if (luminance(vis) <= 0.0f)
+      continue;
+    add(wi, make_f3(sp.emission) * falloff / fmaxf(d * d, 1e-6f), vis);
+  }
+  if (params.num_rect_lights > 0) {
+    float u = rng.next();
+    int idx = cdf_search(params.rect_light_cdf, params.num_rect_lights, u);
+    AreaRectLight &ar = params.rect_lights[idx];
+    float pmf_light =
+        (params.rect_light_cdf[idx + 1] - params.rect_light_cdf[idx]);
+    if (pmf_light > 0.0f) {
+      float su = rng.next();
+      float sv = rng.next();
+      float3 Pl = make_f3(ar.corner) + make_f3(ar.u_axis) * (su * ar.size_u) +
+                  make_f3(ar.v_axis) * (sv * ar.size_v);
+      float3 ld = Pl - P;
+      float d2 = dot3(ld, ld);
+      float d = sqrtf(d2);
+      if (d > 1e-4f) {
+        float3 wi = ld / d;
+        float cos_light = -dot3(make_f3(ar.normal), wi);
+        if (ar.two_sided != 0u)
+          cos_light = fabsf(cos_light);
+        if (cos_light > 0.0f) {
+          float3 vis = shadow_transmittance(P, wi, d, vstack);
+          if (luminance(vis) > 0.0f) {
+            float area = ar.size_u * ar.size_v;
+            float pdf_area = 1.0f / fmaxf(area, 1e-8f);
+            float pdf_solid = pdf_area * d2 / cos_light;
+            float pdf = pdf_solid * pmf_light;
+            if (pdf > 0.0f) {
+              add(wi, make_f3(ar.emission) / pdf, vis);
+            }
+          }
+        }
+      }
+    }
+  }
+  if (params.world_type == 1 && params.envmap_integral > 0.0f) {
+    EnvSample es = sample_envmap(rng);
+    if (es.pdf > 0.0f) {
+      float3 vis = shadow_transmittance(P, es.dir, 1e20f, vstack);
+      if (luminance(vis) > 0.0f) {
+        add(es.dir, es.L * (1.0f / es.pdf), vis);
+      }
+    }
+  }
   return L;
 }
 
@@ -1527,6 +1851,18 @@ extern "C" __global__ void __anyhit__ah() {
   bool is_shadow_ray =
       (optixGetRayFlags() & OPTIX_RAY_FLAG_TERMINATE_ON_FIRST_HIT) != 0;
   if (is_shadow_ray && m->transmission > 0.5f) {
+    optixIgnoreIntersection();
+  }
+  // Pure volume-container surfaces are invisible to *binary* shadow rays
+  // (the legacy `shadow_visible` path used by surface NEE on volumeless
+  // scenes — TERMINATE_ON_FIRST_HIT is set there). Without this check the
+  // smoke's mesh would shadow lights behind it as if it were opaque.
+  //
+  // We do NOT skip volume_only surfaces on radiance rays — `trace_path`
+  // depends on closest-hit firing at the boundary so it can update the
+  // volume stack. `shadow_transmittance` similarly uses the radiance ray
+  // type (no terminate-on-first-hit) so CH runs there too.
+  if (is_shadow_ray && m->volume != nullptr && m->volume_only != 0) {
     optixIgnoreIntersection();
   }
   if (m->alpha_threshold <= 0.0f || m->base_color_tex == nullptr)
@@ -1653,6 +1989,8 @@ static __device__ float3 trace_path(float3 origin, float3 dir, RNG &rng) {
   float3 L = make_float3(0, 0, 0);
   bool last_specular = true;
   float prev_bsdf_pdf = 0.0f;
+  VolumeStack vstack;
+  vstack.depth = 0;
 
   for (unsigned int bounce = 0; bounce < params.max_depth; bounce++) {
     PathVertex v;
@@ -1675,6 +2013,78 @@ static __device__ float3 trace_path(float3 origin, float3 dir, RNG &rng) {
     }
     float t_rect;
     int rect_idx = intersect_rect_lights(origin, dir, 1e-4f, t_geom, t_rect);
+    float t_segment = (rect_idx >= 0) ? t_rect : t_geom;
+
+    // Volume distance sampling: if we're currently inside a volume, decide
+    // whether the ray scatters before reaching the next surface/light. Path
+    // emission is integrated in closed form over the entire segment so
+    // emissive media don't add MC noise.
+    const Volume *cur_vol = volume_stack_top(vstack);
+    if (cur_vol != nullptr) {
+      float sigma_t_avg = vol_sigma_t_avg(cur_vol);
+      if (sigma_t_avg > 1e-12f) {
+        float u = rng.next();
+        float t_scatter =
+            -logf(fmaxf(1.0f - u, 1e-30f)) / sigma_t_avg;
+        if (t_scatter < t_segment) {
+          // --- Volume scatter event ---
+          // Path emission [0, t_scatter] (deterministic, noise-free).
+          L = L + throughput * vol_path_emission(cur_vol, t_scatter);
+          float3 P_scatter = origin + dir * t_scatter;
+          float3 tr = vol_beam_transmittance(cur_vol, t_scatter);
+          float pdf_t = sigma_t_avg * expf(-sigma_t_avg * t_scatter);
+          float3 sigma_s = make_float3(cur_vol->sigma_s[0],
+                                       cur_vol->sigma_s[1],
+                                       cur_vol->sigma_s[2]);
+          throughput = throughput * tr * sigma_s / fmaxf(pdf_t, 1e-30f);
+
+          // In-scatter NEE: phase-weighted contribution from each light.
+          float3 nee = throughput * direct_light_volume(P_scatter, dir,
+                                                         cur_vol, vstack, rng);
+          if (bounce > 0)
+            nee = clamp_indirect(nee, params.clamp_indirect);
+          L = L + nee;
+
+          // Sample new direction via HG phase function. Frame is built
+          // around the previous direction so wi_local.z corresponds to
+          // forward scatter.
+          float u1 = rng.next();
+          float u2 = rng.next();
+          float pdf_phase;
+          float3 wi_local =
+              phase_hg_sample(cur_vol->anisotropy, u1, u2, pdf_phase);
+          float3 T_frame, B_frame;
+          build_frame(dir, T_frame, B_frame);
+          float3 wi = T_frame * wi_local.x + B_frame * wi_local.y +
+                      dir * wi_local.z;
+          // Phase sampling is exact (sampled from p / pdf == 1), so no
+          // additional throughput multiplier is needed.
+          last_specular = false;
+          prev_bsdf_pdf = pdf_phase;
+
+          if (bounce >= 3) {
+            float q = fminf(fmaxf(luminance(throughput), 0.05f), 0.95f);
+            if (rng.next() > q)
+              break;
+            throughput = throughput / q;
+          }
+          origin = P_scatter;
+          dir = wi;
+          continue;
+        }
+        // No scatter — path emission across the full segment, then apply
+        // beam transmittance to the endpoint and divide by survival prob so
+        // the no-scatter branch stays an unbiased estimator.
+        L = L + throughput * vol_path_emission(cur_vol, t_segment);
+        float3 tr = vol_beam_transmittance(cur_vol, t_segment);
+        float pdf_surv = expf(-sigma_t_avg * t_segment);
+        throughput = throughput * tr / fmaxf(pdf_surv, 1e-30f);
+      } else {
+        // Pure emitter (σ_t = 0): only path emission, no transmittance work.
+        L = L + throughput * vol_path_emission(cur_vol, t_segment);
+      }
+    }
+
     if (rect_idx >= 0) {
       // Hit a camera-visible area light in front of any geometry. Hidden
       // rects are pre-filtered by intersect_rect_lights and never reach
@@ -1704,6 +2114,28 @@ static __device__ float3 trace_path(float3 origin, float3 dir, RNG &rng) {
       break;
     }
 
+    // Volume-only boundary surface: invisible to shading. Update the volume
+    // stack and pass straight through. Costs a bounce only if the boundary
+    // surface ends up nested inside another bounded volume; the common
+    // single-volume case still resolves in the next iteration.
+    if (v.mat != nullptr && v.mat->volume != nullptr &&
+        v.mat->volume_only != 0) {
+      bool entering = dot3(v.Ng, dir) < 0.0f;
+      if (entering)
+        volume_stack_push(vstack, v.mat->volume);
+      else
+        volume_stack_pop(vstack, v.mat->volume);
+      float p_scale = fmaxf(fmaxf(fabsf(v.P.x), fabsf(v.P.y)), fabsf(v.P.z));
+      float eps = fmaxf(1e-4f, p_scale * 1e-5f);
+      origin = v.P + dir * eps;
+      // Don't bump bounce count — the boundary is invisible, treating it as
+      // a bounce would shorten paths gratuitously inside dense volumes.
+      // The for-loop still advances `bounce`, but in practice volume
+      // boundaries are rare enough that the few-extra-iterations cost is
+      // negligible and the semantics stay simple.
+      continue;
+    }
+
     MaterialEval e = eval_material(v);
     // Flip normal if ray hit backside (for dielectric transmission). Mirror
     // the bitangent instead of rebuilding the frame so the authored tangent
@@ -1728,7 +2160,7 @@ static __device__ float3 trace_path(float3 origin, float3 dir, RNG &rng) {
 
     // NEE
     float3 wo = -dir;
-    float3 nee = throughput * direct_light(e, v.P, wo, rng);
+    float3 nee = throughput * direct_light(e, v.P, wo, rng, vstack);
     if (bounce > 0)
       nee = clamp_indirect(nee, params.clamp_indirect);
     L = L + nee;
@@ -1748,6 +2180,20 @@ static __device__ float3 trace_path(float3 origin, float3 dir, RNG &rng) {
       if (rng.next() > q)
         break;
       throughput = throughput / q;
+    }
+
+    // If the surface has a volume container (Surface + Volume both
+    // authored — e.g. coloured glass with subsurface fog), update the
+    // volume stack on transmission. Reflection keeps us on the same side.
+    if (v.mat != nullptr && v.mat->volume != nullptr) {
+      bool was_outside_to_inside = dot3(v.Ng, dir) < 0.0f;
+      bool now_outside_to_inside = dot3(v.Ng, bs.wi) < 0.0f;
+      if (was_outside_to_inside != now_outside_to_inside) {
+        if (now_outside_to_inside)
+          volume_stack_push(vstack, v.mat->volume);
+        else
+          volume_stack_pop(vstack, v.mat->volume);
+      }
     }
 
     // Offset along geometric normal to reduce self-intersection. Scale with

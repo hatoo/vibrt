@@ -942,6 +942,189 @@ def _blackbody_to_linear_rgb(kelvin: float) -> list[float]:
     return [s2l(c) for c in rgb_srgb]
 
 
+# ---------- Volume shaders ----------
+#
+# Resolves Cycles' Volume socket on either a material output or the world
+# output into the renderer's `VolumeParams` JSON dict. Supports:
+#   - ShaderNodePrincipledVolume   (full feature set)
+#   - ShaderNodeVolumeAbsorption   (σ_a only)
+#   - ShaderNodeVolumeScatter      (σ_s only)
+#   - ShaderNodeAddShader          (sum of two volume coeffs)
+#   - ShaderNodeMixShader          (linear blend, constant Fac only)
+#
+# Procedural / VDB-grid drivers on Color, Density, etc. fall back to the
+# socket default with a one-time warning — heterogeneous volumes (3D
+# textures, VDB grids, the Color/Density Attribute string fields) need
+# infrastructure the renderer doesn't have yet, and silently rendering the
+# wrong thing is worse than rendering a homogeneous approximation.
+
+
+def _vol_color_input(sock):
+    """Resolve a Color socket on a volume node to a constant RGB triple.
+    Falls back to the socket default with a warning if procedurally driven.
+    """
+    if sock is None:
+        return [1.0, 1.0, 1.0]
+    if sock.is_linked:
+        const = _socket_constant_rgb(sock)
+        if const is not None:
+            return list(const)
+        _warn(
+            f"vol-color:{sock.name}",
+            f"volume {sock.name!r} is procedurally driven — baking to socket default",
+        )
+    v = sock.default_value
+    return [float(v[0]), float(v[1]), float(v[2])]
+
+
+def _vol_scalar_input(sock, default: float = 0.0) -> float:
+    if sock is None:
+        return default
+    if sock.is_linked:
+        _warn(
+            f"vol-scalar:{sock.name}",
+            f"volume {sock.name!r} is linked — using socket default {sock.default_value}",
+        )
+    try:
+        return float(sock.default_value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _resolve_volume_coeffs(node):
+    """Walk a volume shader node and return (σ_s, σ_a, σ_e, anisotropy).
+
+    All three coefficients are RGB lists, already pre-multiplied by density
+    so the caller can sum them across Add/Mix subgraphs without juggling a
+    second density field. Returns None for unsupported nodes.
+    """
+    bl = node.bl_idname
+    if bl == "ShaderNodeVolumePrincipled":
+        color = _vol_color_input(node.inputs.get("Color"))
+        density = _vol_scalar_input(node.inputs.get("Density"), 1.0)
+        absorption = _vol_color_input(node.inputs.get("Absorption Color"))
+        anisotropy = _vol_scalar_input(node.inputs.get("Anisotropy"), 0.0)
+        em_color = _vol_color_input(node.inputs.get("Emission Color"))
+        em_strength = _vol_scalar_input(node.inputs.get("Emission Strength"), 0.0)
+        bb_intensity = _vol_scalar_input(node.inputs.get("Blackbody Intensity"), 0.0)
+        bb_tint = _vol_color_input(node.inputs.get("Blackbody Tint"))
+        bb_temp = _vol_scalar_input(node.inputs.get("Temperature"), 1000.0)
+        sigma_s = [color[i] * density for i in range(3)]
+        sigma_a = [absorption[i] * density for i in range(3)]
+        sigma_e = [em_color[i] * em_strength * density for i in range(3)]
+        if bb_intensity > 0.0:
+            bb_rgb = _blackbody_to_linear_rgb(bb_temp)
+            for i in range(3):
+                sigma_e[i] += bb_rgb[i] * bb_tint[i] * bb_intensity * density
+        return sigma_s, sigma_a, sigma_e, anisotropy
+
+    if bl == "ShaderNodeVolumeAbsorption":
+        color = _vol_color_input(node.inputs.get("Color"))
+        density = _vol_scalar_input(node.inputs.get("Density"), 1.0)
+        sigma_a = [color[i] * density for i in range(3)]
+        return [0.0, 0.0, 0.0], sigma_a, [0.0, 0.0, 0.0], 0.0
+
+    if bl == "ShaderNodeVolumeScatter":
+        color = _vol_color_input(node.inputs.get("Color"))
+        density = _vol_scalar_input(node.inputs.get("Density"), 1.0)
+        anisotropy = _vol_scalar_input(node.inputs.get("Anisotropy"), 0.0)
+        sigma_s = [color[i] * density for i in range(3)]
+        return sigma_s, [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], anisotropy
+
+    if bl == "ShaderNodeAddShader":
+        a = node.inputs[0].links[0].from_node if node.inputs[0].is_linked else None
+        b = node.inputs[1].links[0].from_node if node.inputs[1].is_linked else None
+        ca = _resolve_volume_coeffs(a) if a else None
+        cb = _resolve_volume_coeffs(b) if b else None
+        if ca is None and cb is None:
+            return None
+        if ca is None:
+            return cb
+        if cb is None:
+            return ca
+        ss_a, sa_a, se_a, g_a = ca
+        ss_b, sa_b, se_b, g_b = cb
+        # Anisotropy weighted by σ_s magnitude — the larger scatterer
+        # dominates phase-function shape. With both sides scattering equally
+        # this collapses to the average.
+        ws_a = ss_a[0] + ss_a[1] + ss_a[2]
+        ws_b = ss_b[0] + ss_b[1] + ss_b[2]
+        if ws_a + ws_b > 1e-12:
+            g = (g_a * ws_a + g_b * ws_b) / (ws_a + ws_b)
+        else:
+            g = 0.0
+        return (
+            [ss_a[i] + ss_b[i] for i in range(3)],
+            [sa_a[i] + sa_b[i] for i in range(3)],
+            [se_a[i] + se_b[i] for i in range(3)],
+            g,
+        )
+
+    if bl == "ShaderNodeMixShader":
+        fac_sock = node.inputs.get("Fac")
+        if fac_sock is None or fac_sock.is_linked:
+            _warn(
+                f"vol-mix:{node.name}",
+                f"MixShader on volume has linked/missing Fac — using fac=0.5",
+            )
+            fac = 0.5
+        else:
+            fac = float(fac_sock.default_value)
+        # Inputs[1] = A, Inputs[2] = B for a Mix Shader node.
+        a = node.inputs[1].links[0].from_node if node.inputs[1].is_linked else None
+        b = node.inputs[2].links[0].from_node if node.inputs[2].is_linked else None
+        ca = _resolve_volume_coeffs(a) if a else None
+        cb = _resolve_volume_coeffs(b) if b else None
+        if ca is None and cb is None:
+            return None
+        zero = ([0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], 0.0)
+        if ca is None:
+            ca = zero
+        if cb is None:
+            cb = zero
+        ss_a, sa_a, se_a, g_a = ca
+        ss_b, sa_b, se_b, g_b = cb
+        return (
+            [ss_a[i] * (1.0 - fac) + ss_b[i] * fac for i in range(3)],
+            [sa_a[i] * (1.0 - fac) + sa_b[i] * fac for i in range(3)],
+            [se_a[i] * (1.0 - fac) + se_b[i] * fac for i in range(3)],
+            g_a * (1.0 - fac) + g_b * fac,
+        )
+
+    _warn(f"vol-unsup:{bl}", f"unsupported volume node: {bl}")
+    return None
+
+
+def _resolve_volume(volume_socket) -> dict | None:
+    """Convert a Cycles Volume output socket into a renderer VolumeParams.
+
+    Returns None when the socket is unlinked, when the resolved coefficients
+    are all zero (vacuum — no point shipping it), or when no supported
+    volume node is reachable.
+    """
+    if volume_socket is None or not volume_socket.is_linked:
+        return None
+    src = volume_socket.links[0].from_node
+    coeffs = _resolve_volume_coeffs(src)
+    if coeffs is None:
+        return None
+    sigma_s, sigma_a, sigma_e, anisotropy = coeffs
+    if (max(sigma_s) <= 0.0 and max(sigma_a) <= 0.0 and max(sigma_e) <= 0.0):
+        return None
+    # Renderer convention is σ_s = color × density. We've already folded
+    # density into the coefficients, so pin density = 1.0 and pass the σ
+    # values straight through. The Rust make_volume_gpu just multiplies; the
+    # math comes out the same.
+    return {
+        "color": sigma_s,
+        "density": 1.0,
+        "anisotropy": max(-0.999, min(0.999, float(anisotropy))),
+        "absorption_color": sigma_a,
+        "emission_color": sigma_e,
+        "emission_strength": 1.0,
+    }
+
+
 _IDENTITY_UV = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
 
 
@@ -3004,20 +3187,33 @@ def export_material(
         if out_node is None:
             _warn("no-output", "no ShaderNodeOutputMaterial — using default params")
             return _default_params()
-        if not out_node.inputs["Surface"].is_linked:
-            _warn(
-                "no-surface",
-                "output Surface is not connected — using default params",
-            )
-            return _default_params()
 
-        volume = out_node.inputs.get("Volume")
-        if volume is not None and volume.is_linked:
-            _warn("vol-output", "Volume shader on output is ignored")
+        # Resolve the (optional) Volume socket first — that decides whether a
+        # missing Surface is fatal (return defaults) or the material is just
+        # a pure-volume container (return defaults + volume + volume_only).
+        volume_sock = out_node.inputs.get("Volume")
+        volume = _resolve_volume(volume_sock)
+        surface_linked = out_node.inputs["Surface"].is_linked
+
         displacement = out_node.inputs.get("Displacement")
         if displacement is not None and displacement.is_linked:
             # Displacement is consumed by the mesh exporter in a later phase.
             pass
+
+        if not surface_linked:
+            if volume is None:
+                _warn(
+                    "no-surface",
+                    "output Surface is not connected and no Volume — using default params",
+                )
+                return _default_params()
+            # Pure-volume material: the boundary mesh acts only as a volume
+            # container (e.g. junk_shop's `Smoke`). The renderer skips
+            # surface shading on hits because `volume_only=True`.
+            params = _default_params()
+            params["volume"] = volume
+            params["volume_only"] = True
+            return params
 
         surface = out_node.inputs["Surface"].links[0].from_node
         params = _resolve_shader(surface, writer, textures, mat.name)
@@ -3028,6 +3224,14 @@ def export_material(
         affine = _first_teximage_uv_transform(mat.node_tree)
         if affine is not None:
             params["uv_transform"] = affine
+
+        if volume is not None:
+            # Surface + Volume both authored (e.g. coloured glass with
+            # subsurface fog). The renderer evaluates the BSDF on hit AND
+            # tracks the volume through the body. Boundary stays visible.
+            params["volume"] = volume
+            params["volume_only"] = False
+
         return params
     finally:
         _CURRENT_MATERIAL = ""

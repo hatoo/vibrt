@@ -804,6 +804,31 @@ def _export_world(world, writer, textures: list) -> dict:
     return {"type": "constant", "color": [0, 0, 0], "strength": 0.0}
 
 
+def _export_world_volume(world) -> dict | None:
+    """Resolve the optional ShaderNodeOutputWorld → Volume socket into a
+    VolumeParams dict, or None when the atmosphere is clear (current
+    behaviour). Atmospheric haze / fog scenes get one global homogeneous
+    volume that fills the entire world; the renderer always treats it as
+    sitting at the bottom of the volume stack.
+    """
+    if world is None or not world.use_nodes or world.node_tree is None:
+        return None
+    out = next(
+        (n for n in world.node_tree.nodes
+         if n.bl_idname == "ShaderNodeOutputWorld" and n.is_active_output),
+        None,
+    )
+    if out is None:
+        out = next(
+            (n for n in world.node_tree.nodes
+             if n.bl_idname == "ShaderNodeOutputWorld"),
+            None,
+        )
+    if out is None:
+        return None
+    return material_export._resolve_volume(out.inputs.get("Volume"))
+
+
 def export_scene(
     depsgraph: bpy.types.Depsgraph,
     json_path: Path,
@@ -1058,6 +1083,7 @@ def _export_into(
 
             t_world = time.perf_counter()
             world = _export_world(scene.world, writer, textures)
+            world_volume = _export_world_volume(scene.world)
             world_s = time.perf_counter() - t_world
 
             bin_size = writer.tell()
@@ -1090,6 +1116,8 @@ def _export_into(
         "lights": lights_json,
         "world": world,
     }
+    if world_volume is not None:
+        scene_json["world_volume"] = world_volume
 
     # JSON serialise + write happens in the caller now; keep the dump out of
     # this hot path so `_export_into` can be reused for both file and memory

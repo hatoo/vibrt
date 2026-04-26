@@ -1,11 +1,11 @@
 //! Host-side material upload for Principled BSDF.
 
 use crate::gpu_types::{
-    ColorGraphNode, PrincipledGpu, COLOR_NODE_BRIGHT_CONTRAST, COLOR_NODE_CONST,
+    ColorGraphNode, PrincipledGpu, VolumeGpu, COLOR_NODE_BRIGHT_CONTRAST, COLOR_NODE_CONST,
     COLOR_NODE_HUE_SAT, COLOR_NODE_IMAGE_TEX, COLOR_NODE_INVERT, COLOR_NODE_MATH, COLOR_NODE_MIX,
     COLOR_NODE_RGB_CURVE, COLOR_NODE_VERTEX_COLOR,
 };
-use crate::scene_format::{ColorFactor, ColorGraph, ColorNode, PrincipledMaterial};
+use crate::scene_format::{ColorFactor, ColorGraph, ColorNode, PrincipledMaterial, VolumeParams};
 use crate::scene_loader::LoadedTexture;
 use crate::CudaResultExt;
 use anyhow::{anyhow, Result};
@@ -302,11 +302,45 @@ pub(crate) fn parse_math_op(s: &str) -> Result<u32> {
     })
 }
 
+/// Precompute the GPU-side volume coefficients from authored params.
+/// Cycles' principled volume convention:
+///   σ_s = color × density   (RGB scattering coefficient)
+///   σ_a = absorption_color × density   (RGB absorption)
+///   σ_t = σ_s + σ_a
+///   σ_e = emission_color × emission_strength × density
+/// Negative or NaN inputs collapse to 0; the device code expects
+/// non-negative coefficients.
+pub fn make_volume_gpu(v: &VolumeParams) -> VolumeGpu {
+    let d = v.density.max(0.0);
+    let mut sigma_s = [0.0f32; 3];
+    let mut sigma_a = [0.0f32; 3];
+    let mut emission = [0.0f32; 3];
+    for i in 0..3 {
+        sigma_s[i] = (v.color[i].max(0.0)) * d;
+        sigma_a[i] = (v.absorption_color[i].max(0.0)) * d;
+        emission[i] = (v.emission_color[i].max(0.0)) * v.emission_strength.max(0.0) * d;
+    }
+    let sigma_t = [
+        sigma_s[0] + sigma_a[0],
+        sigma_s[1] + sigma_a[1],
+        sigma_s[2] + sigma_a[2],
+    ];
+    VolumeGpu {
+        sigma_t,
+        _pad0: 0.0,
+        sigma_s,
+        _pad1: 0.0,
+        emission,
+        anisotropy: v.anisotropy.clamp(-0.999, 0.999),
+    }
+}
+
 /// Build a GPU material struct from a host Principled material.
 pub fn make_material_data(
     mat: &PrincipledMaterial,
     textures: &[(optix_sys::CUdeviceptr, i32, i32)],
     graph: ColorGraphGpu,
+    volume_ptr: optix_sys::CUdeviceptr,
 ) -> PrincipledGpu {
     let lookup = |id: Option<u32>| -> (optix_sys::CUdeviceptr, i32, i32, i32) {
         match id {
@@ -390,5 +424,7 @@ pub fn make_material_data(
         color_graph_nodes: graph.nodes,
         color_graph_len: graph.len,
         color_graph_output: graph.output,
+        volume: volume_ptr,
+        volume_only: if mat.volume_only { 1 } else { 0 },
     }
 }

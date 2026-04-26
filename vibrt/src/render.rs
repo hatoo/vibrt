@@ -251,6 +251,10 @@ pub fn render_to_pixels(
     // deferred. Separate u32 / f32 vectors because RGBCurve LUTs are float.
     let mut _color_graph_buffers: Vec<CudaSlice<u32>> = Vec::new();
     let mut _color_graph_lut_buffers: Vec<CudaSlice<f32>> = Vec::new();
+    // Volume parameter blocks live alongside materials. Each material that
+    // has a Volume slot gets one allocation; the device-side `PrincipledGpu`
+    // holds a pointer back to it (or null when absent).
+    let mut _volume_storage: Vec<optix_sys::CUdeviceptr> = Vec::new();
     let mut mat_device_ptrs: Vec<optix_sys::CUdeviceptr> = Vec::new();
     for mat in &scene.file.materials {
         let graph = match &mat.color_graph {
@@ -263,9 +267,24 @@ pub fn render_to_pixels(
             )?,
             None => principled::ColorGraphGpu::default(),
         };
-        let gpu = principled::make_material_data(mat, &tex_slots, graph);
+        let volume_ptr = match &mat.volume {
+            Some(v) => {
+                let vg = principled::make_volume_gpu(v);
+                let p = alloc_and_copy(&stream, &vg)?;
+                _volume_storage.push(p);
+                p
+            }
+            None => 0,
+        };
+        let gpu = principled::make_material_data(mat, &tex_slots, graph, volume_ptr);
         mat_device_ptrs.push(alloc_and_copy(&stream, &gpu)?);
     }
+    // World volume sits in LaunchParams and is shared by every ray that
+    // doesn't enter a tighter mesh-bounded volume. Allocated once.
+    let world_volume_ptr: optix_sys::CUdeviceptr = match &scene.file.world_volume {
+        Some(v) => alloc_and_copy(&stream, &principled::make_volume_gpu(v))?,
+        None => 0,
+    };
 
     // --- Build per-mesh GAS ---
     let build_options = AccelBuildOptions {
@@ -621,6 +640,7 @@ pub fn render_to_pixels(
         clamp_indirect: render_settings.clamp_indirect,
         albedo_aov,
         normal_aov,
+        world_volume: world_volume_ptr,
     };
     let d_params = alloc_and_copy(&stream, &lp)?;
 

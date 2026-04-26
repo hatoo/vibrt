@@ -111,6 +111,33 @@ pub struct PrincipledGpu {
     /// Index into `color_graph_nodes` whose output is the final colour.
     /// Defaults to `color_graph_len - 1`.
     pub color_graph_output: i32,
+    /// Optional pointer to a `VolumeGpu`. Non-null means the bounded mesh is
+    /// a volume container (junk_shop's `Smoke` is the canonical case).
+    pub volume: optix_sys::CUdeviceptr,
+    /// 1 when the material has no Surface — the boundary mesh is invisible
+    /// to surface shading and acts purely as a volume entry/exit boundary.
+    /// 0 when there's both a Surface and a Volume (glass-with-fog case;
+    /// surface BSDF runs alongside the volume entry).
+    pub volume_only: i32,
+}
+
+/// Homogeneous volume parameters precomputed by the host. Layout mirrors
+/// `VolumeGpu` in `devicecode.h`. Padding keeps each `[f32; 3]` aligned on a
+/// 16-byte boundary so the device code can do unrolled vector loads when it
+/// becomes worth optimising.
+#[repr(C)]
+#[derive(Copy, Clone, Default)]
+pub struct VolumeGpu {
+    /// σ_t per channel (extinction = scattering + absorption).
+    pub sigma_t: [f32; 3],
+    pub _pad0: f32,
+    /// σ_s per channel (scattering coefficient).
+    pub sigma_s: [f32; 3],
+    pub _pad1: f32,
+    /// σ_e per channel (emission * density, pre-multiplied).
+    pub emission: [f32; 3],
+    /// Henyey-Greenstein g, [-1, 1]. 0 = isotropic.
+    pub anisotropy: f32,
 }
 
 #[repr(C)]
@@ -237,6 +264,11 @@ pub struct LaunchParams {
     pub albedo_aov: optix_sys::CUdeviceptr,
     /// Camera-space shading normal (X=right, Y=up, Z=forward).
     pub normal_aov: optix_sys::CUdeviceptr,
+
+    /// Optional global homogeneous volume (atmospheric haze) that fills the
+    /// scene. 0 means "vacuum"; non-null is a `VolumeGpu*`. Always part of
+    /// the volume stack at depth 0.
+    pub world_volume: optix_sys::CUdeviceptr,
 }
 
 #[repr(C)]

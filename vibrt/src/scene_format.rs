@@ -27,6 +27,52 @@ pub struct SceneFile {
     #[serde(default)]
     pub lights: Vec<LightDesc>,
     pub world: Option<WorldDesc>,
+    /// Optional homogeneous volume that fills the entire scene (atmospheric
+    /// haze / fog). Cycles' "World Output → Volume" socket lands here.
+    /// `None` => clear atmosphere (current behaviour).
+    #[serde(default)]
+    pub world_volume: Option<VolumeParams>,
+}
+
+/// Homogeneous volume parameters shared by per-material volumes (scattering
+/// boundaries on closed meshes, e.g. junk_shop's `Smoke`) and the world
+/// volume (everywhere). All quantities are in metres⁻¹ before being scaled by
+/// `density`.
+///
+/// Cycles' Principled Volume conventions:
+/// - `color * density` is the per-channel scattering coefficient σ_s.
+/// - `absorption_color * density` is σ_a. (When σ_a = 0 the volume is purely
+///   scattering — junk_shop's smoke is configured this way.)
+/// - σ_t = σ_s + σ_a. The renderer samples a single scalar majorant (the
+///   per-channel max of σ_t) for distance sampling and tracks per-channel
+///   beam transmittance separately.
+/// - Emission = `emission_color * emission_strength + blackbody_rgb *
+///   blackbody_intensity`, all scaled by `density`. The exporter folds the
+///   blackbody term in before serialising; the renderer just sees one
+///   pre-multiplied RGB.
+#[derive(Deserialize, Default, Copy, Clone)]
+pub struct VolumeParams {
+    /// Scattering tint. Multiplied by `density` to give σ_s.
+    #[serde(default = "default_volume_color")]
+    pub color: [f32; 3],
+    #[serde(default = "one_f32")]
+    pub density: f32,
+    /// Henyey-Greenstein g, in [-1, 1]. 0 = isotropic.
+    #[serde(default)]
+    pub anisotropy: f32,
+    /// Multiplied by `density` to give σ_a.
+    #[serde(default)]
+    pub absorption_color: [f32; 3],
+    /// Pre-multiplied with `emission_strength` and folded with any blackbody
+    /// term by the exporter; the renderer scales by density on the GPU side.
+    #[serde(default)]
+    pub emission_color: [f32; 3],
+    #[serde(default)]
+    pub emission_strength: f32,
+}
+
+fn default_volume_color() -> [f32; 3] {
+    [1.0, 1.0, 1.0]
 }
 
 #[derive(Deserialize, Copy, Clone)]
@@ -193,6 +239,19 @@ pub struct PrincipledMaterial {
     /// baked texture.
     #[serde(default)]
     pub color_graph: Option<ColorGraph>,
+    /// Cycles' material output → Volume socket. When present the bounded
+    /// mesh acts as a volume container: rays entering a front face start
+    /// integrating volume scattering until they exit a back face. Combine
+    /// with `volume_only=true` to make the boundary surface invisible
+    /// (junk_shop's `Smoke` material — Surface socket is unlinked).
+    #[serde(default)]
+    pub volume: Option<VolumeParams>,
+    /// True when the material's Surface socket is unlinked. The boundary
+    /// mesh is then a pure volume container — primary rays pass through it
+    /// (no surface shading), but the volume inside still scatters / absorbs.
+    /// Set by the exporter alongside `volume`.
+    #[serde(default)]
+    pub volume_only: bool,
 }
 
 /// Sequential list of colour-producing nodes. Each node reads either from
