@@ -751,8 +751,13 @@ def _extract_sun_from_bake_inplace(rgb, w: int, h: int, sky_node, world_name: st
     # disc; threshold at 5x the 99.5th percentile gives a robust cutoff
     # without per-scene tuning. Bail when the bake is uniform-ish (no
     # sun_disc, overcast sky, hand-edited HDRI).
-    p995 = float(np.percentile(lum, 99.5))
-    threshold = max(50.0, p995 * 5.0)
+    # Diffuse Nishita sky tops out around 5-15 W/sr/m². The disc punches
+    # through that by 4-5 orders of magnitude. Threshold at 3x the 99th
+    # percentile catches the disc's wing without clipping bright horizon
+    # scattering; floor at 30 so a hand-edited HDRI without a tight disc
+    # doesn't accidentally have its highlights pulled out as a "sun".
+    p99 = float(np.percentile(lum, 99.0))
+    threshold = max(30.0, p99 * 3.0)
     if lum_max < threshold:
         return None
     bright_mask = lum > threshold
@@ -795,17 +800,12 @@ def _extract_sun_from_bake_inplace(rgb, w: int, h: int, sky_node, world_name: st
     flux_max = max(float(flux_rgb[0]), float(flux_rgb[1]),
                    float(flux_rgb[2]), 1e-6)
     color = [float(c) / flux_max for c in flux_rgb]
-    # Cap the sun's per-channel irradiance. The Nishita disc ends up at
-    # ~120-200 W/m² above-atmosphere, which after `bsdf*cos` saturates
-    # half the rendered frame on shiny / pale surfaces and bleeds into
-    # vertical fireflies through MIS. Cycles' actual sun-side model
-    # roughly matches a clear-sky direct-irradiance of 8-15 W/m² at the
-    # surface (the rest of the disc's energy already sits in the diffuse
-    # sky). Clipping here keeps the disc visible without the firefly
-    # streaks.
-    SUN_IRRADIANCE_CAP = 10.0
-    if flux_max > SUN_IRRADIANCE_CAP:
-        flux_max = SUN_IRRADIANCE_CAP
+    # No cap on the sun light's irradiance — letting the disc deliver its
+    # full Nishita flux (~120-200 W/m²) is what gives sun-lit surfaces
+    # their proper contrast against the diffuse-sky shadows. The fireflies
+    # that prompted earlier capping came from the *bake* itself sampling
+    # the disc through MIS; pulling the disc out of the bake (residual sky
+    # tops out at `threshold` above) is what handles that.
     _emit(
         f"[vibrt] world {world_name!r}: split {n_bright} sun-disc pixels "
         f"(peak L={lum_max:.0f}, residual sky max={threshold:.0f}) → "
