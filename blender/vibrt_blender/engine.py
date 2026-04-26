@@ -1,10 +1,14 @@
-"""Blender `RenderEngine` subclass for vibrt (final-frame F12 only)."""
+"""Blender `RenderEngine` subclass for vibrt (final-frame F12 only).
+
+Uses the bundled `vibrt_native.pyd` PyO3 extension exclusively — there's
+no subprocess fallback. If the extension isn't importable the addon
+errors out at render time with instructions on how to build it. Subprocess
+rendering through the standalone `vibrt.exe` binary is still available
+for CLI tooling (`scripts/render_blend.py`, `make <scene>-preview`) but
+is not used by the addon itself.
+"""
 
 from __future__ import annotations
-
-import tempfile
-import uuid
-from pathlib import Path
 
 import bpy
 
@@ -25,27 +29,18 @@ class VibrtRenderEngine(bpy.types.RenderEngine):
         height = int(rd.resolution_y * rd.resolution_percentage / 100.0)
         denoise = bool(getattr(scene, "vibrt_denoise", False))
 
-        # Prefer the in-process renderer when the bundled `vibrt_native.pyd`
-        # is importable — it skips the JSON+bin disk roundtrip (~12 GB on
-        # junk_shop, ~15 s of pure I/O round-trip). Fall back to the
-        # subprocess path if the extension is missing or errors out so a
-        # broken pyd doesn't take the addon down with it.
-        if runner.find_native_module() is not None:
-            self.report({"INFO"}, "vibrt: rendering in-process (vibrt_native)")
-            try:
-                self._render_in_process(depsgraph, width, height, denoise)
-                return
-            except KeyboardInterrupt:
-                self.report({"WARNING"}, "Render cancelled")
-                return
-            except Exception as e:
-                self.report(
-                    {"WARNING"},
-                    f"In-process render failed ({e!r}) — falling back to subprocess",
-                )
+        if runner.find_native_module() is None:
+            self.report(
+                {"ERROR"},
+                "vibrt_native extension not bundled. Run `make dev-install` "
+                "(or `make addon-with-native`) and restart Blender.",
+            )
+            return
 
-        self.report({"INFO"}, "vibrt: rendering via subprocess (vibrt.exe)")
-        self._render_via_subprocess(depsgraph, width, height, denoise)
+        try:
+            self._render_in_process(depsgraph, width, height, denoise)
+        except KeyboardInterrupt:
+            self.report({"WARNING"}, "Render cancelled")
 
     def _render_in_process(
         self,
@@ -66,71 +61,13 @@ class VibrtRenderEngine(bpy.types.RenderEngine):
             denoise=denoise,
             texture_arrays=texture_arrays,
         )
-        # `pixels` is float32 (h, w, 4), bottom-left origin (matches the
-        # `.raw` path's encoding — see image_io::save_image's `.raw` branch).
+        # `pixels` is float32 (h, w, 4), bottom-left origin.
         self.update_stats("vibrt", "Loading result...")
         _push_pixels_into_render_result(self, pixels, width, height)
 
-    def _render_via_subprocess(
-        self,
-        depsgraph: bpy.types.Depsgraph,
-        width: int,
-        height: int,
-        denoise: bool,
-    ) -> None:
-        exe = runner.find_executable()
-        if exe is None:
-            self.report(
-                {"ERROR"},
-                "vibrt executable not found (set in addon preferences or $VIBRT_EXECUTABLE or PATH)",
-            )
-            return
-
-        work = Path(bpy.app.tempdir) / f"vibrt_{uuid.uuid4().hex[:8]}"
-        work.mkdir(parents=True, exist_ok=True)
-        json_path = work / "scene.json"
-        bin_path = work / "scene.bin"
-        # Use `.raw` so we can bypass Blender's EXR loader, which emits
-        # multi-layer-channel warnings on single-layer files and can return
-        # empty pixel buffers.
-        exr_path = work / "output.raw"
-
-        self.update_stats("vibrt", "Exporting scene...")
-        try:
-            exporter.export_scene(depsgraph, json_path, bin_path)
-        except Exception as e:
-            self.report({"ERROR"}, f"Export failed: {e}")
-            raise
-
-        self.update_stats("vibrt", "Rendering...")
-        code = runner.run_render(
-            exe,
-            json_path,
-            exr_path,
-            self.report,
-            self.test_break,
-            denoise=denoise,
-        )
-        if code != 0:
-            self.report({"ERROR"}, f"vibrt exited with code {code}")
-            return
-        if not exr_path.exists():
-            self.report({"ERROR"}, f"No output produced at {exr_path}")
-            return
-
-        self.update_stats("vibrt", "Loading result...")
-        _load_exr_into_render_result(self, exr_path, width, height)
-
-    # Fallback: this addon does not support viewport IPR (yet).
-
 
 def _push_pixels_into_render_result(engine, pixels, width: int, height: int):
-    """Copy a float32 (h, w, 4) ndarray into the Combined pass.
-
-    Matches the `.raw`-loader path's expectations: bottom-left origin, RGBA
-    floats. Used by the in-process render path so we skip both the on-disk
-    `.raw` file and Blender's EXR loader entirely.
-    """
+    """Copy a float32 (h, w, 4) ndarray into the Combined pass."""
     arr = pixels
     if arr.shape[0] != height or arr.shape[1] != width or arr.shape[2] != 4:
         engine.report(
@@ -160,50 +97,6 @@ def _push_pixels_into_render_result(engine, pixels, width: int, height: int):
         combined.rect.foreach_set(flat)
     else:
         combined.rect = [tuple(flat[i:i + 4]) for i in range(0, len(flat), 4)]
-    engine.end_result(result)
-
-
-def _load_exr_into_render_result(engine, raw_path: Path, width: int, height: int):
-    """Read our `.raw` float RGBA file and copy pixels into the Combined pass."""
-    import struct
-
-    data = raw_path.read_bytes()
-    if len(data) < 16 or data[:4] != b"VBLT":
-        engine.report({"ERROR"}, f"invalid raw file header in {raw_path}")
-        return
-    file_w, file_h, ch = struct.unpack("<III", data[4:16])
-    if ch != 4 or file_w != width or file_h != height:
-        engine.report(
-            {"ERROR"},
-            f"raw file dims mismatch (file {file_w}x{file_h}x{ch}, expected {width}x{height}x4)",
-        )
-        return
-    expected = width * height * 4
-    pixels = struct.unpack(f"<{expected}f", data[16:16 + expected * 4])
-
-    result = engine.begin_result(0, 0, width, height)
-    render_layer = result.layers[0]
-    # Blender 5.x requires a `view` argument; fall back to scanning for older API.
-    combined = None
-    try:
-        combined = render_layer.passes.find_by_name("Combined", "")
-    except TypeError:
-        combined = render_layer.passes.find_by_name("Combined")
-    if combined is None:
-        for p in render_layer.passes:
-            if p.name == "Combined":
-                combined = p
-                break
-    if combined is None:
-        engine.end_result(result)
-        engine.report({"ERROR"}, "Combined pass not found in render result")
-        return
-    if hasattr(combined.rect, "foreach_set"):
-        combined.rect.foreach_set(pixels)
-    else:
-        combined.rect = [
-            tuple(pixels[i : i + 4]) for i in range(0, len(pixels), 4)
-        ]
     engine.end_result(result)
 
 

@@ -1,45 +1,18 @@
-"""Discover and invoke the vibrt renderer.
+"""Discover and invoke `vibrt_native` — the in-process PyO3 extension.
 
-Two paths exist:
-
-- `run_render_inproc` calls the bundled `vibrt_native` PyO3 extension directly,
-  handing it the in-memory `(scene.json, scene.bin)` buffers produced by
-  `exporter.export_scene_to_memory`. No disk roundtrip, no subprocess.
-- `run_render` is the legacy fallback: write the buffers to a temp dir, spawn
-  `vibrt.exe`, stream its stdout into Blender's Info panel. Used when the
-  native extension isn't bundled (e.g. fresh checkout that hasn't run
-  `cargo build --features python` yet) or when in-process rendering errors
-  out and the engine wants a second chance.
+The addon renders exclusively through the bundled `vibrt_native.pyd`. The
+standalone `vibrt.exe` binary still exists for CLI tooling but is not
+invoked from the addon itself.
 """
 
 from __future__ import annotations
-
-import os
-import shutil
-import subprocess
-from pathlib import Path
-
-import bpy
-
-
-def find_executable() -> str | None:
-    prefs = bpy.context.preferences.addons[__package__].preferences
-    if prefs.vibrt_executable and Path(prefs.vibrt_executable).exists():
-        return prefs.vibrt_executable
-    env = os.environ.get("VIBRT_EXECUTABLE")
-    if env and Path(env).exists():
-        return env
-    which = shutil.which("vibrt")
-    if which:
-        return which
-    return None
 
 
 def find_native_module():
     """Import `vibrt_native` if it's bundled with the addon. Returns the
     module on success, or None on `ImportError` (extension not built yet,
-    binary missing, ABI mismatch). Callers fall back to `run_render` (the
-    subprocess path) when this is None.
+    binary missing, ABI mismatch). Callers report a clear error and stop —
+    there is no subprocess fallback.
     """
     try:
         from . import vibrt_native  # type: ignore  # ships as a .pyd next to __init__.py
@@ -93,47 +66,3 @@ def run_render_inproc(
         scene_json, scene_bin, opts, log_cb, cancel_cb,
         texture_arrays=texture_arrays,
     )
-
-
-def run_render(
-    exe: str,
-    scene_json: Path,
-    output_path: Path,
-    report,
-    is_break,
-    denoise: bool = False,
-) -> int:
-    """Run vibrt; return exit code. Pipes stderr lines to `report`."""
-    cmd = [exe, str(scene_json), "--output", str(output_path)]
-    if denoise:
-        cmd.append("--denoise")
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        bufsize=1,
-        text=True,
-        universal_newlines=True,
-    )
-    stderr_tail: list[str] = []
-    try:
-        while True:
-            if proc.stdout is not None:
-                line = proc.stdout.readline()
-                if line:
-                    report({"INFO"}, line.rstrip())
-                    continue
-            if proc.poll() is not None:
-                break
-            if is_break():
-                proc.terminate()
-                break
-    finally:
-        if proc.stderr is not None:
-            err = proc.stderr.read()
-            if err:
-                stderr_tail = err.splitlines()[-20:]
-                for ln in stderr_tail:
-                    report({"ERROR"}, ln)
-        proc.wait()
-    return proc.returncode if proc.returncode is not None else 1

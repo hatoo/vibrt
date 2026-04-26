@@ -59,16 +59,21 @@ This is a workspace with three Rust crates and a Python addon. The data flow is 
 
 ### Python addon (`blender/vibrt_blender/`)
 
-- **`engine.py`** — `VibrtRenderEngine(bpy.types.RenderEngine)`. F12 entry point. Tries `runner.find_native_module()` first; on success calls the in-process path (no temp files, no subprocess). On `ImportError` or any in-process exception (except `KeyboardInterrupt`), falls back to writing `scene.json`/`scene.bin` to `bpy.app.tempdir` and spawning `vibrt.exe`. Pixels go into the Combined pass via `combined.rect.foreach_set`.
-- **`exporter.py`** — the bulk of the export logic. `_export_into(depsgraph, writer, ...)` is the shared core; `export_scene(...)` writes to disk for the CLI tooling, `export_scene_to_memory(...)` returns `(json_str, bytearray)` for the in-process path. `BinWriter` accepts three sink types (file via `tofile`, `bytearray` via memoryview slice — pre-sized for the in-memory case, `BytesIO` as fallback). All blob writes return `{offset, len}` BlobRefs.
+- **`engine.py`** — `VibrtRenderEngine(bpy.types.RenderEngine)`. F12 entry point. The addon renders **only** through the bundled `vibrt_native.pyd`; if it isn't importable the engine reports an error and stops. There is no subprocess fallback — the standalone `vibrt.exe` is for CLI tooling only.
+- **`exporter.py`** — the bulk of the export logic. `_export_into(depsgraph, writer, ...)` is the shared core; `export_scene(json_path, bin_path, ...)` writes to disk for the CLI tooling, `export_scene_to_memory(...)` returns `(json_str, bytearray, list[ndarray])` for the in-process path. The third element is the per-texture pixel-array list (in defer mode `BinWriter.write_texture_pixels` parks the array into this list and emits `{"array_index": i}` instead of a BlobRef). The `BinWriter` accepts three sink types (file via `tofile`, `bytearray` via memoryview slice, `BytesIO` as fallback); the bytearray-mode writer can grow on overflow (the existing memoryview is released and re-acquired around the resize).
 - **`material_export.py`** — Principled BSDF + node-graph compilation. Bakes RGBCurve/HueSat/Gamma/Invert/Clamp/ColorRamp/BrightContrast/Mix(MIX/MULTIPLY/ADD/SUBTRACT, constant side) into texture pixels; emits residual sequences as a small "colour graph" the device code interprets. Detects pure-emissive single-quad meshes and promotes them to area_rect lights so NEE can importance-sample them.
 - **`hair_export.py`** — particle-system hair → ribbon mesh tessellation. (`rendered_child_count` is per-parent, not total — easy off-by-N if you forget.)
-- **`runner.py`** — both render paths: `run_render_inproc` calls `vibrt_native.render`; `run_render` spawns `vibrt.exe` and pipes stdout into the Info panel.
-- **`build_addon.py`** — packages `vibrt_blender.zip`. `--with-native` builds the cdylib via cargo and stages it as `vibrt_native.pyd`/`.so`/`.dylib`. `--stage-only` does the build + copy without zipping (used by `make dev-install` for the junctioned-addon workflow).
+- **`runner.py`** — `find_native_module()` and `run_render_inproc()`. The latter is a thin wrapper over `vibrt_native.render(...)` that also forwards `texture_arrays`.
+- **`build_addon.py`** — packages `vibrt_blender.zip`. `--with-native` builds the cdylib via cargo and stages it as `vibrt_native.pyd`/`.so`/`.dylib`. `--stage-only` does the build + copy without zipping (used by `make dev-install` for the junctioned-addon workflow). A no-`--with-native` zip won't actually render — the addon errors out without the extension.
 
-### CLI vs in-process: why both exist
+### CLI vs in-process
 
-The disk roundtrip is the bottleneck on heavy scenes: `junk_shop`'s `scene.bin` is ~12 GB of float32 RGBA texture pixels. The CLI path pays write+read+decode (~15 s on `junk_shop`); the in-process path keeps the buffer in Python's heap, hands a `&[u8]` pointer to Rust via PyBuffer, and `LoadedScene` borrows from it. Linear textures and mesh attributes are zero-copy from that point on; only sRGB textures and displacement-perturbed vertices ever allocate. **Both paths must remain functional** — the CLI is used by `scripts/render_blend.py` and the Makefile, and the in-process path falls through to subprocess if the `.pyd` isn't bundled.
+The two paths differ in how they hand the scene to the renderer:
+
+- **In-process** (Blender F12 + `vibrt_native.pyd`, the addon's only path): `export_scene_to_memory` returns `(json_str, bin_bytes, texture_arrays)`. The bin holds mesh / index / vertex-color blobs (typically tens of MB even on the heaviest scenes); textures are passed across PyO3 as a `Vec<PyBuffer<f32>>`. `LoadedScene` borrows directly from both — linear textures and unmodified mesh attributes are zero-copy. The bin's small size means no realloc spikes; on `junk_shop` the export takes ~16 s vs. the disk path's ~26 s, with the largest savings coming from skipping the bytearray concatenation.
+- **Disk** (`scripts/render_blend.py`, `make <scene>-preview`): `export_scene` writes `scene.json` + `scene.bin` to disk; `vibrt.exe` reads them back. Textures use `pixels: BlobRef` instead of `array_index`. The CLI exists for tooling / regression testing, not for the user's interactive workflow.
+
+`TextureDesc` accepts either form: `pixels` and `array_index` are both `Option<...>` and the loader picks whichever is set.
 
 ## Scene-format invariants worth knowing
 
