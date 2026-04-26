@@ -659,7 +659,14 @@ def _resolve_constant_socket(sock, depth: int = 0):
                 continue
         else:
             try:
-                inner = _socket_rgb(inp)
+                if inp.type == "VALUE":
+                    # Math / Clamp / scalar nodes expose VALUE inputs whose
+                    # default is a plain float — broadcast to RGB so the
+                    # rest of this resolver path can treat it as a colour.
+                    v = float(inp.default_value)
+                    inner = [v, v, v]
+                else:
+                    inner = _socket_rgb(inp)
             except Exception as exc:
                 _warn(
                     f"resolve_const:{_node_tag(src)}:{name}",
@@ -1208,21 +1215,81 @@ def _mapping_to_affine(node) -> list[float]:
         )
         return list(_IDENTITY_UV)
 
-    for n in ("Location", "Rotation", "Scale"):
-        if n in node.inputs and node.inputs[n].is_linked:
-            _warn(
-                f"map-linked:{node.as_pointer()}:{n}",
-                f"Mapping {_node_tag(node)}: {n} is linked — UV transform "
-                f"uses default constant only",
-            )
+    def _vec3_const(sock):
+        """Fold a Vector socket to (x, y, z), returning (vec, quiet) where
+        `quiet` is True when the source is a known per-instance / unbakeable
+        signal we want to silently default to zero (e.g. ObjectInfo.Location,
+        which lone_monk artists wire into Mapping.Location to break tiling
+        across brick instances — there's no per-instance bake we can do).
 
-    def _vec3(sock):
-        v = sock.default_value
-        return [float(v[0]), float(v[1]), float(v[2])]
+        Returns (None, False) when the chain isn't recognised at all, so
+        the caller can warn loudly.
+        """
+        sock = _follow_reroutes(sock)
+        if not sock.is_linked:
+            v = sock.default_value
+            return [float(v[0]), float(v[1]), float(v[2])], False
+        src = sock.links[0].from_node
+        bl = src.bl_idname
+        if bl == "ShaderNodeCombineXYZ":
+            xs, ys, zs = src.inputs.get("X"), src.inputs.get("Y"), src.inputs.get("Z")
+            if xs is None or ys is None or zs is None:
+                return None, False
+            x = _resolve_constant_scalar(xs) if xs.is_linked else _socket_f(xs)
+            y = _resolve_constant_scalar(ys) if ys.is_linked else _socket_f(ys)
+            z = _resolve_constant_scalar(zs) if zs.is_linked else _socket_f(zs)
+            if x is None or y is None or z is None:
+                return None, False
+            return [x, y, z], False
+        if bl == "ShaderNodeVectorMath" and src.operation == "MULTIPLY":
+            a, qa = _vec3_const(src.inputs[0])
+            b, qb = _vec3_const(src.inputs[1])
+            if a is not None and b is not None:
+                return [a[0] * b[0], a[1] * b[1], a[2] * b[2]], qa or qb
+        # ShaderNodeObjectInfo (Location, Random, etc.) is per-instance and
+        # therefore unbakeable. Silently fall back to the Mapping socket's
+        # default so the texture still bakes; the per-instance variation
+        # the artist wanted (UV jitter across brick instances) is dropped.
+        if bl == "ShaderNodeObjectInfo":
+            return None, True
+        # ShaderNodeAttribute is per-object; same story as ObjectInfo.
+        if bl == "ShaderNodeAttribute":
+            return None, True
+        # ShaderNodeNewGeometry's outputs (Random Per Island, Position,
+        # Normal, ...) are per-fragment / per-instance signals. Lone_monk
+        # threads "Random Per Island" into Mapping.Location to break
+        # tiling between brick instances; without per-instance UV jitter
+        # we just have to accept the default.
+        if bl == "ShaderNodeNewGeometry":
+            return None, True
+        return None, False
 
-    loc = _vec3(node.inputs["Location"])
-    rot = _vec3(node.inputs["Rotation"])
-    scl = _vec3(node.inputs["Scale"])
+    fallback = False
+    loc, q_loc = _vec3_const(node.inputs["Location"])
+    rot, q_rot = _vec3_const(node.inputs["Rotation"])
+    scl, q_scl = _vec3_const(node.inputs["Scale"])
+    if loc is None:
+        loc = [float(v) for v in node.inputs["Location"].default_value]
+        if not q_loc:
+            fallback = True
+    if rot is None:
+        rot = [float(v) for v in node.inputs["Rotation"].default_value]
+        if not q_rot:
+            fallback = True
+    if scl is None:
+        scl = [float(v) for v in node.inputs["Scale"].default_value]
+        if not q_scl:
+            fallback = True
+    if fallback:
+        for n in ("Location", "Rotation", "Scale"):
+            if n in node.inputs and node.inputs[n].is_linked:
+                _, q = _vec3_const(node.inputs[n])
+                if not q and _vec3_const(node.inputs[n])[0] is None:
+                    _warn(
+                        f"map-linked:{node.as_pointer()}:{n}",
+                        f"Mapping {_node_tag(node)}: {n} is driven by a non-"
+                        f"foldable chain — UV transform uses default constant only",
+                    )
 
     sx, sy = scl[0], scl[1]
     theta = rot[2]  # UV is 2D; only Z rotation matters
@@ -1259,6 +1326,14 @@ _PASSTHROUGH_INPUTS: dict[str, tuple[str, ...] | None] = {
     "ShaderNodeSeparateColor": ("Color",), # packed ORM: Color -> R/G/B channels
     "ShaderNodeSeparateRGB": ("Image",),   # legacy pre-3.3 variant
     "ShaderNodeSeparateXYZ": ("Vector",),
+    # CombineColor / CombineRGB pack three scalar inputs into a Color
+    # output. We can only traverse them when at most one of (R, G, B) is
+    # texture-driven — otherwise the result would need three separate
+    # baked passes. Listed here so `_chain_candidates` returns the
+    # per-channel sockets; the resolver below cherry-picks the linked
+    # one and folds the rest as constants via `_node_color_transform`.
+    "ShaderNodeCombineColor": ("Red", "Green", "Blue"),
+    "ShaderNodeCombineRGB": ("R", "G", "B"),
 }
 
 
@@ -1612,7 +1687,76 @@ def _node_color_transform(node, chain_input_name=None):
         return _mix_transform(node, chain_input_name)
     if bl == "ShaderNodeMath":
         return _math_transform(node, chain_input_name)
+    if bl in ("ShaderNodeCombineColor", "ShaderNodeCombineRGB"):
+        return _combine_color_transform(node, chain_input_name)
     return None
+
+
+def _combine_color_transform(node, chain_input_name=None):
+    """Bake CombineColor / CombineRGB when one channel is texture-driven and
+    the other two fold to constants.
+
+    The chain delivers an RGB texture but only one channel of that texture
+    is actually wanted (the channel matching `chain_input_name`); the
+    output Color slots that channel into its corresponding output index
+    and uses the resolved constants for the other two. Modes other than
+    RGB (HSV, HSL) are skipped — the GPU shader has no HSL/HSV machinery
+    and folding constants there isn't worth replicating.
+    """
+    import numpy as np
+    mode = getattr(node, "mode", "RGB")
+    if mode != "RGB":
+        _warn(
+            f"combine-mode:{node.as_pointer()}:{mode}",
+            f"{_node_tag(node)}: mode={mode!r} not supported (RGB only) — "
+            f"effect not baked",
+        )
+        return None
+    # CombineColor uses Red/Green/Blue, CombineRGB uses R/G/B.
+    if node.bl_idname == "ShaderNodeCombineRGB":
+        names = ("R", "G", "B")
+    else:
+        names = ("Red", "Green", "Blue")
+    chain_idx = next(
+        (i for i, n in enumerate(names) if n == chain_input_name), -1
+    )
+    if chain_idx < 0:
+        return None
+    consts: list[float | None] = [None, None, None]
+    for i, n in enumerate(names):
+        if i == chain_idx:
+            continue
+        sock = node.inputs.get(n)
+        if sock is None:
+            return None
+        if sock.is_linked:
+            v = _resolve_constant_scalar(sock)
+        else:
+            v = _socket_f(sock)
+        if v is None:
+            _warn(
+                f"combine-leaf:{node.as_pointer()}:{n}",
+                f"{_node_tag(node)}: non-chain input {n!r} not foldable to a "
+                f"constant — effect not baked",
+            )
+            return None
+        consts[i] = v
+    id_tuple = ("Combine", chain_idx,
+                tuple(round(float(c), 6) if c is not None else None for c in consts))
+
+    def apply(rgb):
+        # The chain delivers a 3-channel texture (the same texture sampled by
+        # the upstream nodes). We pick the chain_idx-th channel and assemble
+        # the output color with the constants in the other slots.
+        out = np.empty_like(rgb)
+        for i in range(3):
+            if i == chain_idx:
+                out[..., i] = rgb[..., chain_idx]
+            else:
+                out[..., i] = consts[i]
+        return out.astype(np.float32)
+
+    return id_tuple, apply
 
 
 def _math_transform(node, chain_input_name=None):
@@ -1813,17 +1957,32 @@ def _invert_transform(node):
 
 def _huesat_transform(node):
     import numpy as np
-    for n in ("Hue", "Saturation", "Value", "Fac"):
-        if n in node.inputs and node.inputs[n].is_linked:
+    # Each scalar parameter on this node may be driven by a chain (e.g. a
+    # ColorRamp into Hue, or a Math op driving Fac). We accept the chain as
+    # long as it folds to a constant — that's enough for lone_monk's
+    # `leather - book - cover` materials, where the artist clamped the Fac
+    # via Math.MULTIPLY but the multiplicands are all constants.
+    def _const_or_warn(name: str):
+        sock = node.inputs.get(name)
+        if sock is None:
+            return 1.0 if name == "Fac" else (0.5 if name == "Hue" else 1.0)
+        if not sock.is_linked:
+            return _socket_f(sock)
+        v = _resolve_constant_scalar(sock)
+        if v is None:
             _warn(
-                f"hsv-linked:{node.as_pointer()}:{n}",
-                f"{_node_tag(node)}: {n} input is linked — effect not baked",
+                f"hsv-linked:{node.as_pointer()}:{name}",
+                f"{_node_tag(node)}: {name} input is linked and not foldable "
+                f"to a constant — effect not baked",
             )
             return None
-    hue = _socket_f(node.inputs["Hue"])
-    sat = _socket_f(node.inputs["Saturation"])
-    val = _socket_f(node.inputs["Value"])
-    fac = _socket_f(node.inputs["Fac"]) if "Fac" in node.inputs else 1.0
+        return v
+    hue = _const_or_warn("Hue")
+    sat = _const_or_warn("Saturation")
+    val = _const_or_warn("Value")
+    fac = _const_or_warn("Fac") if "Fac" in node.inputs else 1.0
+    if hue is None or sat is None or val is None or fac is None:
+        return None
     id_tuple = (
         "HSV",
         round(hue, 6), round(sat, 6), round(val, 6), round(fac, 6),
@@ -1925,7 +2084,54 @@ def _clamp_transform(node):
 _SUPPORTED_MIX_BLENDS = frozenset((
     "MIX", "MULTIPLY", "ADD", "SUBTRACT", "SCREEN", "DIVIDE", "DIFFERENCE",
     "DARKEN", "LIGHTEN", "OVERLAY", "SOFT_LIGHT", "LINEAR_LIGHT",
+    "HUE", "SATURATION", "COLOR", "VALUE",
 ))
+
+
+def _rgb_to_hsv_np(rgb):
+    """Vectorised RGB→HSV that matches Blender's `rgb_to_hsv` (intern/cycles
+    convention): H in [0, 1), S in [0, 1], V in [0, 1]. Operates on the last
+    axis (..., 3) and returns the same shape."""
+    import numpy as np
+    r, g, b = rgb[..., 0], rgb[..., 1], rgb[..., 2]
+    mx = np.maximum(np.maximum(r, g), b)
+    mn = np.minimum(np.minimum(r, g), b)
+    v = mx
+    delta = mx - mn
+    s = np.where(mx > 0.0, delta / np.maximum(mx, 1e-30), 0.0)
+    # Hue piecewise.
+    rc = (mx - r) / np.maximum(delta, 1e-30)
+    gc = (mx - g) / np.maximum(delta, 1e-30)
+    bc = (mx - b) / np.maximum(delta, 1e-30)
+    h = np.where(r == mx, bc - gc,
+        np.where(g == mx, 2.0 + rc - bc, 4.0 + gc - rc))
+    h = (h / 6.0) % 1.0
+    h = np.where(delta > 0.0, h, 0.0)
+    return np.stack([h, s, v], axis=-1).astype(np.float32)
+
+
+def _hsv_to_rgb_np(hsv):
+    """Vectorised inverse of `_rgb_to_hsv_np`."""
+    import numpy as np
+    h, s, v = hsv[..., 0], hsv[..., 1], hsv[..., 2]
+    h6 = (h % 1.0) * 6.0
+    i = np.floor(h6).astype(np.int32) % 6
+    f = h6 - i.astype(np.float32)
+    p = v * (1.0 - s)
+    q = v * (1.0 - s * f)
+    t = v * (1.0 - s * (1.0 - f))
+    # `np.choose` chokes on >32-D inputs even for tiny arrays — use boolean
+    # masks instead, which broadcast cleanly through any shape.
+    r = np.where(i == 0, v, np.where(i == 1, q,
+        np.where(i == 2, p, np.where(i == 3, p,
+        np.where(i == 4, t, v)))))
+    g = np.where(i == 0, t, np.where(i == 1, v,
+        np.where(i == 2, v, np.where(i == 3, q,
+        np.where(i == 4, p, p)))))
+    b = np.where(i == 0, p, np.where(i == 1, p,
+        np.where(i == 2, t, np.where(i == 3, v,
+        np.where(i == 4, v, q)))))
+    return np.stack([r, g, b], axis=-1).astype(np.float32)
 
 
 def _find_base_color_attribute(sock, depth: int = 0) -> str | None:
@@ -2024,6 +2230,37 @@ def _apply_mix_blend(col1, col2, fac, blend: str, use_clamp: bool):
         out = facm * col1 + fac * ((1.0 - col1) * col2 * col1 + col1 * scr)
     elif blend == "LINEAR_LIGHT":
         out = col1 + fac * (2.0 * col2 - 1.0)
+    elif blend in ("HUE", "SATURATION", "COLOR", "VALUE"):
+        # HSV-based blends. Build a "target" RGB by swapping one or more
+        # HSV channels from col2 into col1, then lerp(col1, target, fac).
+        # Cycles short-circuits when the relevant col2 saturation is 0
+        # (HUE / SATURATION / COLOR) so the col1 chromaticity survives.
+        a1 = np.asarray(col1, dtype=np.float32)
+        a2 = np.asarray(col2, dtype=np.float32)
+        target_shape = np.broadcast_shapes(a1.shape, a2.shape)
+        c1 = np.broadcast_to(a1, target_shape)
+        c2 = np.broadcast_to(a2, target_shape)
+        hsv1 = _rgb_to_hsv_np(c1)
+        hsv2 = _rgb_to_hsv_np(c2)
+        if blend == "HUE":
+            tmp_hsv = np.stack([hsv2[..., 0], hsv1[..., 1], hsv1[..., 2]], axis=-1)
+            tmp_rgb = _hsv_to_rgb_np(tmp_hsv)
+            mixed = c1 * (1.0 - fac) + tmp_rgb * fac
+            out = np.where((hsv2[..., 1] != 0.0)[..., None], mixed, c1)
+        elif blend == "SATURATION":
+            tmp_hsv = np.stack([hsv1[..., 0], hsv2[..., 1], hsv1[..., 2]], axis=-1)
+            tmp_rgb = _hsv_to_rgb_np(tmp_hsv)
+            mixed = c1 * (1.0 - fac) + tmp_rgb * fac
+            out = np.where((hsv1[..., 1] != 0.0)[..., None], mixed, c1)
+        elif blend == "COLOR":
+            tmp_hsv = np.stack([hsv2[..., 0], hsv2[..., 1], hsv1[..., 2]], axis=-1)
+            tmp_rgb = _hsv_to_rgb_np(tmp_hsv)
+            mixed = c1 * (1.0 - fac) + tmp_rgb * fac
+            out = np.where((hsv2[..., 1] != 0.0)[..., None], mixed, c1)
+        else:  # VALUE
+            tmp_hsv = np.stack([hsv1[..., 0], hsv1[..., 1], hsv2[..., 2]], axis=-1)
+            tmp_rgb = _hsv_to_rgb_np(tmp_hsv)
+            out = c1 * (1.0 - fac) + tmp_rgb * fac
     else:
         raise AssertionError(f"unreachable blend: {blend}")
     if use_clamp:
