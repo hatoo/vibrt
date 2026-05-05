@@ -2147,6 +2147,46 @@ static __device__ float ies_lookup(const float *ies_data,
   return ab * (1.0f - th) + cd * th;
 }
 
+// Sum of all sun-light NEE pdfs at a given world-space direction. Used
+// to extend the MIS denominator across NEE strategies so envmap NEE,
+// sun NEE, and BSDF-sampled paths combine into a single unbiased
+// estimator. Returns 0 when `dir` is outside every sun's cone.
+static __device__ float sum_sun_nee_pdf(float3 dir) {
+  float p = 0.0f;
+  for (int i = 0; i < params.num_sun_lights; i++) {
+    SunLight &sl = params.sun_lights[i];
+    float3 sd = make_f3(sl.direction);
+    float cos_to_sun = dot3(dir, sd);
+    if (cos_to_sun > sl.cos_angle) {
+      float sun_omega = 2.0f * M_PIf * fmaxf(1.0f - sl.cos_angle, 1e-30f);
+      p += 1.0f / sun_omega;
+    }
+  }
+  return p;
+}
+
+// Envmap NEE pdf at a world-space direction (0 when there's no envmap
+// or the bake's integral is empty).
+static __device__ float sum_env_nee_pdf(float3 dir) {
+  if (params.world_type != 0 && params.envmap_integral > 0.0f) {
+    return envmap_pdf(dir);
+  }
+  return 0.0f;
+}
+
+// 3-strategy power-heuristic with β=2. Picks `pdf_self` against the
+// other two strategies' pdfs so the chosen-sample's MIS weight forms a
+// proper mixture density across env NEE / sun NEE / BSDF sampling.
+static __device__ float power_heuristic_3(float pdf_self,
+                                           float pdf_o1,
+                                           float pdf_o2) {
+  float a = pdf_self * pdf_self;
+  float b = pdf_o1 * pdf_o1;
+  float c = pdf_o2 * pdf_o2;
+  float denom = a + b + c;
+  return (denom > 0.0f) ? a / denom : 0.0f;
+}
+
 // ---------- Direct lighting (NEE) ----------
 //
 // `vstack` is the shadow ray's starting volume stack. For surface NEE this is
@@ -2211,7 +2251,13 @@ static __device__ float3 direct_light(const MaterialEvalGroup &e, float3 P,
     BsdfEval b = eval_bsdf(e, wo, wi);
     float sun_omega = 2.0f * M_PIf * fmaxf(1.0f - cos_a, 1e-30f);
     float pdf_sun = 1.0f / sun_omega;
-    float w_sun = power_heuristic(pdf_sun, b.pdf);
+    // 3-strategy MIS: balance sun NEE against the (residual) envmap NEE
+    // and the BSDF sample. Without the env NEE term the denominator
+    // missed the case where the envmap CDF picks a direction inside the
+    // sun cone — rare but not zero, since the bake's clipped sun pixels
+    // have nonzero luminance after `_extract_sun_from_bake_inplace`.
+    float pdf_env_at_dir = sum_env_nee_pdf(wi);
+    float w_sun = power_heuristic_3(pdf_sun, pdf_env_at_dir, b.pdf);
     L = L + b.f * vis * make_f3(sl.emission) * w_sun;
   }
 
@@ -2390,7 +2436,14 @@ static __device__ float3 direct_light(const MaterialEvalGroup &e, float3 P,
       if (luminance(vis) > 0.0f) {
         BsdfEval b = eval_bsdf(e, wo, es.dir);
         if (b.pdf > 0.0f) {
-          float w = power_heuristic(es.pdf, b.pdf);
+          // 3-strategy MIS: balance envmap NEE against the sun cones'
+          // delta NEE and the BSDF sample. Without the sun NEE term in
+          // the denominator the envmap-CDF samples that landed inside
+          // a sun cone (clipped sun pixels in the bake retain a small
+          // pdf) double-counted against sun NEE; the asymmetry showed
+          // up as a slight over-delivery on lit surfaces near the sun.
+          float pdf_sun_at_dir = sum_sun_nee_pdf(es.dir);
+          float w = power_heuristic_3(es.pdf, pdf_sun_at_dir, b.pdf);
           L = L + b.f * vis * es.L * (w / es.pdf);
         }
       }
@@ -3160,8 +3213,16 @@ static __device__ float3 trace_path(float3 origin, float3 dir, RNG &rng,
       float w = 1.0f;
       if (bounce > 0 && !last_specular) {
         if (params.world_type != 0) {
+          // 3-strategy MIS: BSDF sample vs envmap NEE vs sun NEE. The
+          // sun term matters when the BSDF-sampled ray happens to land
+          // inside a sun cone — the clipped envmap pixels there have
+          // small `envmap_pdf` so the original 2-strategy MIS gave the
+          // BSDF side full weight and added the (clipped, ~13×) sun
+          // pixel value, double-counting on top of the dedicated sun
+          // MIS branch a few lines below.
           float p_env = envmap_pdf(dir);
-          w = power_heuristic(prev_bsdf_pdf, p_env);
+          float p_sun = sum_sun_nee_pdf(dir);
+          w = power_heuristic_3(prev_bsdf_pdf, p_env, p_sun);
         } else {
           // Constant world: NEE samples cosine-weighted hemisphere with
           // pdf = max(0, NoL) / π. MIS against the BSDF sample's pdf
@@ -3210,7 +3271,13 @@ static __device__ float3 trace_path(float3 origin, float3 dir, RNG &rng,
           // vertex), so the sun's emission arrives unweighted here.
           w_bsdf = 1.0f;
         } else {
-          w_bsdf = power_heuristic(prev_bsdf_pdf, pdf_sun);
+          // 3-strategy MIS: BSDF sample vs sun NEE vs envmap NEE. The
+          // env term is small (clipped sun pixels) but non-zero; the
+          // existing 2-strategy form would be biased when the BSDF
+          // happens to sample the sun direction and the envmap CDF
+          // could have plausibly delivered the same direction.
+          float p_env = sum_env_nee_pdf(dir);
+          w_bsdf = power_heuristic_3(prev_bsdf_pdf, pdf_sun, p_env);
         }
         float3 Le_sun = make_f3(sl.emission) / sun_omega;
         float3 sun_contrib = throughput * Le_sun * w_bsdf;
