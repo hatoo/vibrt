@@ -1515,9 +1515,17 @@ static __device__ BsdfEval eval_bsdf_one(const MaterialEval &e, float3 wo,
   float NoL = dot3(e.Ns, wi);
   bool reflect = NoL > 0.0f;
   bool transmit = !reflect && e.transmission > 0.0f;
-  // SSS can also contribute diffusely when the light is slightly behind the
-  // surface (wraparound lobe).
-  bool sss_backlit = !reflect && e.mat->sss_weight > 0.0f && NoL > -1.0f;
+  // SSS back-hemisphere wraparound: previously delivered `base × NoL_wrap`
+  // for any back-side light source as a "wrap-Lambert" softening hack, but
+  // vibrt has no notion of object thickness or scattering attenuation, so
+  // it would route the FULL Le from very bright back-hemisphere lights into
+  // the camera-facing surface — Cycles' random-walk SSS attenuates this
+  // through the volume (junk_shop's Furniture saw 1000× over-delivery from
+  // the 30m-wide energy-15707 Background Blue area light at NoL=-0.687).
+  // Disable the back-hemisphere SSS contribution. Front-hemisphere wrap
+  // softening (the NoL_std → NoL_wrap blend at the terminator) stays in
+  // place since that does NOT pull energy in from outside the cosine cone.
+  bool sss_backlit = false;
   // Translucent BSDF: Lambertian on the back hemisphere. Active when wi is
   // on the side opposite wo (NoL < 0) — light passing through a thin sheet.
   bool translucent_active =
