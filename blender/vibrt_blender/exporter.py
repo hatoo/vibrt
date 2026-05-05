@@ -2096,8 +2096,22 @@ def _extract_sun_from_bake_inplace(rgb, w: int, h: int, sky_node, world_name: st
     p_med = float(np.percentile(lum, 50.0))
     if p_med <= 0.0 or lum_max / max(p_med, 1e-4) < 3.0:
         return None
+    # Pick a threshold that catches only the sun cone, not the bright
+    # sky around it. lone_monk debug (2026-05-04) showed the prior
+    # `p99 × 1.5` threshold clipped pixels at lum~13, but the actual
+    # sun cone sits 4-5 orders of magnitude brighter (p99.999 = 530k,
+    # p99.99 = 13.7 — i.e. the bake's bright-sky-near-sun region
+    # straddles 8-14, while the sun pixels themselves jump to 5×10⁵+).
+    # Clipping at p99×1.5 collapsed ~1% of the bake (the wide bright-
+    # sky shoulder) into the dedicated SunLight, so envmap-NEE samples
+    # for indirect bounces lost most of their lit-sky contribution
+    # (vibrt total linear energy was 32% of Cycles on the all-white
+    # diagnostic). Use the much steeper p99.99×10 threshold so only
+    # the genuine sun-disc spike crosses it; keep `lum_max ≥ threshold`
+    # as the no-disc bail.
     p99 = float(np.percentile(lum, 99.0))
-    threshold = p99 * 1.5
+    p99_99 = float(np.percentile(lum, 99.99))
+    threshold = max(p99_99 * 10.0, p99 * 1.5)
     if lum_max < threshold:
         return None
     bright_mask = lum > threshold
