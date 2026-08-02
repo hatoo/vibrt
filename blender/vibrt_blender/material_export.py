@@ -218,12 +218,13 @@ def export_image_texture(
     """Serialize an image into scene.bin and register a TextureDesc entry.
 
     Accepts either a `bpy.types.Image` (chain transforms baked into its pixels)
-    or a `_PreBakedTexture` (already in linear space; chain ignored, must be
-    empty). Returns the texture index. Reuses existing entries by cache key.
+    or a `_PreBakedTexture` (already in linear space; chain is applied on top of
+    the prebaked pixels). Returns the texture index. Reuses existing entries by
+    cache key.
     """
     import numpy as np
     if isinstance(image, _PreBakedTexture):
-        return _export_prebaked(image, writer, textures)
+        return _export_prebaked(image, writer, textures, chain=chain)
     chain_key = "" if not chain else "|" + repr(tuple(x[0] for x in chain))
     key = f"__image__{image.name}{chain_key}"
     for i, t in enumerate(textures):
@@ -291,13 +292,28 @@ def export_image_texture(
     return len(textures) - 1
 
 
-def _export_prebaked(pb: "_PreBakedTexture", writer, textures: list) -> int:
+def _export_prebaked(pb: "_PreBakedTexture", writer, textures: list, chain: tuple = ()) -> int:
     import numpy as np
+    # A non-empty chain carries the residual colour transforms that sit above
+    # the baked Mix (e.g. a terminal HueSaturation Value dimming). It must be
+    # folded into the cache key so two materials sharing the same prebaked
+    # base but a different terminal transform get distinct entries.
+    chain_key = "" if not chain else "|" + repr(tuple(x[0] for x in chain))
+    key = pb.cache_key + chain_key
     for i, t in enumerate(textures):
-        if t.get("_key") == pb.cache_key:
+        if t.get("_key") == key:
             return i
     rgb = pb.rgb
     w, h = int(pb.w), int(pb.h)
+    if chain:
+        # Prebaked pixels are already linear; apply the chain transforms in
+        # place (texture-first → outer-last, same order as `_bake_chain`).
+        # Done at full resolution before the texture_pct resample, mirroring
+        # the bpy.Image path in `export_image_texture`.
+        rgb = np.asarray(rgb, dtype=np.float32).reshape((h, w, 3)).copy()
+        for _id, apply_fn in chain:
+            rgb = apply_fn(rgb)
+        rgb = np.ascontiguousarray(rgb, dtype=np.float32)
     if _TEXTURE_PCT is not None and _TEXTURE_PCT != 100:
         new_w = max(1, int(round(w * _TEXTURE_PCT / 100.0)))
         new_h = max(1, int(round(h * _TEXTURE_PCT / 100.0)))
@@ -313,7 +329,7 @@ def _export_prebaked(pb: "_PreBakedTexture", writer, textures: list) -> int:
         "height": h,
         "channels": 4,
         "colorspace": "linear",
-        "_key": pb.cache_key,
+        "_key": key,
         **writer.write_texture_pixels(pixels),
     }
     textures.append(desc)
