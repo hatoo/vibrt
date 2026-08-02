@@ -3120,6 +3120,19 @@ def _try_emit_color_graph(sock, writer, textures, group_stack=None, vc_attrs=Non
                 return idx
             return None
 
+        if bl == "ShaderNodeValue":
+            # A scalar Value node feeding a Color socket broadcasts to
+            # (v, v, v) *linear* — Cycles does not sRGB-decode node data.
+            # Without this the caller fell back to the Color socket's stale
+            # default_value (whatever the artist left before wiring the Value
+            # node), which for lone_monk's `dark` material was 0.0155 instead
+            # of the Value's 0.15 — a ~10× too-dark diffuse albedo.
+            v = float(link.from_socket.default_value)
+            idx = len(nodes)
+            nodes.append({"type": "const", "rgb": [v, v, v]})
+            memo[key] = idx
+            return idx
+
         if bl == "ShaderNodeValToRGB":
             # ColorRamp: scalar in, RGB out. We fold it to a Const node when
             # the Fac chain reduces to a constant (noise / procedural leaves
