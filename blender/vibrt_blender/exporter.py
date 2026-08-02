@@ -1596,11 +1596,19 @@ def _prebake_sky_node_alone(world, sky_node, w: int, h: int) -> None:
     bg.inputs["Strength"].default_value = 1.0
     sky_clone = nt.nodes.new("ShaderNodeTexSky")
     # Copy the Sky Texture's relevant attributes onto the clone so the
-    # bake reproduces what the original node would emit.
+    # bake reproduces what the original node would emit. `sun_direction`
+    # is authoritative for the PREETHAM / HOSEK_WILKIE models (the
+    # sun_elevation / sun_rotation pair only drives NISHITA); it is copied
+    # LAST so that, on a Preetham node, a preceding sun_elevation write
+    # can't leave a stale direction. Omitting it made pabellon's warm
+    # low-sun "sunset" world bake as a blue zenith-sun daytime sky.
+    # `aerosol_density` is the current name for what older builds called
+    # `dust_density`; copy both so either Blender version transfers the value.
     for attr in ("sky_type", "sun_disc", "sun_size", "sun_intensity",
                  "sun_elevation", "sun_rotation", "altitude",
-                 "air_density", "dust_density", "ozone_density",
-                 "ground_albedo", "turbidity"):
+                 "air_density", "dust_density", "aerosol_density",
+                 "ozone_density", "ground_albedo", "turbidity",
+                 "sun_direction"):
         if hasattr(sky_node, attr) and hasattr(sky_clone, attr):
             try:
                 setattr(sky_clone, attr, getattr(sky_node, attr))
