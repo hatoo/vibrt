@@ -3462,27 +3462,24 @@ static __device__ float3 trace_path(float3 origin, float3 dir, RNG &rng,
       if (transmission_bounces > params.max_transmission_bounces)
         break;
     }
-    // Update filter-glossy state. After every glossy / transmission
-    // bounce, narrow the path's pdf floor to the just-sampled value so
-    // the next surface's α is widened proportionally. Diffuse bounces
-    // don't update min_pdf because their pdf is already broad
-    // (cosine-weighted hemisphere integrates to 1).
-    if (params.filter_glossy > 0.0f
-        && (bs.lobe == LOBE_GLOSSY || bs.lobe == LOBE_TRANSMISSION)) {
+    // Update filter-glossy state (Cycles-exact). Cycles tracks the
+    // minimum bsdf pdf along the path across *all* non-delta bounces —
+    // diffuse included, because the broad diffuse pdf (~NoL/π) is exactly
+    // what drops `min_ray_pdf` and triggers blurring of glossy lobes seen
+    // downstream (the diffuse→glossy→small-light caustic paths that
+    // otherwise firefly). `filter_glossy` holds the UI `blur_glossy`
+    // value: blur_pdf = min_ray_pdf / blur_glossy, and the roughness (α)
+    // floor is 0.5·sqrt(1 − blur_pdf) when blur_pdf < 1 (matches Cycles'
+    // `surface_shader_bsdf_blur`). Near-mirror / smooth-glass bounces
+    // carry a huge pdf so `fminf` leaves min_ray_pdf untouched; camera
+    // rays start at min_ray_pdf = 1e30 → no blur on primary visibility.
+    if (params.filter_glossy > 0.0f) {
       path_min_ray_pdf = fminf(path_min_ray_pdf, bs.pdf);
-      // α_min = sqrt(filter_glossy / min_pdf). Cycles' filter_glossy of
-      // 1.0 with a typical glossy bounce pdf of 100 → α_min = 0.10
-      // (roughness ≈ 0.32). filter_glossy=5.0 (pabellon) gives α_min
-      // ≈ 0.22 (roughness ≈ 0.47) — substantial widening of any
-      // near-mirror lobe encountered downstream.
-      float new_min_alpha =
-          sqrtf(params.filter_glossy /
-                fmaxf(path_min_ray_pdf, 1e-6f));
-      // Cap at α=1 (roughness=1, fully diffuse-like) so high
-      // filter_glossy values on a very sharp bounce don't produce
-      // numerically silly alphas.
-      new_min_alpha = fminf(new_min_alpha, 1.0f);
-      min_alpha = fmaxf(min_alpha, new_min_alpha);
+      float blur_pdf = path_min_ray_pdf / params.filter_glossy;
+      if (blur_pdf < 1.0f) {
+        float blur_roughness = 0.5f * sqrtf(fmaxf(0.0f, 1.0f - blur_pdf));
+        min_alpha = fmaxf(min_alpha, blur_roughness);
+      }
     }
 
     // Russian roulette after a few bounces
