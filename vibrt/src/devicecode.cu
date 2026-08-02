@@ -1591,23 +1591,22 @@ static __device__ BsdfEval eval_bsdf_one(const MaterialEval &e, float3 wo,
     sss_tint = make_float3(rr.x / rmax, rr.y / rmax, rr.z / rmax);
   }
 
-  // Wraparound brightness for SSS: allows a bit of back-lit contribution.
   float NoL_std = fmaxf(NoL, 0.0f);
-  // Energy-conserving wrap-Lambert. The raw 0.5(1+NoL) wrap integrates to
-  // 1.5× the cosine lobe over the hemisphere (∫0.5(1+cosθ)sinθ dθdφ = 1.5π
-  // vs Lambert's π), so at sss_weight=1 it reflected ~50% more than the
-  // material albedo — and far more at grazing angles. Cycles' random-walk
-  // SSS conserves energy to the subsurface albedo, so junk_shop's Furniture
-  // (sss_weight=1) over-delivered ~2.5× in bright regions. Scale by 2/3 so
-  // ∫ NoL_wrap dω = ∫ NoL dω = π, matching Lambert's albedo.
-  float NoL_wrap = 0.5f * (1.0f + NoL) * (2.0f / 3.0f);
+  // Wrap-Lambert term, kept only for the (currently disabled) back-hemisphere
+  // SSS block below. The front hemisphere uses plain Lambert — see the
+  // diffuse lobe.
+  float NoL_wrap = 0.5f * (1.0f + NoL);
 
   if (reflect) {
-    // Diffuse (Lambert, possibly wrap-shifted by SSS). The wrap term only
-    // modifies f — the sampler is plain cosine hemisphere, so the MIS pdf
-    // has to stay at NoL/π to match what was actually sampled.
+    // Diffuse. For subsurface materials Cycles' random-walk SSS delivers,
+    // for a convex surface under front lighting, approximately Lambertian
+    // reflectance with the subsurface albedo (the diffusion approximation).
+    // The earlier wrap-Lambert front term over-brightened grazing / rim-lit
+    // regions even after energy normalisation (junk_shop's Furniture stayed
+    // ~1.3× over), so use plain Lambert here; the radius-derived `sss_tint`
+    // still carries the channel-dependent colour shift.
     if (w_diffuse > 0.0f) {
-      float effective = (1.0f - sss_w) * NoL_std + sss_w * NoL_wrap;
+      float effective = NoL_std;
       float3 bc_sss = e.base_color * (make_float3(1, 1, 1) * (1.0f - sss_w) +
                                       sss_tint * sss_w);
       r.f = r.f + bc_sss * (INV_PIf * w_diffuse * effective);
