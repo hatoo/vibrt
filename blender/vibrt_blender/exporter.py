@@ -996,6 +996,17 @@ def _export_light(obj, writer, textures: list) -> dict | None:
 _SKY_BAKE_CACHE: dict[str, tuple] = {}
 
 
+def _sun_dir_key(sky_node) -> str:
+    """Compact, stable string for a Sky node's `sun_direction` vector (the
+    authoritative sun position for PREETHAM / HOSEK_WILKIE). Empty string
+    when the node has no such attribute (older builds), so those keys are
+    unchanged."""
+    d = getattr(sky_node, "sun_direction", None)
+    if d is None:
+        return ""
+    return f"{d[0]:.4f},{d[1]:.4f},{d[2]:.4f}"
+
+
 def _sky_node_cache_key(world, sky_node) -> str:
     """Stable key tying a baked envmap to (world, all Sky Texture controls).
 
@@ -1015,7 +1026,11 @@ def _sky_node_cache_key(world, sky_node) -> str:
         f"sd{int(sky_node.sun_disc)}_"
         f"ss{sky_node.sun_size:.6f}_"
         f"si{sky_node.sun_intensity:.4f}_"
-        f"ga{sky_node.ground_albedo:.4f}"
+        f"ga{sky_node.ground_albedo:.4f}_"
+        # sun_direction is authoritative for PREETHAM / HOSEK_WILKIE, so it
+        # must participate or an animated sun (direction changing while the
+        # stale sun_elevation stays put) would reuse the wrong bake.
+        f"sdir{_sun_dir_key(sky_node)}"
     )
 
 
@@ -1067,8 +1082,12 @@ def _sky_node_alone_cache_key(world, sky_node) -> str:
     sun_size = float(getattr(sky_node, "sun_size", 0.0))
     sun_disc = bool(getattr(sky_node, "sun_disc", False))
     sky_type = getattr(sky_node, "sky_type", "?")
+    # sun_direction is the authoritative sun position for PREETHAM /
+    # HOSEK_WILKIE; without it two sunset skies differing only in direction
+    # (identical stale sun_elevation) would collide on the same cached bake.
     return (f"__sky_alone__{world.name}__{sky_node.name}__{sky_type}__"
-            f"{sun_rot}__{sun_elev}__{sun_size}__{sun_disc}__1024x512")
+            f"{sun_rot}__{sun_elev}__{sun_size}__{sun_disc}__"
+            f"{_sun_dir_key(sky_node)}__1024x512")
 
 
 def _detect_mix_world_camera_ray_split(world):
@@ -1761,10 +1780,14 @@ def _clone_shader_node(src_node, dst_tree):
         return None
     bl = src_node.bl_idname
     if bl == "ShaderNodeTexSky":
+        # `sun_direction` is authoritative for PREETHAM / HOSEK_WILKIE (the
+        # sun_elevation/sun_rotation pair only drives NISHITA); copy it last
+        # so a preceding sun_elevation write can't leave a stale direction.
+        # See `_prebake_sky_node_alone` for the mixed-world variant of this bug.
         for attr in ("sky_type", "sun_disc", "sun_size", "sun_intensity",
                      "sun_elevation", "sun_rotation", "altitude",
                      "air_density", "aerosol_density", "ozone_density",
-                     "ground_albedo", "turbidity"):
+                     "ground_albedo", "turbidity", "sun_direction"):
             if hasattr(src_node, attr) and hasattr(new_node, attr):
                 try:
                     setattr(new_node, attr, getattr(src_node, attr))
