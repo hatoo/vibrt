@@ -1609,7 +1609,23 @@ static __device__ BsdfEval eval_bsdf_one(const MaterialEval &e, float3 wo,
       float effective = NoL_std;
       float3 bc_sss = e.base_color * (make_float3(1, 1, 1) * (1.0f - sss_w) +
                                       sss_tint * sss_w);
-      r.f = r.f + bc_sss * (INV_PIf * w_diffuse * effective);
+      // Energy coupling with the dielectric specular layer above the
+      // diffuse. Cycles' Principled attenuates the diffuse by the
+      // specular layer's directional-hemispherical reflectance so the
+      // pair conserves energy: a white-furnace base-0.8 plane reads
+      // albedo 0.750 (= 0.8 * (1 - E_spec)) in Cycles, but vibrt read
+      // 0.803 (the full Lambert) — an unattenuated diffuse that, summed
+      // over multi-bounce GI, ran the closed 0.8-box ~1.18x over. The
+      // attenuation is VIEW-side only (E_spec(NoV), integrated over
+      // incoming) — the earlier directional (1-F(NoV))(1-F(NoL)) form
+      // over-darkened grazing-lit direct shading. `pure_diff` (Cycles'
+      // standalone Diffuse BSDF, no spec layer) keeps the full Lambert.
+      float spec_T = 1.0f;
+      if (!pure_diff) {
+        float E_spec_v = f_avg_schlick(F0_d) * ggx_e_lookup(NoV, e.alpha);
+        spec_T = 1.0f - fminf(fmaxf(E_spec_v, 0.0f), 0.99f);
+      }
+      r.f = r.f + bc_sss * (INV_PIf * w_diffuse * effective * spec_T);
       r.pdf += p_diff * NoL_std * INV_PIf;
     }
     // Specular (metallic + dielectric spec layer). Skipped entirely for
