@@ -4477,14 +4477,25 @@ def _from_mix(node, writer, textures, mat_name: str) -> dict:
         n2_trans = n2.bl_idname == "ShaderNodeBsdfTransparent"
         if n1_trans and not n2_trans:
             out = dict(p2)
-            out["alpha_blend"] = max(0.0, min(1.0, fac))
+            w_opaque = max(0.0, min(1.0, fac))
+            out["alpha_blend"] = w_opaque
+            # `alpha_blend` scales the opaque BSDF in the kernel but NOT the
+            # emission, so the opaque-side weight has to be folded into the
+            # emission here. Otherwise MixShader(fac, Transparent, Emission)
+            # delivers the full emission instead of `fac × emission` (2× too
+            # bright at fac=0.5).
+            if "emission" in out:
+                out["emission"] = [e * w_opaque for e in out["emission"]]
             if (n2.bl_idname == "ShaderNodeEmission"
                     and _chain_contains_texsky(n2.inputs["Color"])):
                 out["_is_daylight_portal"] = True
             return out
         if n2_trans and not n1_trans:
             out = dict(p1)
-            out["alpha_blend"] = max(0.0, min(1.0, 1.0 - fac))
+            w_opaque = max(0.0, min(1.0, 1.0 - fac))
+            out["alpha_blend"] = w_opaque
+            if "emission" in out:
+                out["emission"] = [e * w_opaque for e in out["emission"]]
             if (n1.bl_idname == "ShaderNodeEmission"
                     and _chain_contains_texsky(n1.inputs["Color"])):
                 out["_is_daylight_portal"] = True
