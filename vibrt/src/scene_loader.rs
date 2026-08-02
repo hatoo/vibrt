@@ -330,7 +330,17 @@ pub fn load_scene_from_bytes<'a>(
                 let dir = transform::transform_dir(&t, [0.0, 0.0, -1.0]);
                 let dir = normalize3(dir);
                 let cos_outer = cone_rad.cos();
-                let cos_inner = (cone_rad * (1.0 - blend)).cos();
+                // Cycles blends the spot smoothstep in COSINE space, not angle
+                // space: `spot_smooth = 1/((1-cos_half)*blend)` so the inner
+                // edge (attenuation=1) sits at
+                // `cos_inner = cos_half + (1-cos_half)*blend`
+                // (scene/light.cpp:176-177, kernel/light/spot.h:30). vibrt
+                // previously interpolated the half-angle itself
+                // (`cos((1-blend)*cone_rad)`), which matches only at the
+                // blend=0/1 endpoints and under/over-attenuated the penumbra
+                // for intermediate blends — under-delivering ies_light's spot
+                // and shifting classroom's five spot cones.
+                let cos_inner = cos_outer + (1.0 - cos_outer) * blend;
                 // A Cycles spot is a *point light with a cone mask*: the
                 // radiant intensity is `power / (4π)` (exactly like a point
                 // light) and the cone smoothstep only attenuates it — it does
