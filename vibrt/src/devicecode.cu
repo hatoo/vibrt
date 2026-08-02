@@ -2328,8 +2328,14 @@ static __device__ float3 direct_light(const MaterialEvalGroup &e, float3 P,
             float pdf_solid = pdf_area * d2 / cos_light;
             float pdf = pdf_solid * pmf_light;
             if (pdf > 0.0f) {
+              // Area rects emit along local +Z, but `ies_lookup` measures
+              // theta from local -Z (the point/spot "down" convention). The
+              // outgoing direction is -wi ≈ +Z, so pass `wi` (= -outgoing)
+              // to map the emission axis onto the profile's theta=0 peak.
+              // With -wi the lookup landed at theta≈180° (the profile's zero
+              // backside) and the IES area light delivered nothing.
               float ies = ies_lookup(ar.ies_data, ar.ies_n_v, ar.ies_n_h,
-                                     ar.light_rotation, -wi);
+                                     ar.light_rotation, wi);
               L = L + b.f * vis * make_f3(ar.emission) * ies / pdf;
             }
           }
@@ -2599,8 +2605,10 @@ static __device__ float3 direct_light_volume(float3 P, float3 wi_world,
             float pdf_solid = pdf_area * d2 / cos_light;
             float pdf = pdf_solid * pmf_light;
             if (pdf > 0.0f) {
+              // See the radiance-path area block: -wi lands on the profile's
+              // zero backside because the rect emits along +Z; pass `wi`.
               float ies = ies_lookup(ar.ies_data, ar.ies_n_v, ar.ies_n_h,
-                                     ar.light_rotation, -wi);
+                                     ar.light_rotation, wi);
               add(wi, make_f3(ar.emission) * ies / pdf, vis);
             }
           }

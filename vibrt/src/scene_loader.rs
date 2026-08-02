@@ -340,13 +340,16 @@ pub fn load_scene_from_bytes<'a>(
                 let solid_angle = 2.0 * std::f32::consts::PI * (1.0 - cos_outer).max(1e-4);
                 let coeff = match ies {
                     Some(p) if p.peak_absolute_candela > 1e-6 => {
-                        // Cycles convention — see Point branch for the
-                        // `power × peak_absolute_candela / π` derivation.
-                        // Spot-cone attenuation is layered on top in the
-                        // kernel, but the IES already encodes the
-                        // beam shape so the spot's own cone usually
-                        // matches or exceeds the IES envelope.
-                        power * p.peak_absolute_candela / std::f32::consts::PI
+                        // Cycles convention, identical to the Point branch:
+                        // `coeff = power × peak_absolute_candela / (4π)`. A
+                        // Cycles spot is a point light with a cone mask, so
+                        // it shares the point light's eval_fac / pdf chain —
+                        // the spot-cone attenuation is layered on top in the
+                        // kernel. (This previously divided by π, a 4×
+                        // over-delivery that made ies_light's spot ~2.4× too
+                        // bright.)
+                        power * p.peak_absolute_candela
+                            / (4.0 * std::f32::consts::PI)
                     }
                     Some(p) if p.integral_norm > 1e-6 => power / p.integral_norm,
                     _ => power / solid_angle,
