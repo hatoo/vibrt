@@ -331,28 +331,25 @@ pub fn load_scene_from_bytes<'a>(
                 let dir = normalize3(dir);
                 let cos_outer = cone_rad.cos();
                 let cos_inner = (cone_rad * (1.0 - blend)).cos();
-                // Without IES: distribute power uniformly over the spot
-                // cone (solid_angle = 2π(1-cos_outer)).
-                // With IES: divide by the IES profile's integral so
-                // the IES profile (which can be narrower than the
-                // spot cone) controls concentration. See the Point
-                // branch for the same formulation and caveats.
-                let solid_angle = 2.0 * std::f32::consts::PI * (1.0 - cos_outer).max(1e-4);
+                // A Cycles spot is a *point light with a cone mask*: the
+                // radiant intensity is `power / (4π)` (exactly like a point
+                // light) and the cone smoothstep only attenuates it — it does
+                // NOT concentrate the flux into the cone. vibrt's kernel
+                // already applies the cone `falloff`, so every branch here
+                // uses the point-light coeff. (This previously divided by the
+                // cone solid angle `2π(1-cos_outer)`, concentrating the flux —
+                // a plain 60° spot came out ~14× too bright vs Cycles.)
                 let coeff = match ies {
                     Some(p) if p.peak_absolute_candela > 1e-6 => {
                         // Cycles convention, identical to the Point branch:
-                        // `coeff = power × peak_absolute_candela / (4π)`. A
-                        // Cycles spot is a point light with a cone mask, so
-                        // it shares the point light's eval_fac / pdf chain —
-                        // the spot-cone attenuation is layered on top in the
-                        // kernel. (This previously divided by π, a 4×
-                        // over-delivery that made ies_light's spot ~2.4× too
-                        // bright.)
+                        // `coeff = power × peak_absolute_candela / (4π)`.
+                        // (Previously divided by π, a 4× over-delivery that
+                        // made ies_light's spot ~2.4× too bright.)
                         power * p.peak_absolute_candela
                             / (4.0 * std::f32::consts::PI)
                     }
                     Some(p) if p.integral_norm > 1e-6 => power / p.integral_norm,
-                    _ => power / solid_angle,
+                    _ => power / (4.0 * std::f32::consts::PI),
                 };
                 let emission = [color[0] * coeff, color[1] * coeff, color[2] * coeff];
                 // Light's local frame for IES sampling: build from the
