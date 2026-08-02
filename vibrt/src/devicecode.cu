@@ -2102,11 +2102,13 @@ static __device__ float ies_lookup(const float *ies_data,
   // -local.z / len.
   float cos_t = fminf(1.0f, fmaxf(-1.0f, -local.z / len));
   float theta_deg = acosf(cos_t) * (180.0f / M_PIf);
-  // phi: angle around the IES axis. atan2(local.y, local.x) in radians,
-  // then to degrees in [0, 360).
-  float phi_rad = atan2f(local.y, local.x);
-  if (phi_rad < 0.0f)
-    phi_rad += 2.0f * M_PIf;
+  // phi: horizontal angle around the IES axis. Match Cycles'
+  // `kernel/svm/ies.h`: `h_angle = atan2f(vector.x, vector.y) + PI`
+  // (NOT atan2(y,x)) — the LM-63 Type-C horizontal convention. For
+  // radially-symmetric profiles (n_h==1) phi is ignored, but directional
+  // profiles (e.g. comet.ies, n_h=5) read the wrong lobe under the old
+  // atan2(y,x) form, under-delivering the point/spot IES lamps.
+  float phi_rad = atan2f(local.x, local.y) + M_PIf;
   float phi_deg = phi_rad * (180.0f / M_PIf);
 
   // Bilinear lookup in the table.
