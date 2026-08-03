@@ -2988,11 +2988,17 @@ extern "C" __global__ void __miss__ms() {
 extern "C" __global__ void __miss__shadow() { optixSetPayload_0(1u); }
 
 static __forceinline__ __device__ float3 clamp_indirect(float3 c,
-                                                         float max_lum) {
-  if (max_lum <= 0.0f)
+                                                         float max_sum) {
+  if (max_sum <= 0.0f)
     return c;
-  float l = luminance(c);
-  return (l > max_lum) ? c * (max_lum / l) : c;
+  // Cycles' `film_clamp_light` compares against `reduce_add(fabs(L))` — the
+  // SUM of the spectrum's components — not luminance. For a white
+  // contribution this clamps at max_sum/3 (Cycles) vs max_sum (a luminance
+  // test), so a luminance test lets ~3× more energy through before clamping;
+  // on aggressively-clamped scenes (classroom: clamp_indirect=3) that reads
+  // as a broad indirect over-delivery. Match Cycles exactly.
+  float s = fabsf(c.x) + fabsf(c.y) + fabsf(c.z);
+  return (s > max_sum) ? c * (max_sum / s) : c;
 }
 
 // Ray/rect-light intersection: returns closest one-sided front-face hit inside
