@@ -1906,12 +1906,22 @@ static __device__ BsdfSample sample_bsdf_one(const MaterialEval &e, float3 wo,
   float cF0 = ((e.mat->coat_ior - 1.0f) / (e.mat->coat_ior + 1.0f)) *
               ((e.mat->coat_ior - 1.0f) / (e.mat->coat_ior + 1.0f));
   float t_w = e.mat->translucent_weight;
+  // Match eval_bsdf_one's lobe gating exactly. Without the `pure_diff`
+  // gate here the sampler picked the (eval-zeroed) specular lobe ~50% of
+  // the time for a `ShaderNodeBsdfDiffuse` surface: those samples were
+  // then evaluated as diffuse-only, biasing the throughput and dropping
+  // the below-horizon spec directions (pdf<=0 break) — a Diffuse-node
+  // white-furnace read 0.70 instead of 0.80. The sampler must see the
+  // same weights as the evaluator or the mixture estimator is biased.
+  bool pure_diff = (e.mat->pure_diffuse != 0);
   float w_base_diff = (1.0f - e.metallic) * (1.0f - e.transmission);
   float w_diffuse = w_base_diff * (1.0f - t_w);
   float w_translucent = w_base_diff * t_w;
-  float w_spec = e.metallic + (1.0f - e.metallic) * (1.0f - e.transmission);
-  float w_trans = (1.0f - e.metallic) * e.transmission;
-  float w_coat = coat_w_mat * schlick_scalar(NoV, cF0);
+  float w_spec = pure_diff
+                     ? 0.0f
+                     : e.metallic + (1.0f - e.metallic) * (1.0f - e.transmission);
+  float w_trans = pure_diff ? 0.0f : (1.0f - e.metallic) * e.transmission;
+  float w_coat = pure_diff ? 0.0f : coat_w_mat * schlick_scalar(NoV, cF0);
   float total = w_diffuse + w_translucent + w_spec + w_trans + w_coat;
   if (total <= 0.0f)
     return s;
