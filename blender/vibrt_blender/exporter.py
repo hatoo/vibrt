@@ -2953,6 +2953,19 @@ def _export_into(
                             obj, obj_eval, materials[slot_mat_ids[0]]
                         )
                         if rect is not None:
+                            # Cycles evaluates a mesh-emission IES with
+                            # `v_angle = acos(-vector.z)`, so the profile's
+                            # θ=0 peak points OPPOSITE the surface normal.
+                            # ies_light's `Mesh` normal faces up (+Z); the
+                            # HALO downlight therefore beams DOWN onto the
+                            # floor. Our area_rect measures IES θ from the
+                            # rect's +Z (the u×v normal), which would aim the
+                            # peak up and leave the floor at θ≈180 (~zero
+                            # candela). Flip the rect's normal column so the
+                            # IES frame's +Z matches Cycles' -normal.
+                            t = rect["transform"]
+                            for c in (2, 6, 10):
+                                t[c] = -t[c]
                             rect["ies"] = material_lampout_ies[slot_mat_ids[0]]
                             lights_json.append(rect)
                             continue
