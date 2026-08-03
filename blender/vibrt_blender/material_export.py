@@ -1153,7 +1153,19 @@ def _blackbody_to_linear_rgb(kelvin: float) -> list[float]:
     def s2l(x):
         return x / 12.92 if x <= 0.04045 else ((x + 0.055) / 1.055) ** 2.4
 
-    return [s2l(c) for c in rgb_srgb]
+    lin = [s2l(c) for c in rgb_srgb]
+    # Cycles' Blackbody node normalises its output to Rec.709 luminance = 1
+    # (so `Blackbody × Strength` emits `Strength` of luminance at any colour
+    # temperature — e.g. 7500K → (0.973, 0.990, 1.174), luminance 1.0). The
+    # Tanner-Helland fit above is *max*-channel-normalised (brightest = 1),
+    # which for a cool white leaves luminance at ~0.83 → the emission is
+    # ~1.2× too dim. This under-lit flat_archiviz's 7500K world (the cool
+    # world feeds most of the blue, so blue read most under). Rescale to
+    # luminance = 1 to match Cycles.
+    lum = 0.2126 * lin[0] + 0.7152 * lin[1] + 0.0722 * lin[2]
+    if lum > 1e-6:
+        lin = [c / lum for c in lin]
+    return lin
 
 
 # ---------- Volume shaders ----------
