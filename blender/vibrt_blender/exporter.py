@@ -885,6 +885,83 @@ def _socket_color_via_group(socket, group_node, *, default: tuple[float, float, 
     return default
 
 
+def _material_output_light_emission(mat):
+    """A *mesh* material whose graph ends in a Lamp Output
+    (`ShaderNodeOutputLight`) instead of a Material Output — e.g.
+    ies_light's red emissive `Mesh` (Material.002: Group{Emission ×
+    IES Texture} → Lamp Output). Cycles renders such meshes as emitters;
+    vibrt's `_material_to_params` only looks for `ShaderNodeOutputMaterial`
+    and silently drops the emission entirely, so the mesh contributes
+    nothing. Recover `(emission_rgb, ies_table)` from the Lamp Output
+    chain, mirroring `_light_node_emission`'s NodeGroup-IES and bare
+    Emission patterns. `emission_rgb` is `color × strength` (radiance at
+    the IES peak); the returned `ies_table` carries the directional
+    profile so the caller can route the quad through an IES-normalised
+    area_rect. Returns None when there's no Lamp Output emission chain.
+    """
+    if not mat.use_nodes or mat.node_tree is None:
+        return None
+    out = next(
+        (n for n in mat.node_tree.nodes
+         if n.bl_idname == "ShaderNodeOutputLight" and n.is_active_output),
+        None,
+    )
+    if out is None:
+        out = next(
+            (n for n in mat.node_tree.nodes
+             if n.bl_idname == "ShaderNodeOutputLight"),
+            None,
+        )
+    if out is None:
+        return None
+    # A material with BOTH a Material Output and a Lamp Output is handled
+    # by the normal surface path; only rescue the Lamp-Output-only case.
+    if any(n.bl_idname == "ShaderNodeOutputMaterial" for n in mat.node_tree.nodes):
+        return None
+    surf = out.inputs.get("Surface")
+    if surf is None or not surf.is_linked:
+        return None
+    src = surf.links[0].from_node
+
+    if src.bl_idname == "ShaderNodeGroup":
+        inner = _follow_through_group(src, "Emission")
+        if inner is None or inner.bl_idname != "ShaderNodeEmission":
+            return None
+        s_sock = inner.inputs.get("Strength")
+        c_sock = inner.inputs.get("Color")
+        ies_table = None
+        strength = 1.0
+        if s_sock is not None and s_sock.is_linked:
+            up = s_sock.links[0].from_node
+            if up.bl_idname == "ShaderNodeTexIES":
+                ies_table = _resolve_ies_table(up)
+                strength = _socket_value_via_group(
+                    up.inputs.get("Strength"), src, default=1.0)
+        elif s_sock is not None:
+            strength = float(s_sock.default_value)
+        color = (_socket_color_via_group(c_sock, src, default=(1.0, 1.0, 1.0))
+                 if c_sock is not None else (1.0, 1.0, 1.0))
+        emission = (color[0] * strength, color[1] * strength, color[2] * strength)
+        if any(e > 1e-6 for e in emission):
+            return list(emission), ies_table
+        return None
+
+    if src.bl_idname == "ShaderNodeEmission":
+        s_sock = src.inputs.get("Strength")
+        c_sock = src.inputs.get("Color")
+        strength = (float(s_sock.default_value)
+                    if s_sock is not None and not s_sock.is_linked else 1.0)
+        if c_sock is not None and not c_sock.is_linked:
+            cv = c_sock.default_value
+            color = (float(cv[0]), float(cv[1]), float(cv[2]))
+        else:
+            color = (1.0, 1.0, 1.0)
+        emission = (color[0] * strength, color[1] * strength, color[2] * strength)
+        if any(e > 1e-6 for e in emission):
+            return list(emission), None
+    return None
+
+
 def _export_light(obj, writer, textures: list) -> dict | None:
     light = obj.data
     node_strength, node_color, ies_table = _light_node_emission(light)
@@ -2745,6 +2822,13 @@ def _export_into(
     # hidden portals get skipped entirely (sky NEE/miss naturally fires
     # through the empty space).
     portal_mat_ids: set[int] = set()
+    # Emissive mesh materials recovered from a Lamp Output (OUTPUT_LIGHT)
+    # chain that carry an IES profile — keyed by material index. The
+    # emissive quad using such a material is promoted to an IES-normalised
+    # area_rect (rather than an isotropic mesh-light) so the beam is
+    # concentrated exactly as Cycles renders it. See
+    # `_material_output_light_emission`.
+    material_lampout_ies: dict[int, dict] = {}
 
     meshes: list[dict] = []
     objects: list[dict] = []
@@ -2789,8 +2873,29 @@ def _export_into(
                 if mat.name in material_index:
                     return material_index[mat.name]
                 exported = material_export.export_material(mat, writer, textures)
+                # Rescue Lamp-Output-only mesh materials (Material Output
+                # absent) whose emission `_material_to_params` dropped —
+                # ies_light's red `Mesh` (Group{Emission × IES}→Lamp
+                # Output). Cycles renders these as emitters; without this
+                # the whole contribution is silently lost.
+                if not any(e > 1e-6 for e in exported.get("emission", [0.0, 0.0, 0.0])):
+                    lo_em = _material_output_light_emission(mat)
+                    if lo_em is not None:
+                        em_rgb, em_ies = lo_em
+                        exported["emission"] = em_rgb
+                        exported["base_color"] = [0.0, 0.0, 0.0]
+                        if em_ies is not None:
+                            exported["_lampout_ies"] = em_ies
+                        _emit(
+                            f"[vibrt] light-output mesh material {mat.name!r}: "
+                            f"recovered emission {em_rgb} "
+                            f"{'with IES profile' if em_ies else '(no IES)'}"
+                        )
                 vc_attr = exported.pop("_vertex_color_attr", None)
                 is_portal = bool(exported.pop("_is_daylight_portal", False))
+                lampout_ies = exported.pop("_lampout_ies", None)
+                if lampout_ies is not None:
+                    material_lampout_ies[len(materials)] = lampout_ies
                 if vc_attr:
                     material_vc_attr[mat.name] = vc_attr
                 if is_portal:
@@ -2829,6 +2934,33 @@ def _export_into(
                                 vc_attr_name = material_vc_attr.get(slot.material.name)
                     if not slot_mat_ids:
                         slot_mat_ids = [resolve_material(None)]
+
+                    # Lamp-Output emissive mesh carrying an IES profile
+                    # (ies_light's red `Mesh`): promote the quad to an IES
+                    # area_rect so the beam concentration and candela
+                    # normalisation match Cycles. An isotropic mesh-light
+                    # spreads the recovered radiance over the whole
+                    # hemisphere and under-lights the floor by ~9×. With
+                    # `power = area·π` the loader's coeff collapses to
+                    # `peak_absolute_candela`, and passing the recovered
+                    # emission (`color × strength`) as the rect colour makes
+                    # the delivered radiance `emission × candela(dir)` — the
+                    # same product Cycles' `Emission.Color × TexIES.Factor`
+                    # forms.
+                    if (len(slot_mat_ids) == 1
+                            and slot_mat_ids[0] in material_lampout_ies):
+                        rect = _try_emissive_quad_as_rect_light(
+                            obj, obj_eval, materials[slot_mat_ids[0]]
+                        )
+                        if rect is not None:
+                            rect["ies"] = material_lampout_ies[slot_mat_ids[0]]
+                            lights_json.append(rect)
+                            continue
+                        _emit(
+                            f"[vibrt] warn: light-output mesh {obj.name!r} "
+                            f"has an IES profile but isn't a promotable quad "
+                            f"— emitting isotropically (beam not concentrated)"
+                        )
 
                     # Detect emissive material slots up front so we can route
                     # the mesh through either the rect-promotion fallback (for
