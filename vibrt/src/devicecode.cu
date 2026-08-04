@@ -2421,7 +2421,17 @@ static __device__ float3 direct_light(const MaterialEvalGroup &e, float3 P,
               // backside) and the IES area light delivered nothing.
               float ies = ies_lookup(ar.ies_data, ar.ies_n_v, ar.ies_n_h,
                                      ar.light_rotation, wi);
-              L = L + b.f * vis * make_f3(ar.emission) * ies / pdf;
+              // MIS-weight against BSDF sampling — but ONLY for camera-
+              // visible rects, since `intersect_rect_lights` (and thus the
+              // BSDF-side emission branch in trace_path) skips hidden rects.
+              // Hidden emissive-mesh rects are NEE-only by design; weighting
+              // them would drop energy with nothing to compensate. For a
+              // visible rect a sharp glossy lobe's reflection is delivered by
+              // the BSDF-side branch, which NEE can't importance-sample.
+              float w_light = (ar.camera_visible != 0u)
+                                  ? power_heuristic(pdf, b.pdf)
+                                  : 1.0f;
+              L = L + b.f * vis * make_f3(ar.emission) * ies * (w_light / pdf);
             }
           }
         }
@@ -3304,18 +3314,33 @@ static __device__ float3 trace_path(float3 origin, float3 dir, RNG &rng,
       // rects are pre-filtered by intersect_rect_lights and never reach
       // here, so they don't occlude primary/specular rays. Add emission
       // on primary rays and after specular bounces; NEE covers diffuse.
+      AreaRectLight &ar = params.rect_lights[rect_idx];
+      // IES applies to direct camera-ray hits too — Cycles' IES Texture
+      // multiplies emission for every visibility class, not just NEE.
+      // `dir` is camera→light here; the IES table is sampled in the
+      // light's local frame.
+      float ies = ies_lookup(ar.ies_data, ar.ies_n_v, ar.ies_n_h,
+                             ar.light_rotation, dir);
+      float3 em = throughput * make_f3(ar.emission) * ies;
       if (bounce == 0 || last_specular) {
-        AreaRectLight &ar = params.rect_lights[rect_idx];
-        // IES applies to direct camera-ray hits too — Cycles' IES Texture
-        // multiplies emission for every visibility class, not just NEE.
-        // `dir` is camera→light here; the IES table is sampled in the
-        // light's local frame.
-        float ies = ies_lookup(ar.ies_data, ar.ies_n_v, ar.ies_n_h,
-                               ar.light_rotation, dir);
-        float3 em = throughput * make_f3(ar.emission) * ies;
         if (bounce > 0)
           em = clamp_indirect(em, params.clamp_indirect);
         L = L + em;
+      } else if (prev_bsdf_pdf > 0.0f) {
+        // BSDF sampled this (camera-visible) area light on a non-specular
+        // bounce. MIS-weight against the NEE sampler (area-light solid-angle
+        // pdf × rect-select pmf) — the piece NEE can't capture for a sharp
+        // glossy lobe reflecting an area light.
+        float cos_light = fabsf(dot3(make_f3(ar.normal), dir));
+        float area = ar.size_u * ar.size_v;
+        float pmf = params.rect_light_cdf[rect_idx + 1] -
+                    params.rect_light_cdf[rect_idx];
+        if (cos_light > 1e-6f && area > 1e-12f && pmf > 0.0f) {
+          float pdf_light = (t_rect * t_rect) / (area * cos_light) * pmf;
+          float w_bsdf = power_heuristic(prev_bsdf_pdf, pdf_light);
+          em = clamp_indirect(em * w_bsdf, params.clamp_indirect);
+          L = L + em;
+        }
       }
       break;
     }
