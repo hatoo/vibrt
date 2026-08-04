@@ -8,6 +8,7 @@ All collapsed onto the renderer's Principled-only parameter set.
 from __future__ import annotations
 
 import math
+import os
 import time
 
 import bpy
@@ -4404,6 +4405,18 @@ def _from_mix(node, writer, textures, mat_name: str) -> dict:
             # diffuse / translucent shader2 sides fall through.
             and not p2.get("translucent_weight", 0.0) > 0.0
             and not p2.get("hair_weight", 0.0) > 0.0
+            # Only collapse when the BASE (shader1) is a diffuse / dielectric
+            # lobe — the Disney "matte base + clear coat" idiom, where a white
+            # dielectric coat lobe faithfully captures the view-angle
+            # highlight. When the base is itself a METALLIC glossy (car-paint
+            # `Mix(Glossy_tint, Glossy_white, fac=Fresnel)` — bmw27's
+            # CarShellNew), collapsing shader2 into a weak dielectric coat
+            # loses the white clearcoat's strong environment reflection and
+            # under-delivers (bmw27 read 0.77; keeping both glossy lobes via
+            # the secondary-closure path below brings it to 0.86). Route those
+            # through the two-glossy mixture instead.
+            and p1.get("metallic", 0.0) < 0.5
+            and not p1.get("pure_glossy", False)
         )
         if is_clearcoat_pattern:
             bc2 = p2.get("base_color", [1.0, 1.0, 1.0])
@@ -4521,7 +4534,16 @@ def _from_mix(node, writer, textures, mat_name: str) -> dict:
     # two-closure material instead so the kernel evaluates the proper
     # `(1-fac)*primary + fac*secondary` mixture. Cycles' MixShader is a
     # closure mix at the BSDF level, not a parameter lerp.
-    if (1e-3 < fac < 1.0 - 1e-3
+    # A Fresnel/LayerWeight-driven mix (view_ior set) MUST keep both lobes
+    # separate so the kernel can apply the view-dependent factor — a lerp
+    # would fold them into one constant-blend Principled and lose the
+    # angle-dependence (bmw27 CarShellNew: two same-flag glossy lobes that
+    # _sides_need_secondary would otherwise lerp). Force the secondary path.
+    force_fresnel_secondary = (
+        view_ior is not None and n1 is not None and n2 is not None
+    )
+    if force_fresnel_secondary or (
+            1e-3 < fac < 1.0 - 1e-3
             and n1 is not None and n2 is not None
             and _sides_need_secondary(p1, p2)):
         # Build a binary Mix node. Each side may itself be a Mix sub-tree
@@ -4541,18 +4563,26 @@ def _from_mix(node, writer, textures, mat_name: str) -> dict:
         # `secondary` is the right.
         is_left_internal = (side_left.get("secondary") is not None
                             or side_left.get("left_subtree") is not None)
+        # View-dependent Fresnel/LayerWeight factor: encode it as a NEGATIVE
+        # mix_fac carrying the IOR magnitude, so the kernel evaluates
+        # F(NoV, ior) per hit instead of a constant hemispheric mean. This
+        # gives the real view-angle falloff for Fresnel-blended pairs the
+        # coat-collapse path can't take (bmw27 CarShellNew's metallic red
+        # base + white clearcoat). Only for the secondary-closure path; the
+        # lerp fallback below stays on the constant `fac`.
+        mix_fac_val = (-float(view_ior)) if view_ior is not None else fac
         if is_left_internal:
             # Balanced / left-leaning: outer node has no own lobe params;
             # both children encode independent sub-trees.
             out = _default_params()
             out["left_subtree"] = side_left
             out["secondary"] = side_right
-            out["mix_fac"] = fac
+            out["mix_fac"] = mix_fac_val
         else:
             # Right-leaning compact: outer's own params are the left leaf.
             out = side_left
             out["secondary"] = side_right
-            out["mix_fac"] = fac
+            out["mix_fac"] = mix_fac_val
         return out
 
     return _lerp_principled(p1, p2, fac)

@@ -486,7 +486,14 @@ pub fn make_material_data(
         alpha_blend: mat.alpha_blend.clamp(0.0, 1.0),
         secondary: secondary_ptr,
         left_subtree: left_subtree_ptr,
-        mix_fac: mat.mix_fac.clamp(0.0, 1.0),
+        // A negative mix_fac is the view-dependent Fresnel sentinel (its
+        // magnitude is the Fresnel IOR); leave it untouched. Only clamp the
+        // ordinary constant-factor case to [0, 1].
+        mix_fac: if mat.mix_fac < 0.0 {
+            mat.mix_fac
+        } else {
+            mat.mix_fac.clamp(0.0, 1.0)
+        },
         mix_fac_tex: mf_ptr,
         mix_fac_tex_w: mf_w,
         mix_fac_tex_h: mf_h,

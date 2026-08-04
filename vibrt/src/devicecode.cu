@@ -1146,6 +1146,7 @@ struct MaterialEval {
   float transmission;
   float3 emission;
   float3 Ns; // shading normal
+  float3 Ng; // geometric normal (for shadow-terminator term)
   float3 T;  // rotated by tangent_rotation for anisotropy
   float3 B;
   PrincipledGpu *mat; // raw material ptr for coat/sheen/sss params
@@ -1296,6 +1297,7 @@ static __device__ MaterialEval eval_material_one(const PathVertex &v,
     Ns = normalize3(T * nm_t.x + B * nm_t.y + Ns * nm_t.z);
   }
   e.Ns = Ns;
+  e.Ng = v.Ng;
   // If closesthit interpolated an authored tangent (hair strand axis), use
   // it as the anisotropy / hair tangent after re-orthogonalising against the
   // possibly-perturbed shading normal. Otherwise fall back to a synthetic
@@ -1352,7 +1354,19 @@ static __device__ MaterialEval eval_material_one(const PathVertex &v,
 // not in either lobe's texture coordinates. Constant-fac is the common case
 // (mix_fac_tex == nullptr); the texture branch supports per-pixel masks for
 // things like edge-wear blends or multi-material decals.
-static __device__ float compute_level_mix_fac(PrincipledGpu *m, float2 uv_raw) {
+static __device__ float compute_level_mix_fac(PrincipledGpu *m, float2 uv_raw,
+                                              float NoV) {
+  // View-dependent Fresnel mix factor: the exporter encodes a Fresnel /
+  // Layer-Weight MixShader factor as a NEGATIVE mix_fac whose magnitude is
+  // the Fresnel IOR. Evaluate F(NoV, ior) at the hit so the secondary
+  // (right) side gets its true view-angle weight — Blender's clearcoat /
+  // "Fresnel over base" idiom (bmw27 CarShellNew: red base at normal, white
+  // clearcoat at grazing). A constant hemispheric-mean fac under-weighted
+  // the clearcoat on the curved car body (seen mostly at grazing).
+  if (m->mix_fac < 0.0f) {
+    float ior = -m->mix_fac;
+    return fminf(fmaxf(fresnel_dielectric(fabsf(NoV), ior), 0.0f), 1.0f);
+  }
   const float *M = m->uv_transform;
   float2 uv_xform =
       make_float2(M[0] * uv_raw.x + M[1] * uv_raw.y + M[2],
@@ -1390,7 +1404,8 @@ static __device__ int eval_material(const PathVertex &v,
                                      MaterialEval *slots,
                                      float *weights,
                                      int max_leaves,
-                                     float min_alpha = 0.0f) {
+                                     float min_alpha = 0.0f,
+                                     float NoV = 1.0f) {
   if (slots == nullptr || max_leaves <= 0) {
     return 0;
   }
@@ -1417,7 +1432,7 @@ static __device__ int eval_material(const PathVertex &v,
       ++n;
       continue;
     }
-    float fac = compute_level_mix_fac(node, v.uv);
+    float fac = compute_level_mix_fac(node, v.uv, NoV);
     float w_left = f.weight * (1.0f - fac);
     float w_right = f.weight * fac;
     // Push right then left so left is processed first (preserves
@@ -1494,6 +1509,25 @@ static __device__ BsdfEval eval_hair(const MaterialEval &e, float3 wo,
         * (INV_PIf * NoL);
   r.pdf = NoL * INV_PIf;
   return r;
+}
+
+// Shadow-terminator softening (Estevez et al. "Hacking the Shadow
+// Terminator", matches Cycles' `bump_shadowing_term`). On smooth-shaded
+// geometry the interpolated shading normal `N` tilts the reflection
+// hemisphere away from the true geometric normal `Ng`, so a reflection
+// direction `I` that is above the shading horizon can be *below* the
+// geometric horizon — physically self-occluded by the surface. Without
+// this term those directions carry full BRDF energy, leaking indirect
+// light that compounds per bounce in furniture-dense scenes (classroom /
+// junk_shop / lone_monk read ~14% over per diffuse bounce). Returns 1 on
+// flat surfaces (Ng == N) so convex / flat-shaded geometry is unaffected.
+static __forceinline__ __device__ float bump_shadowing_term(float3 Ng,
+                                                            float3 N,
+                                                            float3 I) {
+  float denom = dot3(N, I) * dot3(Ng, N);
+  float g = (denom != 0.0f) ? dot3(Ng, I) / denom : 0.0f;
+  g = __saturatef(g); // clamp to [0,1]; endpoints are fixed points of the ramp
+  return g * (g * (1.0f - g) + 1.0f); // == -g³ + g² + g (smooth cubic ramp)
 }
 
 // Single-closure eval. The legacy body — handles diffuse / spec / coat /
@@ -1622,7 +1656,15 @@ static __device__ BsdfEval eval_bsdf_one(const MaterialEval &e, float3 wo,
       // standalone Diffuse BSDF, no spec layer) keeps the full Lambert.
       float spec_T = 1.0f;
       if (!pure_diff) {
-        float E_spec_v = f_avg_schlick(F0_d) * ggx_e_lookup(NoV, e.alpha);
+        // Diffuse-under-dielectric energy coupling: reduce the diffuse by
+        // the specular layer's directional-hemispherical reflectance. The
+        // reflectance scale is F0 (the normal-incidence dielectric Fresnel),
+        // NOT the Schlick hemispherical average f_avg_schlick(F0) = (20F0+1)/21
+        // which for F0=0.04 gives 0.086 — ~2× too high (the (1/21) term is the
+        // grazing F90→1 lift, which the ggx_e_lookup directional factor already
+        // accounts for). Using f_avg over-reduced the diffuse → ~4% under on
+        // Principled-dominated scenes (flat_archiviz / pabellon / bmw27).
+        float E_spec_v = F0_d * ggx_e_lookup(NoV, e.alpha);
         spec_T = 1.0f - fminf(fmaxf(E_spec_v, 0.0f), 0.99f);
       }
       r.f = r.f + bc_sss * (INV_PIf * w_diffuse * effective * spec_T);
@@ -1681,36 +1723,37 @@ static __device__ BsdfEval eval_bsdf_one(const MaterialEval &e, float3 wo,
     float3 f_spec = e.metallic * f_metal +
                     (1.0f - e.metallic) * f_dielec;
 
-    // Kulla-Conty multi-scattering compensation (reflection only).
+    // Multi-scattering energy compensation — Cycles' exact form
+    // (kernel/closure/bsdf_microfacet.h `microfacet_ggx_preserve_energy`).
+    // Cycles applies `energy_scale = 1 + (1−E)/E` in the BSDF eval and
+    // `darkening = (1 + Fms·(1−E)/E) / energy_scale` in the weight; the
+    // product is exactly `1 + Fms·(1−E)/E`, a MULTIPLIER on the single-
+    // scatter lobe, with Fms = Fss·Eavg/(1 − Fss·(1−Eavg)) and Fss the
+    // LINEAR average reflectance (F_avg, not F_avg²). The previous additive
+    // Kulla-Conty form (F_avg² + a separate diffuse-shaped lobe) is a
+    // different approximation; matching Cycles' exact algorithm here.
     float E_wo = ggx_e_lookup(NoV, e.alpha);
-    float E_wi = ggx_e_lookup(NoL, e.alpha);
     float E_avg = ggx_e_avg_lookup(e.alpha);
-    float one_minus_Eavg = fmaxf(1.0f - E_avg, 1e-4f);
-    float f_ms_scalar =
-        (1.0f - E_wo) * (1.0f - E_wi) / fmaxf(M_PIf * one_minus_Eavg, 1e-8f);
+    float missing = (1.0f - E_wo) / fmaxf(E_wo, 1e-4f);
+    float3 one3 = make_float3(1.0f, 1.0f, 1.0f);
 
-    // pure_glossy: F is constant base_color across all angles, so the
-    // hemispherical Fresnel average is just base_color (skip the
-    // Schlick-averaged form which assumes Schlick lift to F90=1).
-    float3 F_avg_m = (mc->pure_glossy != 0)
+    // pure_glossy: F is constant base_color across all angles, so Fss is
+    // just base_color (skip the Schlick-averaged form's F90→1 lift).
+    float3 Fss_m = (mc->pure_glossy != 0)
         ? e.base_color
         : f_avg_schlick(e.base_color);
-    float3 one3 = make_float3(1.0f, 1.0f, 1.0f);
-    float3 denom_m = one3 - F_avg_m * (1.0f - E_avg);
-    float3 F_ms_m = make_float3(
-        (F_avg_m.x * F_avg_m.x) * E_avg / fmaxf(denom_m.x, 1e-4f),
-        (F_avg_m.y * F_avg_m.y) * E_avg / fmaxf(denom_m.y, 1e-4f),
-        (F_avg_m.z * F_avg_m.z) * E_avg / fmaxf(denom_m.z, 1e-4f));
-    float3 f_metal_ms = F_ms_m * f_ms_scalar;
+    float3 Fms_m = make_float3(
+        Fss_m.x * E_avg / fmaxf(1.0f - Fss_m.x * (1.0f - E_avg), 1e-4f),
+        Fss_m.y * E_avg / fmaxf(1.0f - Fss_m.y * (1.0f - E_avg), 1e-4f),
+        Fss_m.z * E_avg / fmaxf(1.0f - Fss_m.z * (1.0f - E_avg), 1e-4f));
+    float3 scale_m = one3 + Fms_m * missing;
 
-    float F_avg_d = f_avg_schlick(F0_d);
-    float denom_d = fmaxf(1.0f - F_avg_d * (1.0f - E_avg), 1e-4f);
-    float F_ms_d = (F_avg_d * F_avg_d) * E_avg / denom_d;
-    float f_dielec_ms = F_ms_d * f_ms_scalar;
+    float Fss_d = f_avg_schlick(F0_d);
+    float Fms_d = Fss_d * E_avg / fmaxf(1.0f - Fss_d * (1.0f - E_avg), 1e-4f);
+    float scale_d = 1.0f + Fms_d * missing;
 
-    f_spec = f_spec + e.metallic * f_metal_ms +
-             (1.0f - e.metallic) *
-                 make_float3(f_dielec_ms, f_dielec_ms, f_dielec_ms);
+    f_spec = e.metallic * f_metal * scale_m +
+             (1.0f - e.metallic) * f_dielec * scale_d;
 
     r.f = r.f + f_spec * NoL;
     float pdf_spec = ggx_vndf_pdf_aniso(Vloc, Hloc, e.alpha_x, e.alpha_y);
@@ -1813,6 +1856,12 @@ static __device__ BsdfEval eval_bsdf_one(const MaterialEval &e, float3 wo,
         r.f = r.f + bc_sss * (INV_PIf * w_diffuse * sss_w * w_wrap);
       }
     }
+  }
+  // Shadow-terminator: applies to reflection lobes only (the geometric
+  // horizon check is for same-side scattering). Transmission / translucent
+  // (wi on the far side) keep their own geometry handling.
+  if (reflect) {
+    r.f = r.f * bump_shadowing_term(e.Ng, e.Ns, wi);
   }
   // Cycles Principled `Alpha` socket: `alpha × principled + (1-alpha) ×
   // transparent` blend. The transparent component is a delta in the
@@ -2050,6 +2099,8 @@ static __device__ BsdfEval eval_bsdf(const MaterialEvalGroup &g,
 static __device__ BsdfSample sample_bsdf(const MaterialEvalGroup &g,
                                          float3 wo, RNG &rng) {
   if (g.n == 1) {
+    // sample_bsdf_one already sets s.f via eval_bsdf_one, so the
+    // shadow-terminator is applied there — no second application here.
     return sample_bsdf_one(g.slots[0], wo, rng);
   }
   float u = rng.next();
@@ -2879,6 +2930,15 @@ extern "C" __global__ void __anyhit__ah() {
   // shadow-ray loop; for now respecting the alpha-cutout silhouette
   // (which is what's checked further below) gets us closer to
   // reference than full pass-through.
+  //
+  // NB: full pass-through over-delivers light entering through glass at
+  // grazing angles (classroom exterior_fillLight ~2.4× over; clean
+  // glass-pane test 2.58×). But BLOCKING glass shadows (the Cycles-exact
+  // behaviour, delivering via refraction paths) under-delivers badly here
+  // because vibrt's refraction paths under-sample at practical SPP
+  // (flat_archiviz 1.00→0.92, junk_shop 1.07→0.73). The correct fix is
+  // Fresnel-attenuated transparent shadows via an accumulating shadow-ray
+  // loop; until then full pass-through is the better net approximation.
   bool is_shadow_ray =
       (optixGetRayFlags() & OPTIX_RAY_FLAG_TERMINATE_ON_FIRST_HIT) != 0;
   if (is_shadow_ray && m->transmission > 0.5f) {
@@ -3370,7 +3430,10 @@ static __device__ float3 trace_path(float3 origin, float3 dir, RNG &rng,
     // covers every direct_light / sample_bsdf call that reads `e_group`.
     MaterialEval e_slots[MAX_LEAVES];
     float e_weights[MAX_LEAVES];
-    int e_n = eval_material(v, e_slots, e_weights, MAX_LEAVES, min_alpha);
+    // View cosine for view-dependent (Fresnel) mix factors. `dir` is the
+    // incoming ray (origin→hit); |dot(Ns, dir)| is the incidence cosine.
+    float NoV_mix = fabsf(dot3(v.Ns, dir));
+    int e_n = eval_material(v, e_slots, e_weights, MAX_LEAVES, min_alpha, NoV_mix);
     MaterialEvalGroup e_group = {e_slots, e_weights, e_n};
     // Flip normal if ray hit backside (for dielectric transmission). Mirror
     // the bitangent instead of rebuilding the frame so the authored tangent
