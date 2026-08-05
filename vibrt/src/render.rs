@@ -898,9 +898,10 @@ pub fn render_to_pixels(
         };
 
     // --- GGX LUTs ---
-    let (lut_e, lut_e_avg) = pipeline::generate_ggx_energy_lut();
+    let (lut_e, lut_e_avg, lut_b) = pipeline::generate_ggx_energy_lut();
     let d_ggx_e = alloc_and_copy_slice(&stream, &lut_e)?;
     let d_ggx_e_avg = alloc_and_copy_slice(&stream, &lut_e_avg)?;
+    let d_ggx_b = alloc_and_copy_slice(&stream, &lut_b)?;
 
     // --- Image buffer (float4 per pixel) ---
     let pixel_count = (render_settings.width * render_settings.height) as usize;
@@ -977,6 +978,7 @@ pub fn render_to_pixels(
         envmap_rotation_z_rad: envmap_rot,
         ggx_e_lut: d_ggx_e,
         ggx_e_avg_lut: d_ggx_e_avg,
+        ggx_b_lut: d_ggx_b,
         clamp_indirect: render_settings.clamp_indirect,
         clamp_direct: render_settings.clamp_direct,
         filter_glossy: render_settings.filter_glossy,

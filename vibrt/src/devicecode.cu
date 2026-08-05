@@ -275,6 +275,29 @@ static __device__ float ggx_e_avg_lookup(float alpha) {
   return L[a0] * (1.0f - da) + L[a1] * da;
 }
 
+// Fresnel split-sum bias term B(NoV, alpha) = ∫ (1-VoH)^5 · G·VoH/(NoV·NoH).
+// With E = A + B, the dielectric spec directional reflectance is
+// F0·A + B = F0·E + B·(1 − F0) — the grazing white-lift the old bare `F0·E`
+// diffuse-under-spec coupling dropped.
+static __device__ float ggx_b_lookup(float NoV, float alpha) {
+  float fc = ggx_lut_coord(fminf(fmaxf(NoV, 0.0f), 1.0f));
+  float fa = ggx_lut_coord(fminf(fmaxf(alpha, 0.0f), 1.0f));
+  int c0 = (int)floorf(fc);
+  int a0 = (int)floorf(fa);
+  int c1 = min(c0 + 1, GGX_LUT_N - 1);
+  int a1 = min(a0 + 1, GGX_LUT_N - 1);
+  float dc = fc - (float)c0;
+  float da = fa - (float)a0;
+  const float *L = params.ggx_b_lut;
+  float v00 = L[c0 * GGX_LUT_N + a0];
+  float v10 = L[c1 * GGX_LUT_N + a0];
+  float v01 = L[c0 * GGX_LUT_N + a1];
+  float v11 = L[c1 * GGX_LUT_N + a1];
+  float v0 = v00 * (1.0f - dc) + v10 * dc;
+  float v1 = v01 * (1.0f - dc) + v11 * dc;
+  return v0 * (1.0f - da) + v1 * da;
+}
+
 // Hemispherical-average Fresnel under Schlick approximation:
 //   F_avg = ∫ F_Schlick(μ) · 2μ dμ  =  (20·F0 + 1) / 21
 static __forceinline__ __device__ float f_avg_schlick(float F0) {
@@ -1664,7 +1687,8 @@ static __device__ BsdfEval eval_bsdf_one(const MaterialEval &e, float3 wo,
         // grazing F90→1 lift, which the ggx_e_lookup directional factor already
         // accounts for). Using f_avg over-reduced the diffuse → ~4% under on
         // Principled-dominated scenes (flat_archiviz / pabellon / bmw27).
-        float E_spec_v = F0_d * ggx_e_lookup(NoV, e.alpha);
+        float E_spec_v = F0_d * ggx_e_lookup(NoV, e.alpha) +
+                         ggx_b_lookup(NoV, e.alpha) * (1.0f - F0_d);
         spec_T = 1.0f - fminf(fmaxf(E_spec_v, 0.0f), 0.99f);
       }
       r.f = r.f + bc_sss * (INV_PIf * w_diffuse * effective * spec_T);

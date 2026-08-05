@@ -348,6 +348,7 @@ struct LaunchParams {
 
   float *ggx_e_lut;
   float *ggx_e_avg_lut;
+  float *ggx_b_lut;
 
   // Clamp for indirect (bounce>=1) contributions. <=0 disables.
   float clamp_indirect;

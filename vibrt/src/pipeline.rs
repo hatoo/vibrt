@@ -44,10 +44,11 @@ pub fn compile_ptx() -> Result<String> {
 pub const GGX_LUT_SIZE: usize = 32;
 
 /// Monte-Carlo precompute of GGX directional albedo E(cosθ, α) and E_avg(α).
-pub fn generate_ggx_energy_lut() -> (Vec<f32>, Vec<f32>) {
+pub fn generate_ggx_energy_lut() -> (Vec<f32>, Vec<f32>, Vec<f32>) {
     let n = GGX_LUT_SIZE;
     let num_samples = 16384u32;
     let mut e_lut = vec![0.0f32; n * n];
+    let mut b_lut = vec![0.0f32; n * n];
     let mut e_avg = vec![0.0f32; n];
     for ai in 0..n {
         let alpha = (ai as f32 + 0.5) / n as f32;
@@ -56,6 +57,7 @@ pub fn generate_ggx_energy_lut() -> (Vec<f32>, Vec<f32>) {
             let cos_theta = (ci as f32 + 0.5) / n as f32;
             let sin_theta = (1.0 - cos_theta * cos_theta).max(0.0).sqrt();
             let mut sum = 0.0f64;
+            let mut b_sum = 0.0f64;
             for s in 0..num_samples {
                 let u1 = s as f64 / num_samples as f64;
                 let mut bits = s;
@@ -92,8 +94,11 @@ pub fn generate_ggx_energy_lut() -> (Vec<f32>, Vec<f32>) {
                     2.0 * n_dot_l / (n_dot_l + (a2_d + (1.0 - a2_d) * n_dot_l * n_dot_l).sqrt());
                 let weight = g1_v * g1_l * v_dot_h / (n_dot_v * n_dot_h);
                 sum += weight;
+                let fc = (1.0 - v_dot_h).powi(5);
+                b_sum += fc * weight;
             }
             e_lut[ci * n + ai] = (sum / num_samples as f64) as f32;
+            b_lut[ci * n + ai] = (b_sum / num_samples as f64) as f32;
         }
         let mut avg = 0.0f64;
         for ci in 0..n {
@@ -102,7 +107,7 @@ pub fn generate_ggx_energy_lut() -> (Vec<f32>, Vec<f32>) {
         }
         e_avg[ai] = avg as f32;
     }
-    (e_lut, e_avg)
+    (e_lut, e_avg, b_lut)
 }
 
 /// Build marginal + conditional CDFs for envmap importance sampling (RGB data).
