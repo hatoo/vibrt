@@ -196,6 +196,9 @@ pub struct MeshDesc {
     /// `use_vertex_color` set.
     #[serde(default)]
     pub vertex_colors: Option<BlobIdx>,
+    /// Alpha channel of the selected color attribute, f32 per vertex.
+    #[serde(default)]
+    pub vertex_alphas: Option<BlobIdx>,
     /// f32 x 3 per vertex; optional. Object-space tangent direction authored
     /// by the exporter — used by the hair Kajiya-Kay lobe to read the strand
     /// axis at the hit point. When present, the device interpolates it
@@ -354,6 +357,8 @@ pub struct PrincipledMaterial {
     /// baked texture.
     #[serde(default)]
     pub color_graph: Option<ColorGraph>,
+    #[serde(default)]
+    pub shader_graph: Option<vibrt_nodes::shader::ShaderGraph>,
     /// Cycles' material output → Volume socket. When present the bounded
     /// mesh acts as a volume container: rays entering a front face start
     /// integrating volume scattering until they exit a back face. Combine
@@ -398,6 +403,8 @@ pub struct PrincipledMaterial {
     /// both `secondary` and `left_subtree` are `None` (leaf).
     #[serde(default)]
     pub mix_fac: f32,
+    #[serde(default)]
+    pub add_shader: bool,
     /// Optional single-channel mask texture (R channel sampled) for the
     /// per-pixel mix factor. Multiplied with `mix_fac` to produce the
     /// right side's weight at each hit point.
@@ -405,147 +412,7 @@ pub struct PrincipledMaterial {
     pub mix_fac_tex: Option<u32>,
 }
 
-/// Sequential list of colour-producing nodes. Each node reads either from
-/// earlier nodes (by index) or from constants/textures; the last node's
-/// value is the material's base colour. Input indices must be strictly
-/// less than the owning node's index so the graph stays a DAG in
-/// topological order.
-#[derive(Deserialize, Clone)]
-pub struct ColorGraph {
-    pub nodes: Vec<ColorNode>,
-    /// Index of the output node. Default: last node.
-    #[serde(default)]
-    pub output: Option<u32>,
-}
-
-/// Factor input for a Mix node: either a constant scalar or a reference to
-/// another node's value (converted to luminance at evaluation time).
-#[derive(Deserialize, Clone)]
-#[serde(untagged)]
-pub enum ColorFactor {
-    Const(f32),
-    Node { node: u32 },
-}
-
-#[derive(Deserialize, Clone)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ColorNode {
-    /// Literal RGB.
-    Const { rgb: [f32; 3] },
-    /// Sample a texture (by index into `SceneFile::textures`) with its own
-    /// UV transform applied on top of the mesh UV.
-    ImageTex {
-        tex: u32,
-        #[serde(default = "identity_uv_transform")]
-        uv: [f32; 6],
-    },
-    /// Mix two inputs with the given blend and factor. `blend` follows
-    /// Blender's naming: "mix" / "multiply" / "add" / "subtract" / "screen"
-    /// / "divide" / "difference" / "darken" / "lighten" / "overlay" /
-    /// "soft_light" / "linear_light".
-    Mix {
-        a: u32,
-        b: u32,
-        #[serde(default = "default_mix_fac")]
-        fac: ColorFactor,
-        #[serde(default = "default_blend")]
-        blend: String,
-        #[serde(default)]
-        clamp: bool,
-    },
-    /// Per-channel RGB invert with mix factor (`out = lerp(rgb, 1-rgb, fac)`).
-    Invert {
-        input: u32,
-        #[serde(default = "one_f32")]
-        fac: f32,
-    },
-    /// Scalar math on the input treated per-channel. Ops mirror
-    /// ShaderNodeMath: "add" / "subtract" / "multiply" / "divide" /
-    /// "power" / "multiply_add" / "minimum" / "maximum".
-    ///
-    /// `swap` flips operand order for non-commutative ops (subtract /
-    /// divide / power): when true the op evaluates as `b OP input` instead
-    /// of `input OP b`. Emitted when Cycles drives the second Math input
-    /// (rather than the first) with the texture chain. Ignored for
-    /// commutative ops.
-    Math {
-        input: u32,
-        #[serde(default = "default_math_op")]
-        op: String,
-        #[serde(default)]
-        b: f32,
-        #[serde(default)]
-        c: f32,
-        #[serde(default)]
-        clamp: bool,
-        #[serde(default)]
-        swap: bool,
-    },
-    /// Blender HueSaturation: shift hue, scale saturation/value, then blend
-    /// with the original by `fac`. All scalars are constants (Blender
-    /// interprets linked ones here too but very rare).
-    HueSat {
-        input: u32,
-        #[serde(default = "half_f32")]
-        hue: f32,
-        #[serde(default = "one_f32")]
-        saturation: f32,
-        #[serde(default = "one_f32")]
-        value: f32,
-        #[serde(default = "one_f32")]
-        fac: f32,
-    },
-    /// Per-channel RGB curve, pre-baked by the exporter into a `768`-entry
-    /// LUT (256 samples × 3 channels). Each channel's entry already folds
-    /// the per-channel curve through the combined curve, matching how
-    /// Blender stacks them in ShaderNodeRGBCurve.
-    RgbCurve {
-        input: u32,
-        /// 768 floats: R[0..256], G[0..256], B[0..256]. Each subarray is
-        /// the curve sampled at `i/255` and clamped to [0, 1].
-        lut: Vec<f32>,
-    },
-    /// Blender BrightContrast: `out = a * rgb + b` with Cycles' parameter
-    /// convention `a = 1 + contrast`, `b = bright - contrast/2`.
-    BrightContrast {
-        input: u32,
-        #[serde(default)]
-        bright: f32,
-        #[serde(default)]
-        contrast: f32,
-    },
-    /// Blender ShaderNodeAttribute reading a per-vertex colour. The mesh must
-    /// ship the matching colour attribute (exporter plumbs this via
-    /// `_vertex_color_attr`); when absent the device falls back to white.
-    VertexColor {},
-    /// Per-instance uniform random in [0..1) — derived from the OptiX
-    /// instance id at hit time. Mirrors `ShaderNodeObjectInfo.Random`. The
-    /// scalar is broadcast to all three RGB channels so downstream Mix /
-    /// ColorRamp consumers can use it both as a colour and as a Fac.
-    ObjectRandom {},
-    /// Look up a 1D RGB ramp at a Fac driven by another graph slot. Used
-    /// when ColorRamp's Fac chain is non-foldable (typically
-    /// `ObjectInfo.Random` feeding a per-instance palette). The exporter
-    /// bakes the ramp to `lut.len() / 3` evenly-spaced linear-RGB stops.
-    ColorRamp {
-        input: u32,
-        /// `n_stops × 3` floats: R[0..n], G[0..n], B[0..n] flattened by
-        /// stop, so payload[i*3..i*3+3] is the i-th stop's linear RGB.
-        lut: Vec<f32>,
-    },
-}
-
-fn default_mix_fac() -> ColorFactor {
-    ColorFactor::Const(0.5)
-}
-
-fn default_blend() -> String {
-    "mix".to_string()
-}
-
-fn default_math_op() -> String {
-    "multiply".to_string()
-}
+pub use vibrt_nodes::graph::{ColorFactor, ColorGraph, ColorNode};
 
 fn default_sss_radius() -> [f32; 3] {
     [1.0, 0.2, 0.1]
@@ -603,6 +470,10 @@ pub struct ObjectDesc {
     pub materials: Vec<u32>,
     /// 4x4 row-major matrix_world
     pub transform: [f32; 16],
+    #[serde(default = "default_object_color")]
+    pub object_color: [f32; 4],
+    #[serde(default)]
+    pub object_index: u32,
     /// Cycles' object "Ray Visibility → Shadow". When false, shadow rays skip
     /// this instance — matches Cycles' use of paper-lantern shades that are
     /// camera-visible but transparent to NEE.
@@ -623,6 +494,9 @@ pub struct ObjectDesc {
 
 fn default_true() -> bool {
     true
+}
+fn default_object_color() -> [f32; 4] {
+    [1.0; 4]
 }
 
 /// One entry per emissive mesh registered for NEE. The loader looks up

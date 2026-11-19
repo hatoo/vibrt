@@ -14,12 +14,15 @@ pub mod principled;
 pub mod render;
 pub mod scene_format;
 pub mod scene_loader;
+pub use vibrt_nodes::sky;
 pub mod transform;
 
 #[cfg(feature = "python")]
 mod blender_mesh;
 #[cfg(feature = "python")]
 mod python;
+#[cfg(feature = "python")]
+mod python_nodes;
 #[cfg(feature = "python")]
 mod python_pixels;
 #[cfg(feature = "python")]

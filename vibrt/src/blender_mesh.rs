@@ -77,12 +77,13 @@ impl<'py, T: Copy> Span<'py, T> {
 }
 
 #[pyfunction]
-#[pyo3(signature = (mesh, material_slots, color_attribute = None))]
+#[pyo3(signature = (mesh, material_slots, color_attribute = None, uv_attribute = None))]
 pub fn read_mesh<'py>(
     py: Python<'py>,
     mesh: &Bound<'py, PyAny>,
     material_slots: usize,
     color_attribute: Option<&str>,
+    uv_attribute: Option<&str>,
 ) -> PyResult<Option<Bound<'py, PyDict>>> {
     let bpy = py.import_bound("bpy")?;
     let version: (u32, u32, u32) = bpy.getattr("app")?.getattr("version")?.extract()?;
@@ -100,9 +101,12 @@ pub fn read_mesh<'py>(
 
     let attributes = mesh.getattr("attributes")?;
     let colors = if let Some(name) = color_attribute {
-        let attr = mesh
-            .getattr("color_attributes")?
-            .call_method1("get", (name,))?;
+        let attributes = mesh.getattr("color_attributes")?;
+        let attr = if name.is_empty() {
+            attributes.getattr("active_color")?
+        } else {
+            attributes.call_method1("get", (name,))?
+        };
         if attr.is_none() {
             None
         } else {
@@ -137,7 +141,11 @@ pub fn read_mesh<'py>(
     } else {
         None
     };
-    let uv_layer = mesh.getattr("uv_layers")?.getattr("active")?;
+    let uv_layers = mesh.getattr("uv_layers")?;
+    let uv_layer = match uv_attribute {
+        Some(name) if !name.is_empty() => uv_layers.call_method1("get", (name,))?,
+        _ => uv_layers.getattr("active")?,
+    };
     let uvs = if uv_layer.is_none() {
         None
     } else {
@@ -181,6 +189,7 @@ pub fn read_mesh<'py>(
     let mut split_normals = Vec::with_capacity(count * 3);
     let mut texcoords = Vec::with_capacity(if uvs.is_some() { count * 2 } else { 0 });
     let mut vertex_colors = Vec::with_capacity(if colors.is_some() { count * 3 } else { 0 });
+    let mut vertex_alphas = Vec::with_capacity(if colors.is_some() { count } else { 0 });
     let mut materials = Vec::with_capacity(if material_slots > 1 { triangles.len } else { 0 });
     // All RNA lookups have finished. Read Blender memory and write each final
     // renderer array once, without foreach_get temporaries or NumPy gathers.
@@ -195,6 +204,7 @@ pub fn read_mesh<'py>(
             if let Some((color, per_corner)) = &colors {
                 let rgba = color.get(if *per_corner { corner } else { vertex })?;
                 vertex_colors.extend_from_slice(&rgba[..3]);
+                vertex_alphas.push(rgba[3]);
             }
         }
         if material_slots > 1 {
@@ -218,6 +228,7 @@ pub fn read_mesh<'py>(
     }
     if colors.is_some() {
         result.set_item("vertex_colors", vertex_colors.into_pyarray_bound(py))?;
+        result.set_item("vertex_alphas", vertex_alphas.into_pyarray_bound(py))?;
     }
     if material_slots > 1 {
         result.set_item("material_indices", materials.into_pyarray_bound(py))?;

@@ -23,7 +23,7 @@ pub fn find_optix_include() -> String {
     panic!("OptiX SDK not found. Set OPTIX_ROOT.");
 }
 
-pub fn compile_ptx() -> Result<String> {
+pub fn compile_ptx(shader_ops: u64, max_closures: usize) -> Result<String> {
     let cu_src = include_str!("devicecode.cu");
     let header_src = include_str!("devicecode.h");
     let opts = cudarc::nvrtc::CompileOptions {
@@ -32,83 +32,45 @@ pub fn compile_ptx() -> Result<String> {
         ..Default::default()
     };
     let full_src = format!(
-        "// -- inlined devicecode.h --\n{}\n// -- devicecode.cu --\n{}",
-        header_src,
-        cu_src.replace("#include \"devicecode.h\"", "// (inlined above)")
+        "#define VIBRT_SHADER_OPS {shader_ops}ull\n#define VIBRT_MAX_CLOSURES {max_closures}\n// -- inlined devicecode.h --\n{}\n// -- devicecode.cu --\n{}",
+        header_src.replace(
+            "#include \"vibrt_nodes_types.h\"",
+            vibrt_nodes::DEVICE_TYPES
+        ),
+        cu_src
+            .replace("#include \"devicecode.h\"", "// (inlined above)")
+            .replace("#include \"vibrt_nodes_core.h\"", vibrt_nodes::DEVICE_CORE)
+            .replace("#include \"vibrt_shader.h\"", &vibrt_nodes::DEVICE_SHADER
+                .replace("#include \"cycles_nodes.h\"", &vibrt_nodes::DEVICE_CYCLES
+                    .replace("#include \"cycles_compat.h\"", vibrt_nodes::DEVICE_CYCLES_COMPAT)))
     );
+    use std::hash::{Hash, Hasher};
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    full_src.hash(&mut hash);
+    format!("{:?}", opts).hash(&mut hash);
+    let key = hash.finish();
+    let cache_dir = std::env::temp_dir().join("vibrt-ptx-v1");
+    let cache_file = cache_dir.join(format!("{key:016x}.ptx"));
+    if let Ok(ptx) = std::fs::read_to_string(&cache_file) {
+        if ptx.contains(".version") && ptx.contains("__raygen__rg") {
+            return Ok(ptx);
+        }
+    }
     let ptx = cudarc::nvrtc::compile_ptx_with_opts(&full_src, opts)
         .map_err(|e| anyhow::anyhow!("NVRTC compile failed: {e:?}"))?;
-    Ok(ptx.to_src().to_string())
-}
-
-pub const GGX_LUT_SIZE: usize = 32;
-
-/// Monte-Carlo precompute of GGX directional albedo E(cosθ, α) and E_avg(α).
-pub fn generate_ggx_energy_lut() -> (Vec<f32>, Vec<f32>, Vec<f32>) {
-    let n = GGX_LUT_SIZE;
-    let num_samples = 16384u32;
-    let mut e_lut = vec![0.0f32; n * n];
-    let mut b_lut = vec![0.0f32; n * n];
-    let mut e_avg = vec![0.0f32; n];
-    for ai in 0..n {
-        let alpha = (ai as f32 + 0.5) / n as f32;
-        let a2 = alpha * alpha;
-        for ci in 0..n {
-            let cos_theta = (ci as f32 + 0.5) / n as f32;
-            let sin_theta = (1.0 - cos_theta * cos_theta).max(0.0).sqrt();
-            let mut sum = 0.0f64;
-            let mut b_sum = 0.0f64;
-            for s in 0..num_samples {
-                let u1 = s as f64 / num_samples as f64;
-                let mut bits = s;
-                bits = (bits << 16) | (bits >> 16);
-                bits = ((bits & 0x5555_5555) << 1) | ((bits & 0xAAAA_AAAA) >> 1);
-                bits = ((bits & 0x3333_3333) << 2) | ((bits & 0xCCCC_CCCC) >> 2);
-                bits = ((bits & 0x0F0F_0F0F) << 4) | ((bits & 0xF0F0_F0F0) >> 4);
-                bits = ((bits & 0x00FF_00FF) << 8) | ((bits & 0xFF00_FF00) >> 8);
-                let u2 = bits as f64 / 0x1_0000_0000u64 as f64;
-                let a2_d = a2 as f64;
-                let cos_h = ((1.0 - u2) / (1.0 + (a2_d - 1.0) * u2)).sqrt();
-                let sin_h = (1.0 - cos_h * cos_h).max(0.0).sqrt();
-                let phi = 2.0 * std::f64::consts::PI * u1;
-                let hx = sin_h * phi.cos();
-                let hy = sin_h * phi.sin();
-                let hz = cos_h;
-                let vx = sin_theta as f64;
-                let vy = 0.0;
-                let vz = cos_theta as f64;
-                let v_dot_h = vx * hx + vy * hy + vz * hz;
-                if v_dot_h <= 0.0 {
-                    continue;
-                }
-                let lz = 2.0 * v_dot_h * hz - vz;
-                if lz <= 0.0 {
-                    continue;
-                }
-                let n_dot_v = cos_theta as f64;
-                let n_dot_l = lz;
-                let n_dot_h = cos_h;
-                let g1_v =
-                    2.0 * n_dot_v / (n_dot_v + (a2_d + (1.0 - a2_d) * n_dot_v * n_dot_v).sqrt());
-                let g1_l =
-                    2.0 * n_dot_l / (n_dot_l + (a2_d + (1.0 - a2_d) * n_dot_l * n_dot_l).sqrt());
-                let weight = g1_v * g1_l * v_dot_h / (n_dot_v * n_dot_h);
-                sum += weight;
-                let fc = (1.0 - v_dot_h).powi(5);
-                b_sum += fc * weight;
-            }
-            e_lut[ci * n + ai] = (sum / num_samples as f64) as f32;
-            b_lut[ci * n + ai] = (b_sum / num_samples as f64) as f32;
+    let ptx = ptx.to_src().to_string();
+    if std::fs::create_dir_all(&cache_dir).is_ok() {
+        let temporary = cache_file.with_extension(format!("{}.tmp", std::process::id()));
+        if std::fs::write(&temporary, &ptx).is_ok() {
+            let _ = std::fs::rename(&temporary, &cache_file);
         }
-        let mut avg = 0.0f64;
-        for ci in 0..n {
-            let mu = (ci as f64 + 0.5) / n as f64;
-            avg += e_lut[ci * n + ai] as f64 * 2.0 * mu / n as f64;
-        }
-        e_avg[ai] = avg as f32;
     }
-    (e_lut, e_avg, b_lut)
+    Ok(ptx)
 }
+
+// The integration depends only on the BRDF, never on the scene or GPU.
+// Build it once and embed the exact float bits, including for the first render.
+include!(concat!(env!("OUT_DIR"), "/ggx_energy_lut.rs"));
 
 /// Build marginal + conditional CDFs for envmap importance sampling (RGB data).
 pub fn build_envmap_cdf(rgb: &[f32], width: u32, height: u32) -> (Vec<f32>, Vec<f32>, f32) {

@@ -1,26 +1,31 @@
-"""Unit tests for `color_fold`. Runs under plain CPython — no Blender
-needed, since `color_fold` has no bpy imports.
+"""CPU-only binding tests for `color_fold`; build/stage the native extension first.
+No Blender or GPU is needed. The standalone core has matching Rust fixtures.
 
 Run with:
     py blender/vibrt_blender/test_color_fold.py
 
-The sibling `__init__.py` imports `bpy`, so we load `color_fold.py`
-directly via importlib instead of going through the package.
+The sibling `__init__.py` imports `bpy`, so a test package loads the adapters
+and extension directly without initializing Blender's addon.
 """
 
 from __future__ import annotations
 
 import importlib.util
 import sys
+import types
 import unittest
 from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
+# Load the CPU-only adapter without running the addon's bpy-dependent init.
+_package = types.ModuleType("vibrt_node_tests")
+_package.__path__ = [str(_HERE)]
+sys.modules[_package.__name__] = _package
 _spec = importlib.util.spec_from_file_location(
-    "vibrt_color_fold", _HERE / "color_fold.py"
+    "vibrt_node_tests.color_fold", _HERE / "color_fold.py"
 )
 _color_fold = importlib.util.module_from_spec(_spec)
-sys.modules["vibrt_color_fold"] = _color_fold
+sys.modules[_spec.name] = _color_fold
 _spec.loader.exec_module(_color_fold)
 fold_constants = _color_fold.fold_constants
 
@@ -46,6 +51,7 @@ def _approx(case, a, b, eps=1e-6):
                                msg=f"component {i}: {a[i]} vs {b[i]}")
 
 
+@unittest.skipUnless(_color_fold.node_ops.native(), "Build the extension to test the Python node bindings; cargo test -p vibrt-nodes tests the standalone core")
 class FoldTests(unittest.TestCase):
     # --- Invert ---
     def test_invert_full(self):

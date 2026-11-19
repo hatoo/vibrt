@@ -22,6 +22,7 @@ crate-type = ["rlib", "cdylib"]
 python = ["dep:pyo3", "dep:numpy"]
 
 [dependencies]
+vibrt-nodes = { path = "../vibrt-nodes" }
 optix = { path = "../optix" }
 optix-sys = { path = "../optix-sys" }
 cudarc = { version = "0.19", default-features = false, features = ["driver", "dynamic-loading", "cuda-version-from-build-system", "nvrtc"] }

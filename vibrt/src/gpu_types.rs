@@ -1,51 +1,7 @@
 //! GPU struct types shared between host and device.
 //! Layout must match `devicecode.h` exactly.
 
-/// Single node in a material's colour graph. The graph is a sequential
-/// list; each node reads from earlier nodes by index and writes one RGB
-/// value. The device-side evaluator allocates a small stack of `float3`
-/// slots (one per node) and runs through them in order.
-///
-/// Fields are type-punned into `payload[]` (u32 for indices / tags,
-/// bit-cast float for constants). Host side fills the packing; device
-/// side mirrors the layout via the same struct in `devicecode.h`.
-///
-/// Payload layout per tag (`payload[i]` as u32 unless noted):
-///   Const       [0..3] = rgb (float bitcast)
-///   ImageTex    [0] = tex_ptr_lo, [1] = tex_ptr_hi, [2] = w, [3] = h,
-///               [4] = channels, [5..11] = uv_transform (6 floats)
-///   Mix         [0] = in_a, [1] = in_b, [2] = blend_type, [3] = fac_src
-///               (0=const, 1=node), [4] = fac_node, [5] = clamp (0/1),
-///               [6] = fac_const (float)
-///   Invert      [0] = in, [1] = fac (float)
-///   Math        [0] = in, [1] = op, [2] = clamp (0/1),
-///               [3] = b_const (float), [4] = c_const (float),
-///               [5] = swap (0/1) — flips operand order for non-commutative
-///                     ops (subtract/divide/power); ignored for others.
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct ColorGraphNode {
-    pub tag: u32,
-    pub payload: [u32; 15],
-}
-
-// Layout contract with `devicecode.h`: 16 × u32, no padding, 4-byte aligned.
-// Host-side uploaders rely on this to reinterpret `&[ColorGraphNode]` as `&[u32]`.
-const _: () = assert!(std::mem::size_of::<ColorGraphNode>() == 64);
-const _: () = assert!(std::mem::align_of::<ColorGraphNode>() == 4);
-
-// Must stay in sync with `devicecode.h` and `scene_loader.rs`.
-pub const COLOR_NODE_CONST: u32 = 0;
-pub const COLOR_NODE_IMAGE_TEX: u32 = 1;
-pub const COLOR_NODE_MIX: u32 = 2;
-pub const COLOR_NODE_INVERT: u32 = 3;
-pub const COLOR_NODE_MATH: u32 = 4;
-pub const COLOR_NODE_HUE_SAT: u32 = 5;
-pub const COLOR_NODE_RGB_CURVE: u32 = 6;
-pub const COLOR_NODE_BRIGHT_CONTRAST: u32 = 7;
-pub const COLOR_NODE_VERTEX_COLOR: u32 = 8;
-pub const COLOR_NODE_OBJECT_RANDOM: u32 = 9;
-pub const COLOR_NODE_COLOR_RAMP: u32 = 10;
+pub use vibrt_nodes::types::*;
 
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -122,6 +78,9 @@ pub struct PrincipledGpu {
     /// Index into `color_graph_nodes` whose output is the final colour.
     /// Defaults to `color_graph_len - 1`.
     pub color_graph_output: i32,
+    pub shader_nodes: optix_sys::CUdeviceptr,
+    pub shader_len: i32,
+    pub shader_outputs: u32,
     /// Optional pointer to a `VolumeGpu`. Non-null means the bounded mesh is
     /// a volume container (junk_shop's `Smoke` is the canonical case).
     pub volume: optix_sys::CUdeviceptr,
@@ -166,6 +125,7 @@ pub struct PrincipledGpu {
     /// null`) ignore their own lobe params.
     pub left_subtree: optix_sys::CUdeviceptr,
     pub mix_fac: f32,
+    pub add_shader: i32,
     pub mix_fac_tex: optix_sys::CUdeviceptr,
     pub mix_fac_tex_w: i32,
     pub mix_fac_tex_h: i32,
@@ -208,10 +168,19 @@ pub struct HitGroupData {
     pub num_materials: i32,
     /// f32 x 3 per vertex. 0 when the mesh has no vertex color attribute.
     pub vertex_colors: optix_sys::CUdeviceptr,
+    pub vertex_alphas: optix_sys::CUdeviceptr,
     /// f32 x 3 per vertex (object-space). 0 when the mesh has no authored
     /// tangent — the device falls back to its default build_frame() tangent
     /// in that case. Currently only hair ribbon meshes ship a tangent blob.
     pub tangents: optix_sys::CUdeviceptr,
+    pub bounds_min: [f32; 3],
+    pub bounds_max: [f32; 3],
+    pub object_to_world: [f32; 12],
+    pub world_to_object: [f32; 12],
+    pub object_color: [f32; 4],
+    pub object_index: u32,
+    pub instance_id: u32,
+    pub light_pdf: optix_sys::CUdeviceptr,
 }
 
 #[repr(C)]
@@ -313,6 +282,9 @@ pub struct AreaRectLight {
 #[repr(C)]
 #[derive(Copy, Clone, Default)]
 pub struct MeshLightTri {
+    pub geometry: optix_sys::CUdeviceptr,
+    pub primitive: u32,
+    pub _pad_geometry: u32,
     pub v0: [f32; 3],
     pub _pad0: f32,
     pub v1: [f32; 3],
@@ -331,7 +303,7 @@ pub struct MeshLightTri {
     pub emission_tex_channels: i32,
     pub _pad4: [i32; 3],
 }
-const _: () = assert!(std::mem::size_of::<MeshLightTri>() == 128);
+const _: () = assert!(std::mem::size_of::<MeshLightTri>() == 144);
 
 /// One emissive mesh (or sub-mesh) addressed by NEE. `triangles` and
 /// `cdf` point into per-light device buffers built at scene-load time;

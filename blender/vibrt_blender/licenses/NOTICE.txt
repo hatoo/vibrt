@@ -1,0 +1,46 @@
+Native shader nodes and sky models bundled in vibrt_native
+
+Source: Blender v5.1.1 (b70da489d7f4)
+https://github.com/blender/blender/tree/v5.1.1/intern/sky
+
+Hosek-Wilkie model and coefficient tables (BSD-3-Clause):
+Copyright (c) 2012-2013 Lukas Hosek and Alexander Wilkie. All rights reserved.
+sky_hosek.cpp, sky_hosek_data.h, sky_hosek.h
+
+Single scattering atmosphere (Apache-2.0):
+Copyright 2011-2020 Blender Authors.
+sky_single_scattering.cpp
+
+Multiple scattering atmosphere (MIT):
+Copyright 2022 Fernando García Liñán.
+Copyright 2011-2025 Blender Authors.
+sky_multiple_scattering.cpp
+
+Analytic sky initialization and evaluation (Apache-2.0):
+Copyright 2011-2022 Blender Foundation.
+Adapted from intern/cycles/scene/shader_nodes.cpp and kernel/svm/sky.h.
+vibrt's sky_bridge.cpp replaces Cycles scene/kernel dependencies with an owned
+CPU evaluator, Rec.709 conversion, image filtering and a Rust C ABI.
+
+The original model sources are unchanged. The standalone math, scheduling and
+declaration headers are supplied by vibrt (MIT); Blender's GPL helper headers
+are not bundled. Full license texts are included beside this notice.
+
+Cycles shader mathematics (Blender v5.1.1):
+https://github.com/blender/blender/tree/v5.1.1/intern/cycles
+Copyright 2011-2022 Blender Foundation and Blender Authors (Apache-2.0).
+The standalone adapter extracts numerical helpers and replaces SVM stack,
+kernel globals, image access and shading context with vibrt's CPU/CUDA ABI.
+Noise, fractals, Voronoi, Gabor, Wave, Brick, Checker, Gradient, Magic,
+color/vector math, radial tiling, image projection, normal maps, Fresnel
+and tangent evaluation use or adapt these sources. Provenance and hashes
+are recorded in vibrt-nodes/third_party/cycles/.
+
+Perlin noise (BSD-3-Clause):
+Copyright (c) 2009-2010 Sony Pictures Imageworks Inc., et al.
+All Rights Reserved.
+Copyright 2011-2022 Blender Foundation.
+Adapted upstream from Open Shading Language.
+
+Voronoi portions (MIT):
+Copyright (c) 2013 Inigo Quilez.

@@ -27,6 +27,7 @@ parser.add_argument("--spp", type=int, default=4)
 parser.add_argument("--repeat", type=int, default=2)
 parser.add_argument("--expect-sky", action="store_true")
 parser.add_argument("--expect-progress", action="store_true")
+parser.add_argument("--expect-native-sky", action="store_true")
 args = parser.parse_args(sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else [])
 assert not bpy.app.background, "Use a normal Blender process to test the render job thread"
 assert args.repeat > 0
@@ -34,7 +35,13 @@ args.output.mkdir(parents=True, exist_ok=True)
 if not addon_utils.check("vibrt_blender")[1]:
     addon_utils.enable("vibrt_blender")
 from vibrt_blender import exporter
+from vibrt_blender import sky_bake
 from vibrt_blender.progressive import RenderResultDisplay
+
+if args.expect_native_sky:
+    def unexpected_worker(*_args, **_kwargs):
+        raise AssertionError("Expected native sky evaluation, but a Cycles worker was requested")
+    sky_bake._start_worker = unexpected_worker
 
 scene = bpy.context.scene
 scene.render.engine = "VIBRT"
@@ -64,7 +71,8 @@ def observe_preview(display, pixels):
     # Retain small fingerprints, not a full-resolution copy of every frame.
     previews.append(actual[::max(1, actual.shape[0] // 32),
                            ::max(1, actual.shape[1] // 32), :3].copy())
-    print("[render-job-test] preview", len(previews), flush=True)
+    print("[render-job-test] preview", len(previews),
+          f"at {time.monotonic() - state['started']:.3f}s", flush=True)
 
 
 if args.expect_progress:

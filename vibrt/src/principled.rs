@@ -1,11 +1,7 @@
 //! Host-side material upload for Principled BSDF.
 
-use crate::gpu_types::{
-    ColorGraphNode, PrincipledGpu, VolumeGpu, COLOR_NODE_BRIGHT_CONTRAST, COLOR_NODE_COLOR_RAMP,
-    COLOR_NODE_CONST, COLOR_NODE_HUE_SAT, COLOR_NODE_IMAGE_TEX, COLOR_NODE_INVERT, COLOR_NODE_MATH,
-    COLOR_NODE_MIX, COLOR_NODE_OBJECT_RANDOM, COLOR_NODE_RGB_CURVE, COLOR_NODE_VERTEX_COLOR,
-};
-use crate::scene_format::{ColorFactor, ColorGraph, ColorNode, PrincipledMaterial, VolumeParams};
+use crate::gpu_types::{PrincipledGpu, VolumeGpu};
+use crate::scene_format::{ColorGraph, ColorNode, PrincipledMaterial, VolumeParams};
 use crate::scene_loader::LoadedTexture;
 use crate::CudaResultExt;
 use anyhow::{anyhow, Result};
@@ -47,6 +43,42 @@ pub struct ColorGraphGpu {
     pub output: i32,
 }
 
+pub fn upload_shader_graph(
+    graph: &vibrt_nodes::shader::ShaderGraph,
+    textures: &[(u64, i32, i32)],
+    stream: &Arc<CudaStream>,
+    buffers: &mut Vec<CudaSlice<u32>>,
+    tables: &mut Vec<CudaSlice<f32>>,
+) -> Result<(u64, i32, u32)> {
+    graph.validate()?;
+    let mut pointers = Vec::with_capacity(graph.nodes.len());
+    for node in &graph.nodes {
+        if node.table.is_empty() {
+            pointers.push(0);
+        } else {
+            let data = stream.clone_htod(&node.table).cuda()?;
+            pointers.push(dptr(&data, stream));
+            tables.push(data);
+        }
+    }
+    let packed = graph.pack(textures, &pointers)?;
+    // repr(C), 104 bytes, all fields are integer/f32 with no uninitialized padding.
+    let words =
+        unsafe { std::slice::from_raw_parts(packed.as_ptr().cast::<u32>(), packed.len() * 26) };
+    let data = stream.clone_htod(words).cuda()?;
+    let ptr = dptr_u32(&data, stream);
+    buffers.push(data);
+    let mut mask = 0;
+    for name in graph.outputs.keys() {
+        mask |= 1
+            << vibrt_nodes::shader::OUTPUTS
+                .iter()
+                .position(|n| n == name)
+                .unwrap();
+    }
+    Ok((ptr, packed.len() as i32, mask))
+}
+
 /// Flatten a `ColorGraph` into the on-device `ColorGraphNode` layout and
 /// upload it. Returns a descriptor the material upload can splice in.
 pub fn upload_color_graph(
@@ -59,12 +91,7 @@ pub fn upload_color_graph(
     // Constant subgraphs were folded to `const` nodes by the Python exporter
     // (`vibrt_blender/color_fold.py`) before serialisation. The graph
     // arriving here already has them collapsed.
-    if graph.nodes.len() > 255 {
-        return Err(anyhow!(
-            "color_graph has {} nodes (max 255)",
-            graph.nodes.len()
-        ));
-    }
+    graph.validate()?;
     // RGBCurve / ColorRamp nodes carry their LUT inline in JSON; allocate
     // them per-node on the GPU so `flatten_color_graph` can splice the
     // device pointer into the payload. RGBCurve has a fixed 768-entry LUT
@@ -112,7 +139,7 @@ pub fn upload_color_graph(
             }
         }
     }
-    let flat = flatten_color_graph(graph, textures, &lut_ptrs, &lut_lens)?;
+    let flat = vibrt_nodes::graph::pack(graph, textures, &lut_ptrs, &lut_lens)?;
     // ColorGraphNode is repr(C) + 16 × u32 with no padding (see the
     // compile-time size/align asserts in `gpu_types.rs`), so reinterpreting
     // the buffer as `&[u32]` is sound and lets us reuse the existing
@@ -138,205 +165,6 @@ pub fn upload_color_graph(
         nodes: ptr,
         len,
         output,
-    })
-}
-
-fn flatten_color_graph(
-    graph: &ColorGraph,
-    textures: &[(optix_sys::CUdeviceptr, i32, i32)],
-    lut_ptrs: &[optix_sys::CUdeviceptr],
-    lut_lens: &[u32],
-) -> Result<Vec<ColorGraphNode>> {
-    let mut out: Vec<ColorGraphNode> = Vec::with_capacity(graph.nodes.len());
-    for (i, node) in graph.nodes.iter().enumerate() {
-        let mut record = ColorGraphNode {
-            tag: 0,
-            payload: [0u32; 15],
-        };
-        flatten_one(node, i, textures, lut_ptrs, lut_lens, &mut record)?;
-        out.push(record);
-    }
-    Ok(out)
-}
-
-fn flatten_one(
-    node: &ColorNode,
-    self_idx: usize,
-    textures: &[(optix_sys::CUdeviceptr, i32, i32)],
-    lut_ptrs: &[optix_sys::CUdeviceptr],
-    lut_lens: &[u32],
-    out: &mut ColorGraphNode,
-) -> Result<()> {
-    let check_ref = |r: u32, field: &str| -> Result<()> {
-        if (r as usize) >= self_idx {
-            Err(anyhow!(
-                "color_graph node {} {}: references node {} >= self",
-                self_idx,
-                field,
-                r
-            ))
-        } else {
-            Ok(())
-        }
-    };
-    let p = &mut out.payload;
-    match node {
-        ColorNode::Const { rgb } => {
-            out.tag = COLOR_NODE_CONST;
-            p[0] = rgb[0].to_bits();
-            p[1] = rgb[1].to_bits();
-            p[2] = rgb[2].to_bits();
-        }
-        ColorNode::ImageTex { tex, uv } => {
-            let (ptr, w, h) = *textures
-                .get(*tex as usize)
-                .ok_or_else(|| anyhow!("color_graph ImageTex.tex = {} out of range", tex))?;
-            out.tag = COLOR_NODE_IMAGE_TEX;
-            p[0] = ptr as u32;
-            p[1] = (ptr >> 32) as u32;
-            p[2] = w as u32;
-            p[3] = h as u32;
-            p[4] = 4; // RGBA f32 — every loaded texture is padded to 4 channels
-            for k in 0..6 {
-                p[5 + k] = uv[k].to_bits();
-            }
-        }
-        ColorNode::Mix {
-            a,
-            b,
-            fac,
-            blend,
-            clamp,
-        } => {
-            check_ref(*a, "a")?;
-            check_ref(*b, "b")?;
-            let blend_id = parse_blend(blend)?;
-            out.tag = COLOR_NODE_MIX;
-            p[0] = *a;
-            p[1] = *b;
-            p[2] = blend_id;
-            match fac {
-                ColorFactor::Const(v) => {
-                    p[3] = 0; // fac_src = const
-                    p[4] = 0;
-                    p[6] = v.to_bits();
-                }
-                ColorFactor::Node { node } => {
-                    check_ref(*node, "fac.node")?;
-                    p[3] = 1; // fac_src = node
-                    p[4] = *node;
-                    p[6] = 0;
-                }
-            }
-            p[5] = if *clamp { 1 } else { 0 };
-        }
-        ColorNode::Invert { input, fac } => {
-            check_ref(*input, "input")?;
-            out.tag = COLOR_NODE_INVERT;
-            p[0] = *input;
-            p[1] = fac.to_bits();
-        }
-        ColorNode::Math {
-            input,
-            op,
-            b,
-            c,
-            clamp,
-            swap,
-        } => {
-            check_ref(*input, "input")?;
-            let op_id = parse_math_op(op)?;
-            out.tag = COLOR_NODE_MATH;
-            p[0] = *input;
-            p[1] = op_id;
-            p[2] = if *clamp { 1 } else { 0 };
-            p[3] = b.to_bits();
-            p[4] = c.to_bits();
-            p[5] = if *swap { 1 } else { 0 };
-        }
-        ColorNode::HueSat {
-            input,
-            hue,
-            saturation,
-            value,
-            fac,
-        } => {
-            check_ref(*input, "input")?;
-            out.tag = COLOR_NODE_HUE_SAT;
-            p[0] = *input;
-            p[1] = hue.to_bits();
-            p[2] = saturation.to_bits();
-            p[3] = value.to_bits();
-            p[4] = fac.to_bits();
-        }
-        ColorNode::RgbCurve { input, .. } => {
-            check_ref(*input, "input")?;
-            let lut_ptr = lut_ptrs[self_idx];
-            out.tag = COLOR_NODE_RGB_CURVE;
-            p[0] = *input;
-            p[1] = lut_ptr as u32;
-            p[2] = (lut_ptr >> 32) as u32;
-        }
-        ColorNode::BrightContrast {
-            input,
-            bright,
-            contrast,
-        } => {
-            check_ref(*input, "input")?;
-            out.tag = COLOR_NODE_BRIGHT_CONTRAST;
-            p[0] = *input;
-            p[1] = bright.to_bits();
-            p[2] = contrast.to_bits();
-        }
-        ColorNode::VertexColor {} => {
-            out.tag = COLOR_NODE_VERTEX_COLOR;
-        }
-        ColorNode::ObjectRandom {} => {
-            out.tag = COLOR_NODE_OBJECT_RANDOM;
-        }
-        ColorNode::ColorRamp { input, .. } => {
-            check_ref(*input, "input")?;
-            let lut_ptr = lut_ptrs[self_idx];
-            let lut_len = lut_lens[self_idx];
-            out.tag = COLOR_NODE_COLOR_RAMP;
-            p[0] = *input;
-            p[1] = lut_ptr as u32;
-            p[2] = (lut_ptr >> 32) as u32;
-            p[3] = lut_len;
-        }
-    }
-    Ok(())
-}
-
-pub(crate) fn parse_blend(s: &str) -> Result<u32> {
-    Ok(match s {
-        "mix" => 0,
-        "multiply" => 1,
-        "add" => 2,
-        "subtract" => 3,
-        "screen" => 4,
-        "divide" => 5,
-        "difference" => 6,
-        "darken" => 7,
-        "lighten" => 8,
-        "overlay" => 9,
-        "soft_light" => 10,
-        "linear_light" => 11,
-        other => return Err(anyhow!("unknown Mix blend {:?}", other)),
-    })
-}
-
-pub(crate) fn parse_math_op(s: &str) -> Result<u32> {
-    Ok(match s {
-        "add" => 0,
-        "subtract" => 1,
-        "multiply" => 2,
-        "divide" => 3,
-        "power" => 4,
-        "multiply_add" => 5,
-        "minimum" => 6,
-        "maximum" => 7,
-        other => return Err(anyhow!("unknown Math op {:?}", other)),
     })
 }
 
@@ -478,6 +306,9 @@ pub fn make_material_data(
         color_graph_nodes: graph.nodes,
         color_graph_len: graph.len,
         color_graph_output: graph.output,
+        shader_nodes: 0,
+        shader_len: 0,
+        shader_outputs: 0,
         volume: volume_ptr,
         volume_only: if mat.volume_only { 1 } else { 0 },
         pure_glossy: if mat.pure_glossy { 1 } else { 0 },
@@ -488,6 +319,7 @@ pub fn make_material_data(
         // A negative mix_fac is the view-dependent Fresnel sentinel (its
         // magnitude is the Fresnel IOR); leave it untouched. Only clamp the
         // ordinary constant-factor case to [0, 1].
+        add_shader: mat.add_shader as i32,
         mix_fac: if mat.mix_fac < 0.0 {
             mat.mix_fac
         } else {

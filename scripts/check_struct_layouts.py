@@ -17,6 +17,10 @@ from pathlib import Path
 
 C = Path("vibrt/src/devicecode.h").read_text(encoding="utf-8")
 R = Path("vibrt/src/gpu_types.rs").read_text(encoding="utf-8")
+C += "\n" + Path("vibrt-nodes/native/types.h").read_text(encoding="utf-8")
+R += "\n" + Path("vibrt-nodes/src/types.rs").read_text(encoding="utf-8")
+C += "\n" + Path("vibrt-nodes/native/shader.h").read_text(encoding="utf-8")
+R += "\n" + Path("vibrt-nodes/src/shader.rs").read_text(encoding="utf-8")
 
 C_STRUCTS = re.compile(r"struct\s+(\w+)\s*\{([^}]*)\}\s*;", re.DOTALL)
 R_STRUCTS = re.compile(r"#\[repr\(C\)\][\s\S]*?pub struct\s+(\w+)\s*\{([^}]*)\}", re.DOTALL)

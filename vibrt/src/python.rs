@@ -236,6 +236,13 @@ fn render<'py>(
 
 #[pymodule]
 fn vibrt_native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(crate::python_nodes::sky_pixels, m)?)?;
+    m.add_function(wrap_pyfunction!(crate::python_nodes::color_pixels, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        crate::python_nodes::fold_color_constants,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(crate::python_nodes::shader_pixels, m)?)?;
     m.add_function(wrap_pyfunction!(render, m)?)?;
     m.add_function(wrap_pyfunction!(crate::blender_mesh::read_mesh, m)?)?;
     m.add_function(wrap_pyfunction!(crate::python_pixels::srgb_to_linear, m)?)?;

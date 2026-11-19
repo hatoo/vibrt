@@ -278,6 +278,7 @@ pub fn render_to_pixels(
         scene.mesh_lights.len(),
     ));
 
+    let t_prepare = std::time::Instant::now();
     let cuda_ctx = CudaContext::new(0).cuda().context("CUDA context")?;
     let stream = cuda_ctx.default_stream();
     let cu_stream = stream.cu_stream() as optix_sys::CUstream;
@@ -290,7 +291,67 @@ pub fn render_to_pixels(
     )
     .context("OptiX context")?;
 
-    let ptx_src = pipeline::compile_ptx()?;
+    let context_time = t_prepare.elapsed();
+    let t_ptx = std::time::Instant::now();
+    fn validate_shader_tree(
+        material: &scene_format::PrincipledMaterial,
+        depth: usize,
+    ) -> Result<usize> {
+        anyhow::ensure!(depth <= 8, "Material shader tree exceeds 8 levels");
+        if let Some(graph) = &material.shader_graph {
+            graph.validate()?;
+        }
+        let leaves = match (&material.left_subtree, &material.secondary) {
+            (None, None) => 1,
+            (left, right) => {
+                let l = if let Some(c) = left {
+                    validate_shader_tree(c, depth + 1)?
+                } else {
+                    1
+                };
+                let r = if let Some(c) = right {
+                    validate_shader_tree(c, depth + 1)?
+                } else {
+                    1
+                };
+                l + r
+            }
+        };
+        anyhow::ensure!(leaves <= 16, "Material shader tree exceeds 16 BSDF leaves");
+        Ok(leaves)
+    }
+    let mut max_closures = 1;
+    for material in &scene.file.materials {
+        max_closures = max_closures.max(validate_shader_tree(material, 0)?);
+    }
+    fn shader_operations(material: &scene_format::PrincipledMaterial) -> u64 {
+        let mut flags = 0;
+        if let Some(graph) = &material.shader_graph {
+            for node in &graph.nodes {
+                if let Some(index) = vibrt_nodes::shader::OPS
+                    .iter()
+                    .position(|(op, _)| *op == node.op)
+                {
+                    flags |= 1u64 << index;
+                }
+            }
+        }
+        if let Some(child) = &material.secondary {
+            flags |= shader_operations(child);
+        }
+        if let Some(child) = &material.left_subtree {
+            flags |= shader_operations(child);
+        }
+        flags
+    }
+    let shader_ops = scene
+        .file
+        .materials
+        .iter()
+        .fold(0, |mask, m| mask | shader_operations(m));
+    let ptx_src = pipeline::compile_ptx(shader_ops, max_closures)?;
+    let ptx_time = t_ptx.elapsed();
+    let t_pipeline = std::time::Instant::now();
 
     // --- Pipeline ---
     let pipeline_options = PipelineCompileOptions::new("params")
@@ -341,15 +402,10 @@ pub fn render_to_pixels(
     )
     .context("pipeline")?
     .value;
-    // 4096 bytes for the continuation stack (was 2048): trace_path
-    // stack-allocates a small array of MaterialEval slots (one per
-    // secondary closure level) so nested MixShader chains can be
-    // evaluated; with MAX_SECONDARY=3 in devicecode.cu, four
-    // ~144-byte MaterialEvals plus the surrounding locals push past
-    // 2048 on classroom and trip CUDA_ERROR_INVALID_PC. Doubling
-    // restores headroom; OptiX recomputes per-thread stacks lazily so
-    // there's no static cost when shallow scenes are rendered.
-    pipeline.set_stack_size(2048, 2048, 4096, 2)?;
+    // Node graphs and closure trees change stack use; query the compiled programs.
+    pipeline.set_stack_size_for_programs(&all_pgs, 2, 2)?;
+    let pipeline_time = t_pipeline.elapsed();
+    let t_scene_upload = std::time::Instant::now();
 
     // --- Upload textures (shared across materials) ---
     let mut _tex_buffers: Vec<CudaSlice<f32>> = Vec::new();
@@ -430,7 +486,7 @@ pub fn render_to_pixels(
             )?,
             None => 0,
         };
-        let gpu = principled::make_material_data(
+        let mut gpu = principled::make_material_data(
             mat,
             tex_slots,
             graph,
@@ -438,6 +494,16 @@ pub fn render_to_pixels(
             secondary_ptr,
             left_subtree_ptr,
         );
+        if let Some(graph) = &mat.shader_graph {
+            (gpu.shader_nodes, gpu.shader_len, gpu.shader_outputs) =
+                principled::upload_shader_graph(
+                    graph,
+                    tex_slots,
+                    stream,
+                    color_graph_buffers,
+                    color_graph_lut_buffers,
+                )?;
+        }
         Ok(alloc_and_copy(stream, &gpu)?)
     }
     for mat in &scene.file.materials {
@@ -473,6 +539,7 @@ pub fn render_to_pixels(
         d_uvs: optix_sys::CUdeviceptr,
         d_mat_indices: optix_sys::CUdeviceptr,
         d_vertex_colors: optix_sys::CUdeviceptr,
+        d_vertex_alphas: optix_sys::CUdeviceptr,
         d_tangents: optix_sys::CUdeviceptr,
         num_verts: i32,
     }
@@ -556,6 +623,14 @@ pub fn render_to_pixels(
         } else {
             0
         };
+        let d_vertex_alphas = if !m.vertex_alphas.is_empty() {
+            let s = stream.clone_htod(&m.vertex_alphas[..]).cuda()?;
+            let p = dptr_f32(&s, &stream);
+            _f32_buffers.push(s);
+            p
+        } else {
+            0
+        };
         let d_tangents = if !m.tangents.is_empty() {
             let s = stream.clone_htod(&m.tangents[..]).cuda()?;
             let p = dptr_f32(&s, &stream);
@@ -573,6 +648,7 @@ pub fn render_to_pixels(
             d_uvs,
             d_mat_indices,
             d_vertex_colors,
+            d_vertex_alphas,
             d_tangents,
             num_verts: num_verts as i32,
         });
@@ -603,6 +679,21 @@ pub fn render_to_pixels(
     let mut tri_hg_records: Vec<SbtRecord<HitGroupData>> = Vec::new();
     let mut gas_entries: Vec<GasEntry> = Vec::new();
     let mut _mat_table_bufs: Vec<CudaSlice<u64>> = Vec::new();
+    let mesh_bounds: Vec<_> = scene
+        .meshes
+        .iter()
+        .map(|mesh| {
+            let mut lo = [f32::MAX; 3];
+            let mut hi = [f32::MIN; 3];
+            for vertex in mesh.vertices.chunks_exact(3) {
+                for axis in 0..3 {
+                    lo[axis] = lo[axis].min(vertex[axis]);
+                    hi[axis] = hi[axis].max(vertex[axis]);
+                }
+            }
+            (lo, hi)
+        })
+        .collect();
     for (obj_idx, obj) in scene.objects.iter().enumerate() {
         let m = &meshes_gpu[obj.mesh as usize];
         let mat_ptr = *mat_device_ptrs
@@ -652,7 +743,33 @@ pub fn render_to_pixels(
             materials: materials_ptr,
             num_materials,
             vertex_colors: m.d_vertex_colors,
+            vertex_alphas: m.d_vertex_alphas,
             tangents: m.d_tangents,
+            bounds_min: mesh_bounds[obj.mesh as usize].0,
+            bounds_max: mesh_bounds[obj.mesh as usize].1,
+            object_to_world: obj.transform,
+            world_to_object: crate::transform::invert(&obj.transform),
+            object_color: scene.file.objects[obj_idx].object_color,
+            object_index: scene.file.objects[obj_idx].object_index,
+            instance_id: obj_idx as u32,
+            light_pdf: {
+                let total: f32 = scene.mesh_lights.iter().map(|l| l.power).sum();
+                if let Some(light) = scene
+                    .mesh_lights
+                    .iter()
+                    .find(|l| l.object_idx as usize == obj_idx)
+                {
+                    let mut densities =
+                        vec![0.0f32; scene.meshes[obj.mesh as usize].indices.len() / 3];
+                    for tri in &light.triangles {
+                        densities[tri.primitive as usize] =
+                            tri.sampling_luminance / total.max(1e-30);
+                    }
+                    alloc_and_copy_slice(&stream, &densities)?
+                } else {
+                    0
+                }
+            },
         };
         tri_hg_records.push(SbtRecord::new(&hit_rg_pg, hg)?);
         tri_hg_records.push(SbtRecord::new(&hit_shadow_pg, hg)?);
@@ -803,6 +920,12 @@ pub fn render_to_pixels(
                     None => (0, 0, 0, 0),
                 };
                 MeshLightTri {
+                    geometry: d_hg
+                        + (ml.object_idx as usize * 2 * hg_stride
+                            + mem::offset_of!(SbtRecord<HitGroupData>, data))
+                            as u64,
+                    primitive: t.primitive,
+                    _pad_geometry: 0,
                     v0: t.v0,
                     _pad0: 0.0,
                     v1: t.v1,
@@ -916,10 +1039,11 @@ pub fn render_to_pixels(
         };
 
     // --- GGX LUTs ---
-    let (lut_e, lut_e_avg, lut_b) = pipeline::generate_ggx_energy_lut();
-    let d_ggx_e = alloc_and_copy_slice(&stream, &lut_e)?;
-    let d_ggx_e_avg = alloc_and_copy_slice(&stream, &lut_e_avg)?;
-    let d_ggx_b = alloc_and_copy_slice(&stream, &lut_b)?;
+    let scene_upload_time = t_scene_upload.elapsed();
+    let t_buffers = std::time::Instant::now();
+    let d_ggx_e = alloc_and_copy_slice(&stream, &pipeline::GGX_ENERGY_LUT)?;
+    let d_ggx_e_avg = alloc_and_copy_slice(&stream, &pipeline::GGX_ENERGY_AVG_LUT)?;
+    let d_ggx_b = alloc_and_copy_slice(&stream, &pipeline::GGX_FRESNEL_LUT)?;
 
     // --- Image buffer (float4 per pixel) ---
     let pixel_count = (render_settings.width * render_settings.height) as usize;
@@ -1028,6 +1152,12 @@ pub fn render_to_pixels(
         primary_back_face_skip_exhausted,
     };
     let mut d_params = stream.clone_htod(&[lp]).cuda()?;
+    stream.synchronize().cuda()?;
+    progress.log(&format!(
+        "GPU preparation: {:.2?} (context={:.2?}, PTX={:.2?}, pipeline={:.2?}, scene={:.2?}, buffers={:.2?})",
+        t_prepare.elapsed(), context_time, ptx_time, pipeline_time, scene_upload_time,
+        t_buffers.elapsed(),
+    ));
 
     progress.log("Rendering...");
     let t0 = std::time::Instant::now();

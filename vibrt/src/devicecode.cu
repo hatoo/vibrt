@@ -236,7 +236,7 @@ ggx_vndf_pdf_aniso(float3 Vlocal, float3 Hlocal, float ax, float ay) {
 }
 
 // ---------- GGX energy compensation (Kulla-Conty) ----------
-// LUT layout matches pipeline::generate_ggx_energy_lut():
+// LUT layout matches build.rs::generate_ggx_energy_lut():
 //   e_lut[ci * n + ai]  with  cos_theta = (ci+0.5)/n,  alpha = (ai+0.5)/n
 //   e_avg[ai]           with  alpha     = (ai+0.5)/n
 #define GGX_LUT_N 32
@@ -426,6 +426,13 @@ struct PathVertex {
   // stable but-different value — feeds `COLOR_NODE_OBJECT_RANDOM` so the
   // material graph can lerp ColorRamps and Mix nodes per instance.
   float object_random;
+  float3 P_object, generated, N_object, object_location, incoming;
+  float3 dPdu, dPdv;
+  float3 dOdu, dOdv, dGdu, dGdv;
+  HitGroupData *geometry;
+  float vertex_alpha;
+  float ray_length;
+  unsigned int path_depth, diffuse_depth, glossy_depth, transmission_depth, path_flags;
   int hit; // 1 if hit, 0 if miss
   // Mesh-light index for the instance this hit landed on (-1 when the
   // instance isn't registered for mesh-light NEE). Mirrors the SBT's
@@ -440,6 +447,7 @@ struct PathVertex {
   // form `pdf_solid = d² / (area × cos_light)` without re-fetching the
   // BLAS triangle. Zero on misses / non-mesh-light hits.
   float prim_area;
+  float light_pdf;
 };
 
 static __forceinline__ __device__ void *unpack_ptr(unsigned int hi,
@@ -694,7 +702,7 @@ static __device__ bool shadow_visible(float3 P, float3 dir, float tmax) {
 // trace iterations to bound the worst case (alternating boundary
 // crossings); past that we conservatively assume the light is unreachable
 // — pathological scenes only.
-static __device__ float3 shadow_transmittance(float3 P, float3 dir, float tmax,
+static __device__ __noinline__ float3 shadow_transmittance(float3 P, float3 dir, float tmax,
                                               VolumeStack stack) {
   // Fast path: no volumes anywhere. Standard binary visibility — the
   // any-hit handler already lets transmissive surfaces pass through
@@ -804,344 +812,48 @@ static __device__ float3 shadow_transmittance(float3 P, float3 dir, float tmax,
 }
 
 // ---------- Colour graph evaluator ----------
-// Register-sized cap — classroom's paintedCeiling only needs 6 nodes today.
-#define COLOR_GRAPH_MAX_NODES 32
+#include "vibrt_nodes_core.h"
+#include "vibrt_shader.h"
 
-static __forceinline__ __device__ float3 mix_blend_rgb(
-    float3 a, float3 b, float fac, unsigned int blend, bool clamp_out) {
-  float facm = 1.0f - fac;
-  float3 out;
-  switch (blend) {
-    default:
-    case 0: // MIX
-      out = a * facm + b * fac;
-      break;
-    case 1: // MULTIPLY
-      out = make_float3(a.x * (facm + b.x * fac),
-                        a.y * (facm + b.y * fac),
-                        a.z * (facm + b.z * fac));
-      break;
-    case 2: // ADD
-      out = a + b * fac;
-      break;
-    case 3: // SUBTRACT
-      out = a - b * fac;
-      break;
-    case 4: // SCREEN
-      out = make_float3(1.0f, 1.0f, 1.0f) -
-            (make_float3(facm, facm, facm) + (make_float3(1.0f, 1.0f, 1.0f) - b) * fac) *
-                (make_float3(1.0f, 1.0f, 1.0f) - a);
-      break;
-    case 5: // DIVIDE — per-channel, guard against div-by-zero
-      out.x = b.x == 0.0f ? a.x : a.x * facm + a.x / b.x * fac;
-      out.y = b.y == 0.0f ? a.y : a.y * facm + a.y / b.y * fac;
-      out.z = b.z == 0.0f ? a.z : a.z * facm + a.z / b.z * fac;
-      break;
-    case 6: { // DIFFERENCE
-      float3 d = make_float3(fabsf(a.x - b.x), fabsf(a.y - b.y), fabsf(a.z - b.z));
-      out = a * facm + d * fac;
-      break;
-    }
-    case 7: // DARKEN
-      out.x = a.x * facm + fminf(a.x, b.x) * fac;
-      out.y = a.y * facm + fminf(a.y, b.y) * fac;
-      out.z = a.z * facm + fminf(a.z, b.z) * fac;
-      break;
-    case 8: // LIGHTEN (Blender's asymmetric form)
-      out.x = fmaxf(a.x, b.x * fac);
-      out.y = fmaxf(a.y, b.y * fac);
-      out.z = fmaxf(a.z, b.z * fac);
-      break;
-    case 9: { // OVERLAY per-channel
-      auto ov = [&](float ax, float bx) {
-        return ax < 0.5f ? ax * (facm + 2.0f * fac * bx)
-                         : 1.0f - (facm + 2.0f * fac * (1.0f - bx)) * (1.0f - ax);
-      };
-      out.x = ov(a.x, b.x);
-      out.y = ov(a.y, b.y);
-      out.z = ov(a.z, b.z);
-      break;
-    }
-    case 10: { // SOFT_LIGHT
-      float3 scr = make_float3(1.0f - (1.0f - b.x) * (1.0f - a.x),
-                               1.0f - (1.0f - b.y) * (1.0f - a.y),
-                               1.0f - (1.0f - b.z) * (1.0f - a.z));
-      float3 inner = make_float3(
-          (1.0f - a.x) * b.x * a.x + a.x * scr.x,
-          (1.0f - a.y) * b.y * a.y + a.y * scr.y,
-          (1.0f - a.z) * b.z * a.z + a.z * scr.z);
-      out = a * facm + inner * fac;
-      break;
-    }
-    case 11: // LINEAR_LIGHT
-      out = a + (b * 2.0f - make_float3(1.0f, 1.0f, 1.0f)) * fac;
-      break;
+static __device__ void shader_context(const PathVertex &v, vibrt_cycles::float4 *ctx) {
+  using vibrt_cycles::make_float4;
+  for(int i=0;i<32;i++)ctx[i]=make_float4(0);
+  ctx[0]=make_float4(v.uv.x,v.uv.y,0,1);
+#define CTX_VEC(I,V) ctx[I]=make_float4((V).x,(V).y,(V).z,1)
+  CTX_VEC(1,v.generated);CTX_VEC(2,v.P_object);CTX_VEC(3,v.P);
+  CTX_VEC(4,v.Ns);CTX_VEC(5,v.Ng);CTX_VEC(6,v.incoming);
+  float3 T=v.dPdu,B;if(dot3(T,T)<1e-8f)build_frame(v.Ns,T,B);else T=normalize3(T-v.Ns*dot3(T,v.Ns));
+  CTX_VEC(7,T);CTX_VEC(8,v.vc);
+  ctx[8].w=v.vertex_alpha;
+  ctx[17]=make_float4(dot3(cross3(v.Ns,T),v.dPdv)<0?-1.0f:1.0f,0,0,0);
+  ctx[9]=make_float4(v.object_random,v.geometry?(float)v.geometry->object_index:0,0,v.geometry?v.geometry->object_color[3]:1);
+  CTX_VEC(10,v.object_location);ctx[11]=v.geometry?make_float4(v.geometry->object_color[0],v.geometry->object_color[1],v.geometry->object_color[2],v.geometry->object_color[3]):make_float4(1);
+  float3 cp=v.P-make_f3(params.cam_eye);
+  float3 cr=make_float3(dot3(cp,normalize3(make_f3(params.cam_u))),dot3(cp,normalize3(make_f3(params.cam_v))),dot3(cp,normalize3(make_f3(params.cam_w))));
+  CTX_VEC(12,cr);CTX_VEC(13,v.N_object);
+  float z=dot3(cp,normalize3(make_f3(params.cam_w)));
+  ctx[14]=make_float4(0.5f+0.5f*dot3(cp,make_f3(params.cam_u))/fmaxf(z*dot3(make_f3(params.cam_u),make_f3(params.cam_u)),1e-8f),0.5f+0.5f*dot3(cp,make_f3(params.cam_v))/fmaxf(z*dot3(make_f3(params.cam_v),make_f3(params.cam_v)),1e-8f),0,1);
+  float3 refl=2.0f*dot3(v.Ns,v.incoming)*v.Ns-v.incoming;
+  CTX_VEC(15,refl);ctx[16]=vibrt_shader::scalar(dot3(v.Ng,v.incoming)<0?1.0f:0.0f);
+  ctx[18]=make_float4(v.ray_length,(float)v.path_depth,(float)v.diffuse_depth,(float)v.glossy_depth);
+  ctx[19]=make_float4((float)v.transmission_depth,0,0,0);
+  for(int i=0;i<4;i++){ctx[20][i]=(v.path_flags&(1u<<i))?1.0f:0.0f;ctx[21][i]=(v.path_flags&(1u<<(i+4)))?1.0f:0.0f;}
+  if(v.geometry)for(int i=0;i<3;i++) {
+    const float *a=v.geometry->object_to_world+4*i,*b=v.geometry->world_to_object+4*i;
+    ctx[22+i]=make_float4(a[0],a[1],a[2],a[3]);ctx[25+i]=make_float4(b[0],b[1],b[2],b[3]);
   }
-  if (clamp_out) {
-    out.x = fmaxf(0.0f, fminf(1.0f, out.x));
-    out.y = fmaxf(0.0f, fminf(1.0f, out.y));
-    out.z = fmaxf(0.0f, fminf(1.0f, out.z));
-  }
-  return out;
+  float3 axes[3]={normalize3(make_f3(params.cam_u)),normalize3(make_f3(params.cam_v)),normalize3(make_f3(params.cam_w))};
+  for(int i=0;i<3;i++)ctx[28+i]=make_float4(axes[i].x,axes[i].y,axes[i].z,-dot3(axes[i],make_f3(params.cam_eye)));
+#undef CTX_VEC
 }
-
-static __forceinline__ __device__ float3 math_apply_rgb(
-    float3 inp, unsigned int op, float b, float c, bool swap) {
-  // `swap` flips operand order for non-commutative ops so the node can act as
-  // `b OP input` instead of `input OP b` — mirrors Cycles ShaderNodeMath with
-  // the texture chain on input[1]. Commutative ops ignore swap.
-  float3 o;
-  switch (op) {
-    default:
-    case 0: // ADD
-      o = make_float3(inp.x + b, inp.y + b, inp.z + b);
-      break;
-    case 1: // SUBTRACT
-      if (swap) {
-        o = make_float3(b - inp.x, b - inp.y, b - inp.z);
-      } else {
-        o = make_float3(inp.x - b, inp.y - b, inp.z - b);
-      }
-      break;
-    case 2: // MULTIPLY
-      o = make_float3(inp.x * b, inp.y * b, inp.z * b);
-      break;
-    case 3: // DIVIDE
-      if (swap) {
-        // b / inp, per channel. Cycles returns 0 when the denominator is 0.
-        o = make_float3(inp.x == 0.0f ? 0.0f : b / inp.x,
-                        inp.y == 0.0f ? 0.0f : b / inp.y,
-                        inp.z == 0.0f ? 0.0f : b / inp.z);
-      } else {
-        o = make_float3(b == 0.0f ? 0.0f : inp.x / b,
-                        b == 0.0f ? 0.0f : inp.y / b,
-                        b == 0.0f ? 0.0f : inp.z / b);
-      }
-      break;
-    case 4: // POWER
-      if (swap) {
-        float base = fmaxf(b, 0.0f);
-        o = make_float3(powf(base, inp.x), powf(base, inp.y), powf(base, inp.z));
-      } else {
-        o = make_float3(powf(fmaxf(inp.x, 0.0f), b),
-                        powf(fmaxf(inp.y, 0.0f), b),
-                        powf(fmaxf(inp.z, 0.0f), b));
-      }
-      break;
-    case 5: // MULTIPLY_ADD
-      o = make_float3(inp.x * b + c, inp.y * b + c, inp.z * b + c);
-      break;
-    case 6: // MINIMUM
-      o = make_float3(fminf(inp.x, b), fminf(inp.y, b), fminf(inp.z, b));
-      break;
-    case 7: // MAXIMUM
-      o = make_float3(fmaxf(inp.x, b), fmaxf(inp.y, b), fmaxf(inp.z, b));
-      break;
-  }
-  return o;
+static __device__ __noinline__ void evaluate_shader(PrincipledGpu *m,const PathVertex &v,vibrt_cycles::float4 *out) {
+  vibrt_cycles::float4 ctx[32];shader_context(v,ctx);
+  vibrt_shader::evaluate((const ShaderInstruction*)m->shader_nodes,m->shader_len,ctx,out);
 }
-
-// RGB ↔ HSV helpers in the shape Blender uses (HSV channels in [0,1]).
-static __forceinline__ __device__ float3 rgb_to_hsv_bl(float3 c) {
-  float cmax = fmaxf(c.x, fmaxf(c.y, c.z));
-  float cmin = fminf(c.x, fminf(c.y, c.z));
-  float v = cmax;
-  float d = cmax - cmin;
-  float s = cmax > 0.0f ? d / cmax : 0.0f;
-  float h = 0.0f;
-  if (d > 0.0f) {
-    if (cmax == c.x) {
-      h = (c.y - c.z) / d + (c.y < c.z ? 6.0f : 0.0f);
-    } else if (cmax == c.y) {
-      h = (c.z - c.x) / d + 2.0f;
-    } else {
-      h = (c.x - c.y) / d + 4.0f;
-    }
-    h *= (1.0f / 6.0f);
-  }
-  return make_float3(h, s, v);
-}
-
-static __forceinline__ __device__ float3 hsv_to_rgb_bl(float3 c) {
-  float h = c.x - floorf(c.x); // wrap to [0,1)
-  float s = fmaxf(0.0f, fminf(1.0f, c.y));
-  float v = c.z;
-  float i = floorf(h * 6.0f);
-  float f = h * 6.0f - i;
-  float p = v * (1.0f - s);
-  float q = v * (1.0f - f * s);
-  float t = v * (1.0f - (1.0f - f) * s);
-  int ii = ((int)i) % 6;
-  if (ii < 0) ii += 6;
-  switch (ii) {
-    case 0: return make_float3(v, t, p);
-    case 1: return make_float3(q, v, p);
-    case 2: return make_float3(p, v, t);
-    case 3: return make_float3(p, q, v);
-    case 4: return make_float3(t, p, v);
-    default: return make_float3(v, p, q);
-  }
-}
-
 static __device__ float3 eval_color_graph(
-    ColorGraphNode *nodes, int n_nodes, int output, float2 base_uv, float3 vc,
-    float object_random) {
-  float3 slots[COLOR_GRAPH_MAX_NODES];
-  int n = n_nodes < COLOR_GRAPH_MAX_NODES ? n_nodes : COLOR_GRAPH_MAX_NODES;
-  for (int i = 0; i < n; i++) {
-    ColorGraphNode nd = nodes[i];
-    unsigned int tag = nd.tag;
-    const unsigned int *pp = nd.payload;
-    if (tag == COLOR_NODE_CONST) {
-      slots[i] = make_float3(__uint_as_float(pp[0]),
-                             __uint_as_float(pp[1]),
-                             __uint_as_float(pp[2]));
-    } else if (tag == COLOR_NODE_IMAGE_TEX) {
-      unsigned long long ptr =
-          ((unsigned long long)pp[1] << 32) | (unsigned long long)pp[0];
-      const float *tex = (const float *)ptr;
-      int w = (int)pp[2];
-      int h = (int)pp[3];
-      int ch = (int)pp[4];
-      float m0 = __uint_as_float(pp[5]);
-      float m1 = __uint_as_float(pp[6]);
-      float m2 = __uint_as_float(pp[7]);
-      float m3 = __uint_as_float(pp[8]);
-      float m4 = __uint_as_float(pp[9]);
-      float m5 = __uint_as_float(pp[10]);
-      float2 uv = make_float2(m0 * base_uv.x + m1 * base_uv.y + m2,
-                              m3 * base_uv.x + m4 * base_uv.y + m5);
-      slots[i] = sample_rgba(tex, w, h, ch, uv);
-    } else if (tag == COLOR_NODE_MIX) {
-      int ia = (int)pp[0];
-      int ib = (int)pp[1];
-      unsigned int blend = pp[2];
-      unsigned int fac_src = pp[3];
-      float fac;
-      if (fac_src == 0u) {
-        fac = __uint_as_float(pp[6]);
-      } else {
-        int ifac = (int)pp[4];
-        float3 fv = slots[ifac];
-        fac = 0.2126f * fv.x + 0.7152f * fv.y + 0.0722f * fv.z;
-      }
-      bool clamp_out = pp[5] != 0u;
-      slots[i] = mix_blend_rgb(slots[ia], slots[ib], fac, blend, clamp_out);
-    } else if (tag == COLOR_NODE_INVERT) {
-      int iin = (int)pp[0];
-      float fac = __uint_as_float(pp[1]);
-      float3 cc = slots[iin];
-      float facm = 1.0f - fac;
-      slots[i] = make_float3(cc.x * facm + (1.0f - cc.x) * fac,
-                             cc.y * facm + (1.0f - cc.y) * fac,
-                             cc.z * facm + (1.0f - cc.z) * fac);
-    } else if (tag == COLOR_NODE_MATH) {
-      int iin = (int)pp[0];
-      unsigned int op = pp[1];
-      bool clamp_out = pp[2] != 0u;
-      float b = __uint_as_float(pp[3]);
-      float c = __uint_as_float(pp[4]);
-      bool swap = pp[5] != 0u;
-      float3 o = math_apply_rgb(slots[iin], op, b, c, swap);
-      if (clamp_out) {
-        o.x = fmaxf(0.0f, fminf(1.0f, o.x));
-        o.y = fmaxf(0.0f, fminf(1.0f, o.y));
-        o.z = fmaxf(0.0f, fminf(1.0f, o.z));
-      }
-      slots[i] = o;
-    } else if (tag == COLOR_NODE_RGB_CURVE) {
-      int iin = (int)pp[0];
-      unsigned long long ptr =
-          ((unsigned long long)pp[2] << 32) | (unsigned long long)pp[1];
-      const float *lut = (const float *)ptr;
-      float3 src = slots[iin];
-      auto fetch = [&](int channel, float x) {
-        float xc = fmaxf(0.0f, fminf(1.0f, x));
-        float fx = xc * 255.0f;
-        int i0 = (int)floorf(fx);
-        int i1 = i0 < 255 ? i0 + 1 : 255;
-        float t = fx - (float)i0;
-        int base = channel * 256;
-        return lut[base + i0] * (1.0f - t) + lut[base + i1] * t;
-      };
-      slots[i] = make_float3(fetch(0, src.x), fetch(1, src.y), fetch(2, src.z));
-    } else if (tag == COLOR_NODE_BRIGHT_CONTRAST) {
-      int iin = (int)pp[0];
-      float bright = __uint_as_float(pp[1]);
-      float contrast = __uint_as_float(pp[2]);
-      // Cycles: a = 1 + contrast; b = bright - contrast/2.
-      float a = 1.0f + contrast;
-      float b = bright - 0.5f * contrast;
-      float3 s = slots[iin];
-      slots[i] = make_float3(fmaxf(0.0f, a * s.x + b),
-                             fmaxf(0.0f, a * s.y + b),
-                             fmaxf(0.0f, a * s.z + b));
-    } else if (tag == COLOR_NODE_HUE_SAT) {
-      int iin = (int)pp[0];
-      float hue = __uint_as_float(pp[1]);
-      float sat = __uint_as_float(pp[2]);
-      float val = __uint_as_float(pp[3]);
-      float fac = __uint_as_float(pp[4]);
-      float3 src = slots[iin];
-      float3 hsv = rgb_to_hsv_bl(src);
-      // Blender's HueSaturation subtracts 0.5 from Hue before shifting so
-      // the default (0.5) is identity.
-      hsv.x = hsv.x + (hue - 0.5f);
-      hsv.y = fmaxf(0.0f, fminf(1.0f, hsv.y * sat));
-      hsv.z = hsv.z * val;
-      float3 shifted = hsv_to_rgb_bl(hsv);
-      float facm = 1.0f - fac;
-      slots[i] = make_float3(src.x * facm + shifted.x * fac,
-                             src.y * facm + shifted.y * fac,
-                             src.z * facm + shifted.z * fac);
-    } else if (tag == COLOR_NODE_VERTEX_COLOR) {
-      slots[i] = vc;
-    } else if (tag == COLOR_NODE_OBJECT_RANDOM) {
-      slots[i] = make_float3(object_random, object_random, object_random);
-    } else if (tag == COLOR_NODE_COLOR_RAMP) {
-      // Payload: [in_slot, lut_ptr_lo, lut_ptr_hi, lut_len]. The host bakes
-      // the ramp to `lut_len` linear-RGB stops; we look up by Fac.x with
-      // bilinear interpolation across the table.
-      int iin = (int)pp[0];
-      unsigned long long ptr =
-          ((unsigned long long)pp[2] << 32) | (unsigned long long)pp[1];
-      const float *lut = (const float *)ptr;
-      int len = (int)pp[3];
-      float3 src = slots[iin];
-      // ColorRamp's Fac socket reads as either a scalar or the R channel of
-      // an incoming colour — match `_socket_constant_rgb`'s convention.
-      float fac = src.x;
-      fac = fmaxf(0.0f, fminf(1.0f, fac));
-      float fx = fac * (float)(len - 1);
-      int i0 = (int)floorf(fx);
-      int i1 = i0 < (len - 1) ? i0 + 1 : (len - 1);
-      float t = fx - (float)i0;
-      float3 c0 = make_float3(lut[i0 * 3 + 0], lut[i0 * 3 + 1], lut[i0 * 3 + 2]);
-      float3 c1 = make_float3(lut[i1 * 3 + 0], lut[i1 * 3 + 1], lut[i1 * 3 + 2]);
-      slots[i] = make_float3(c0.x * (1.0f - t) + c1.x * t,
-                             c0.y * (1.0f - t) + c1.y * t,
-                             c0.z * (1.0f - t) + c1.z * t);
-    } else {
-      // Unknown tag means the host built a graph with a node type the device
-      // doesn't recognize — a real bug in the exporter / scene_loader. Print
-      // once per launch (gated by launch-idx==0) so the log isn't flooded.
-      uint3 _li = optixGetLaunchIndex();
-      if (_li.x == 0 && _li.y == 0) {
-        printf("[vibrt] warn: eval_color_graph: unknown node tag %u at slot %d -- returning white\n",
-               tag, i);
-      }
-      slots[i] = make_float3(1.0f, 1.0f, 1.0f);
-    }
-  }
-  if (output < 0 || output >= n) {
-    uint3 _li = optixGetLaunchIndex();
-    if (_li.x == 0 && _li.y == 0) {
-      printf("[vibrt] warn: eval_color_graph: output index %d out of range [0, %d) -- returning white\n",
-             output, n);
-    }
-    return make_float3(1.0f, 1.0f, 1.0f);
-  }
-  return slots[output];
+    ColorGraphNode *nodes, int n, int output, float2 uv, float3 vc, float random) {
+  auto value = vibrt_nodes::eval_color_graph(nodes, n, output, {uv.x, uv.y}, {vc.x, vc.y, vc.z}, random);
+  return make_float3(value.x, value.y, value.z);
 }
 
 // ---------- Principled BSDF ----------
@@ -1172,15 +884,19 @@ struct MaterialEval {
   float3 Ng; // geometric normal (for shadow-terminator term)
   float3 T;  // rotated by tangent_rotation for anisotropy
   float3 B;
+  float specular_ior_level, anisotropy, tangent_rotation;
+  float coat_weight, coat_roughness, coat_ior;
+  float sheen_weight, sheen_roughness, sss_weight, translucent_weight;
+  float hair_offset, hair_roughness_u, hair_roughness_v, alpha_blend;
+  float3 sheen_tint, sss_radius;
   PrincipledGpu *mat; // raw material ptr for coat/sheen/sss params
 };
 
 // Group of leaf MaterialEvals + their per-leaf weights. The weights sum
 // to 1 across the group (modulo per-pixel mix_fac quantisation). Built
-// by `eval_material` from the binary Mix tree at the hit. Capped at
-// `MAX_LEAVES` slots — anything deeper truncates the deepest branch
-// (silently, since the exporter caps tree depth too).
-constexpr int MAX_LEAVES = 4;
+// by `eval_material` from the binary Mix tree at the hit. The host validates
+// the tree and compiles exactly the maximum leaf count used by the scene.
+constexpr int MAX_LEAVES = VIBRT_MAX_CLOSURES;
 struct MaterialEvalGroup {
   MaterialEval *slots; // n elements
   float *weights;      // n elements, sum to ≈1
@@ -1198,7 +914,7 @@ struct MaterialEvalGroup {
 // (m = v.mat->secondary). The vertex-level inputs (uv, vertex color,
 // tangents, normals) come from `v` regardless of which closure is being
 // evaluated.
-static __device__ MaterialEval eval_material_one(const PathVertex &v,
+static __device__ __noinline__ MaterialEval eval_material_one(const PathVertex &v,
                                                   PrincipledGpu *m,
                                                   float min_alpha = 0.0f) {
   MaterialEval e;
@@ -1209,6 +925,11 @@ static __device__ MaterialEval eval_material_one(const PathVertex &v,
   e.ior = m->ior;
   e.transmission = m->transmission;
   e.emission = make_f3(m->emission);
+  e.specular_ior_level=m->specular_ior_level;e.anisotropy=m->anisotropy;e.tangent_rotation=m->tangent_rotation;
+  e.coat_weight=m->coat_weight;e.coat_roughness=m->coat_roughness;e.coat_ior=m->coat_ior;
+  e.sheen_weight=m->sheen_weight;e.sheen_roughness=m->sheen_roughness;e.sheen_tint=make_f3(m->sheen_tint);
+  e.sss_weight=m->sss_weight;e.sss_radius=make_f3(m->sss_radius);e.translucent_weight=m->translucent_weight;
+  e.hair_offset=m->hair_offset;e.hair_roughness_u=m->hair_roughness_u;e.hair_roughness_v=m->hair_roughness_v;e.alpha_blend=m->alpha_blend;
 
   const float *M = m->uv_transform;
   float2 uv =
@@ -1255,6 +976,43 @@ static __device__ MaterialEval eval_material_one(const PathVertex &v,
     e.emission = e.emission * t;
   }
   e.metallic = fminf(fmaxf(e.metallic, 0.0f), 1.0f);
+  float3 graph_normal=v.Ns,graph_tangent=v.T;
+  if(m->shader_nodes && m->shader_len>0) {
+    vibrt_cycles::float4 out[32];evaluate_shader(m,v,out);
+    unsigned int mask=m->shader_outputs;
+#define GRAPH_SCALAR(I,F) if(mask&(1u<<I))e.F=out[I].x
+#define GRAPH_COLOR(I,F) if(mask&(1u<<I))e.F=make_float3(out[I].x,out[I].y,out[I].z)
+    GRAPH_COLOR(0,base_color);GRAPH_SCALAR(1,roughness);GRAPH_SCALAR(2,metallic);GRAPH_SCALAR(3,ior);
+    GRAPH_SCALAR(4,transmission);GRAPH_COLOR(5,emission);if(mask&(1u<<6))e.emission=e.emission*out[6].x;
+    GRAPH_SCALAR(7,alpha_blend);GRAPH_SCALAR(8,specular_ior_level);GRAPH_SCALAR(9,anisotropy);
+    if(mask&(1u<<10))e.tangent_rotation=out[10].x*6.283185307179586f;
+    GRAPH_SCALAR(11,coat_weight);GRAPH_SCALAR(12,coat_roughness);GRAPH_SCALAR(13,coat_ior);
+    GRAPH_SCALAR(14,sheen_weight);GRAPH_SCALAR(15,sheen_roughness);GRAPH_COLOR(16,sheen_tint);
+    GRAPH_SCALAR(17,sss_weight);GRAPH_COLOR(18,sss_radius);GRAPH_SCALAR(19,translucent_weight);
+    GRAPH_SCALAR(20,hair_offset);GRAPH_SCALAR(21,hair_roughness_u);GRAPH_SCALAR(22,hair_roughness_v);
+    if(mask&(1u<<24))graph_normal=normalize3(make_float3(out[24].x,out[24].y,out[24].z));
+    if(mask&(1u<<25))graph_tangent=normalize3(make_float3(out[25].x,out[25].y,out[25].z));
+    if(mask&(1u<<26)) {
+      constexpr float delta=0.001f;
+      PathVertex du=v,dv=v;
+      du.uv.x+=delta;dv.uv.y+=delta;
+      du.P=du.P+v.dPdu*delta;dv.P=dv.P+v.dPdv*delta;
+      du.P_object=du.P_object+v.dOdu*delta;dv.P_object=dv.P_object+v.dOdv*delta;
+      du.generated=du.generated+v.dGdu*delta;dv.generated=dv.generated+v.dGdv*delta;
+      vibrt_cycles::float4 out_u[32],out_v[32];evaluate_shader(m,du,out_u);evaluate_shader(m,dv,out_v);
+      float dhdu=(out_u[26].x-out[26].x)/delta,dhdv=(out_v[26].x-out[26].x)/delta;
+      float3 r1=cross3(v.dPdv,graph_normal),r2=cross3(graph_normal,v.dPdu);
+      float det=dot3(v.dPdu,r1);
+      if(fabsf(det)>1e-12f){float3 bumped=normalize3(graph_normal-(r1*dhdu+r2*dhdv)*(out[28].x/det));float f=fminf(fmaxf(out[27].x,0.0f),1.0f);graph_normal=normalize3(graph_normal*(1-f)+bumped*f);}
+    }
+#undef GRAPH_SCALAR
+#undef GRAPH_COLOR
+  }
+  e.alpha_blend=fminf(fmaxf(e.alpha_blend,0.0f),1.0f);
+  e.emission=e.emission*e.alpha_blend;
+  e.metallic=fminf(fmaxf(e.metallic,0.0f),1.0f);
+  e.roughness=fminf(fmaxf(e.roughness,0.0f),1.0f);
+  e.ior=fmaxf(e.ior,1e-5f);
   e.transmission = fminf(fmaxf(e.transmission, 0.0f), 1.0f);
   // No separate roughness floor — the alpha clamp below is the sampler's
   // numerical safeguard; forcing a minimum roughness on top of it would
@@ -1268,7 +1026,7 @@ static __device__ MaterialEval eval_material_one(const PathVertex &v,
   if (min_alpha > e.alpha)
     e.alpha = min_alpha;
 
-  float3 Ns = v.Ns;
+  float3 Ns = graph_normal;
   // Composite tangent-space perturbation: start from (0,0,1), apply bump
   // (central-difference over heightmap) first, then normal map (multiplied).
   float3 nm_t = make_float3(0.0f, 0.0f, 1.0f);
@@ -1325,8 +1083,8 @@ static __device__ MaterialEval eval_material_one(const PathVertex &v,
   // it as the anisotropy / hair tangent after re-orthogonalising against the
   // possibly-perturbed shading normal. Otherwise fall back to a synthetic
   // tangent — the previous behaviour for every non-hair surface.
-  if (dot3(v.T, v.T) > 0.5f) {
-    float3 Tperp = v.T - e.Ns * dot3(v.T, e.Ns);
+  if (dot3(graph_tangent, graph_tangent) > 0.5f) {
+    float3 Tperp = graph_tangent - e.Ns * dot3(graph_tangent, e.Ns);
     float Tn2 = dot3(Tperp, Tperp);
     if (Tn2 > 1e-8f) {
       e.T = Tperp * (1.0f / sqrtf(Tn2));
@@ -1339,7 +1097,7 @@ static __device__ MaterialEval eval_material_one(const PathVertex &v,
   }
 
   // Anisotropic α. Disney remap: aspect = sqrt(1 - 0.9·|aniso|).
-  float aniso = fminf(fmaxf(m->anisotropy, -1.0f), 1.0f);
+  float aniso = fminf(fmaxf(e.anisotropy, -1.0f), 1.0f);
   float aspect = sqrtf(fmaxf(1.0f - 0.9f * fabsf(aniso), 1e-4f));
   if (aniso >= 0.0f) {
     e.alpha_x = e.alpha / aspect;
@@ -1355,11 +1113,11 @@ static __device__ MaterialEval eval_material_one(const PathVertex &v,
   // pool's surface into a sharper cone than the path has already
   // sampled. Same min_alpha as the main lobe — Cycles' filter_glossy
   // is a single state shared across all glossy lobes.
-  e.coat_alpha = fmaxf(m->coat_roughness * m->coat_roughness, 1e-4f);
+  e.coat_alpha = fmaxf(e.coat_roughness * e.coat_roughness, 1e-4f);
   if (min_alpha > e.coat_alpha)
     e.coat_alpha = min_alpha;
   // Tangent rotation around Ns.
-  float rot = m->tangent_rotation;
+  float rot = e.tangent_rotation;
   if (rot != 0.0f) {
     float c = cosf(rot);
     float s = sinf(rot);
@@ -1377,8 +1135,10 @@ static __device__ MaterialEval eval_material_one(const PathVertex &v,
 // not in either lobe's texture coordinates. Constant-fac is the common case
 // (mix_fac_tex == nullptr); the texture branch supports per-pixel masks for
 // things like edge-wear blends or multi-material decals.
-static __device__ float compute_level_mix_fac(PrincipledGpu *m, float2 uv_raw,
+static __device__ float compute_level_mix_fac(PrincipledGpu *m, const PathVertex &v,
                                               float NoV) {
+  if(m->shader_outputs&(1u<<23)){vibrt_cycles::float4 out[32];evaluate_shader(m,v,out);return fminf(fmaxf(out[23].x,0.0f),1.0f);}
+  float2 uv_raw=v.uv;
   // View-dependent Fresnel mix factor: the exporter encodes a Fresnel /
   // Layer-Weight MixShader factor as a NEGATIVE mix_fac whose magnitude is
   // the Fresnel IOR. Evaluate F(NoV, ior) at the hit so the secondary
@@ -1417,13 +1177,12 @@ static __device__ float compute_level_mix_fac(PrincipledGpu *m, float2 uv_raw,
 //
 // Walks iteratively via an explicit stack — CUDA call recursion is
 // supported but slow. Stack depth bounded by `STACK_DEPTH`; with
-// MAX_LEAVES=4 a fully balanced binary tree has 4 leaves + 3 internal
-// = 7 nodes, so STACK_DEPTH=8 is safe headroom.
+// at most 16 leaves and 8 levels; STACK_DEPTH=32 covers those validated trees.
 //
 // `max_leaves == 1` makes this behave like the AOV-pass single-closure
 // query (just emit the leftmost leaf). `slots == nullptr` is treated
 // the same way (return 0 leaves — caller signalled "I don't care").
-static __device__ int eval_material(const PathVertex &v,
+static __device__ __noinline__ int eval_material(const PathVertex &v,
                                      MaterialEval *slots,
                                      float *weights,
                                      int max_leaves,
@@ -1432,7 +1191,7 @@ static __device__ int eval_material(const PathVertex &v,
   if (slots == nullptr || max_leaves <= 0) {
     return 0;
   }
-  constexpr int STACK_DEPTH = 8;
+  constexpr int STACK_DEPTH = 32;
   struct Frame {
     PrincipledGpu *node;
     float weight;
@@ -1455,9 +1214,9 @@ static __device__ int eval_material(const PathVertex &v,
       ++n;
       continue;
     }
-    float fac = compute_level_mix_fac(node, v.uv, NoV);
-    float w_left = f.weight * (1.0f - fac);
-    float w_right = f.weight * fac;
+    float fac = compute_level_mix_fac(node, v, NoV);
+    float w_left = f.weight * (node->add_shader ? 1.0f : 1.0f-fac);
+    float w_right = f.weight * (node->add_shader ? 1.0f : fac);
     // Push right then left so left is processed first (preserves
     // depth-first order, helps determinism if anything else inspects
     // the leaf order).
@@ -1520,11 +1279,11 @@ static __device__ BsdfEval eval_hair(const MaterialEval &e, float3 wo,
   float Hlen = sqrtf(fmaxf(dot3(H, H), 1e-12f));
   H = H * (1.0f / Hlen);
   float TdotH = dot3(H, e.T);
-  float tilt = sinf(e.mat->hair_offset);
+  float tilt = sinf(e.hair_offset);
   float TdotH_eff = TdotH - tilt;
   float cone = sqrtf(fmaxf(1.0f - TdotH_eff * TdotH_eff, 0.0f));
-  float exponent = 2.0f / fmaxf(e.mat->hair_roughness_u *
-                                    e.mat->hair_roughness_u,
+  float exponent = 2.0f / fmaxf(e.hair_roughness_u *
+                                    e.hair_roughness_u,
                                 1e-4f);
   float spec = powf(fmaxf(cone, 0.0f), exponent);
 
@@ -1557,7 +1316,7 @@ static __forceinline__ __device__ float bump_shadowing_term(float3 Ng,
 // transmission / sheen / sss / translucent for one PrincipledGpu. The
 // outer `eval_bsdf` wrapper below combines this with the secondary
 // closure (when present).
-static __device__ BsdfEval eval_bsdf_one(const MaterialEval &e, float3 wo,
+static __device__ __noinline__ BsdfEval eval_bsdf_one(const MaterialEval &e, float3 wo,
                                          float3 wi) {
   BsdfEval r;
   r.f = make_float3(0, 0, 0);
@@ -1586,7 +1345,7 @@ static __device__ BsdfEval eval_bsdf_one(const MaterialEval &e, float3 wo,
   // Translucent BSDF: Lambertian on the back hemisphere. Active when wi is
   // on the side opposite wo (NoL < 0) — light passing through a thin sheet.
   bool translucent_active =
-      !reflect && e.mat->translucent_weight > 0.0f && e.transmission <= 0.0f;
+      !reflect && e.translucent_weight > 0.0f && e.transmission <= 0.0f;
 
   // Cycles Principled F0 = ((ior-1)/(ior+1))² × 2 × specular_ior_level.
   // The user-set Specular IOR Level (default 0.5 → multiplier 1.0)
@@ -1595,14 +1354,14 @@ static __device__ BsdfEval eval_bsdf_one(const MaterialEval &e, float3 wo,
   // by 30-40% over Cycles before this fix.
   float F0_d =
       ((e.ior - 1.0f) / (e.ior + 1.0f)) * ((e.ior - 1.0f) / (e.ior + 1.0f))
-      * (2.0f * e.mat->specular_ior_level);
+      * (2.0f * e.specular_ior_level);
 
   // Coat Fresnel parameters (used both for MIS weighting and the coat BRDF).
   PrincipledGpu *mc = e.mat;
-  float coat_w_mat = mc->coat_weight;
+  float coat_w_mat = e.coat_weight;
   float coat_alpha = e.coat_alpha;  // already filter-glossy-clamped
-  float cF0 = ((mc->coat_ior - 1.0f) / (mc->coat_ior + 1.0f)) *
-              ((mc->coat_ior - 1.0f) / (mc->coat_ior + 1.0f));
+  float cF0 = ((e.coat_ior - 1.0f) / (e.coat_ior + 1.0f)) *
+              ((e.coat_ior - 1.0f) / (e.coat_ior + 1.0f));
 
   // Weights for MIS between lobes. Coat gets `coat_weight·F_coat(V)` so its
   // sampling budget follows the actual lobe intensity at this view angle —
@@ -1610,7 +1369,7 @@ static __device__ BsdfEval eval_bsdf_one(const MaterialEval &e, float3 wo,
   // translucent_weight steals from the forward diffuse budget: t_w=1 → no
   // forward Lambert, all diffuse energy on the back hemisphere; t_w=0.5 →
   // even split (Mix Shader of Diffuse + Translucent).
-  float t_w = mc->translucent_weight;
+  float t_w = e.translucent_weight;
   float w_base_diff = (1.0f - e.metallic) * (1.0f - e.transmission);
   float w_diffuse = w_base_diff * (1.0f - t_w);
   float w_translucent = w_base_diff * t_w;
@@ -1640,10 +1399,10 @@ static __device__ BsdfEval eval_bsdf_one(const MaterialEval &e, float3 wo,
   // Not a true random-walk SSS but captures the characteristic "wax / skin /
   // paper" behaviour where light wraps past the terminator and shifts hue by
   // channel-dependent mean-free-path.
-  float sss_w = e.mat->sss_weight;
+  float sss_w = e.sss_weight;
   float3 sss_tint = make_float3(1, 1, 1);
   if (sss_w > 0.0f) {
-    float3 rr = make_f3(e.mat->sss_radius);
+    float3 rr = e.sss_radius;
     float rmax = fmaxf(fmaxf(rr.x, rr.y), fmaxf(rr.z, 1e-4f));
     sss_tint = make_float3(rr.x / rmax, rr.y / rmax, rr.z / rmax);
   }
@@ -1817,13 +1576,13 @@ static __device__ BsdfEval eval_bsdf_one(const MaterialEval &e, float3 wo,
     // NoV and NoL so the BRDF is reciprocal, and normalised by 1/π so the
     // integral stays bounded as sheen_roughness→0. Still an ad-hoc shape
     // (not Charlie), but energy-sane and reciprocal.
-    float sheen_w = mc->sheen_weight;
+    float sheen_w = e.sheen_weight;
     if (sheen_w > 0.0f) {
-      float sr = fmaxf(mc->sheen_roughness, 1e-3f);
+      float sr = fmaxf(e.sheen_roughness, 1e-3f);
       float inv_sr = 1.0f / sr;
       float sf = powf(fmaxf(1.0f - NoV, 0.0f), inv_sr) *
                  powf(fmaxf(1.0f - NoL, 0.0f), inv_sr) * sheen_w * INV_PIf;
-      float3 tint = make_f3(mc->sheen_tint);
+      float3 tint = e.sheen_tint;
       r.f = r.f + tint * sf * NoL;
     }
   } else if (transmit) {
@@ -1892,7 +1651,7 @@ static __device__ BsdfEval eval_bsdf_one(const MaterialEval &e, float3 wo,
   // through-surface direction, so it contributes 0 to eval at any finite
   // wi — we just scale the opaque part by alpha. sample_bsdf handles
   // the (1-alpha) passthrough branch separately.
-  float ab = e.mat->alpha_blend;
+  float ab = e.alpha_blend;
   if (ab < 1.0f) {
     r.f = r.f * ab;
     r.pdf *= ab;
@@ -1914,6 +1673,7 @@ struct BsdfSample {
   float3 f;
   float pdf;
   bool specular; // true for rough-specular that shouldn't NEE-double-count
+  bool transparent;
   int lobe;      // LOBE_DIFFUSE / LOBE_GLOSSY / LOBE_TRANSMISSION
 };
 
@@ -1922,7 +1682,7 @@ struct BsdfSample {
 // inner `eval_bsdf(e, wo, s.wi)` call near the end of this function is
 // rewritten to `eval_bsdf_one` so it sees only this closure — the
 // wrapper recomputes the combined f / pdf for MIS afterwards.
-static __device__ BsdfSample sample_bsdf_one(const MaterialEval &e, float3 wo,
+static __device__ __noinline__ BsdfSample sample_bsdf_one(const MaterialEval &e, float3 wo,
                                               RNG &rng) {
   BsdfSample s;
   s.wi = make_float3(0, 0, 1);
@@ -1930,6 +1690,7 @@ static __device__ BsdfSample sample_bsdf_one(const MaterialEval &e, float3 wo,
   s.pdf = 0.0f;
   s.specular = false;
   s.lobe = LOBE_DIFFUSE;
+  s.transparent = false;
 
   float NoV = dot3(e.Ns, wo);
   if (NoV <= 0.0f)
@@ -1942,9 +1703,10 @@ static __device__ BsdfSample sample_bsdf_one(const MaterialEval &e, float3 wo,
   // tracer's `throughput *= bs.f / bs.pdf` then preserves throughput on
   // this branch. eval_bsdf scales the opaque branch by alpha so NEE and
   // BSDF-sampled emission see the correct mixing weight.
-  float ab = e.mat->alpha_blend;
+  float ab = e.alpha_blend;
   if (ab < 1.0f && rng.next() >= ab) {
     s.wi = -1.0f * wo;
+    s.transparent = true;
     s.f = make_float3(1.0f, 1.0f, 1.0f);
     s.pdf = 1.0f;
     s.specular = true;
@@ -1974,11 +1736,11 @@ static __device__ BsdfSample sample_bsdf_one(const MaterialEval &e, float3 wo,
 
   // Coat weight mirrors eval_bsdf: scale by F_coat(V) so sampling budget
   // follows the actual coat intensity at this view angle (grazing >> normal).
-  float coat_w_mat = e.mat->coat_weight;
+  float coat_w_mat = e.coat_weight;
   float coat_alpha = e.coat_alpha;  // already filter-glossy-clamped
-  float cF0 = ((e.mat->coat_ior - 1.0f) / (e.mat->coat_ior + 1.0f)) *
-              ((e.mat->coat_ior - 1.0f) / (e.mat->coat_ior + 1.0f));
-  float t_w = e.mat->translucent_weight;
+  float cF0 = ((e.coat_ior - 1.0f) / (e.coat_ior + 1.0f)) *
+              ((e.coat_ior - 1.0f) / (e.coat_ior + 1.0f));
+  float t_w = e.translucent_weight;
   // Match eval_bsdf_one's lobe gating exactly. Without the `pure_diff`
   // gate here the sampler picked the (eval-zeroed) specular lobe ~50% of
   // the time for a `ShaderNodeBsdfDiffuse` surface: those samples were
@@ -2105,12 +1867,15 @@ static __device__ BsdfEval eval_bsdf(const MaterialEvalGroup &g,
   BsdfEval r;
   r.f = make_float3(0.0f, 0.0f, 0.0f);
   r.pdf = 0.0f;
+  float total_weight=0.0f;
   for (int i = 0; i < g.n; ++i) {
     BsdfEval ev = eval_bsdf_one(g.slots[i], wo, wi);
     float w = g.weights[i];
     r.f = r.f + ev.f * w;
     r.pdf += ev.pdf * w;
+    total_weight+=w;
   }
+  if(total_weight>0)r.pdf/=total_weight;
   return r;
 }
 
@@ -2127,7 +1892,8 @@ static __device__ BsdfSample sample_bsdf(const MaterialEvalGroup &g,
     // shadow-terminator is applied there — no second application here.
     return sample_bsdf_one(g.slots[0], wo, rng);
   }
-  float u = rng.next();
+  float total_weight=0.0f;for(int i=0;i<g.n;i++)total_weight+=g.weights[i];
+  float u = rng.next()*total_weight;
   int picked = g.n - 1; // last leaf catches residual mass
   float acc = 0.0f;
   for (int i = 0; i < g.n - 1; ++i) {
@@ -2140,10 +1906,47 @@ static __device__ BsdfSample sample_bsdf(const MaterialEvalGroup &g,
   BsdfSample s = sample_bsdf_one(g.slots[picked], wo, rng);
   if (s.pdf <= 0.0f)
     return s;
+  if (s.transparent) {
+    float opacity=0.0f;
+    for(int i=0;i<g.n;i++)opacity+=g.weights[i]*(1.0f-g.slots[i].alpha_blend);
+    s.f=make_float3(opacity,opacity,opacity);
+    s.pdf=opacity/fmaxf(total_weight,1e-20f);
+    return s;
+  }
   BsdfEval comb = eval_bsdf(g, wo, s.wi);
   s.f = comb.f;
   s.pdf = comb.pdf;
   return s;
+}
+
+static __device__ __noinline__ void fill_surface_vertex(PathVertex*,HitGroupData*,unsigned int,float2,float3,float,unsigned int);
+
+static __device__ __noinline__ float4 emission_alpha(const PathVertex &v) {
+  struct Entry {PrincipledGpu *m;float w;bool leaf;};
+  Entry stack[32];int sp=0;stack[sp++]={v.mat,1,false};
+  float3 emission=make_float3(0,0,0);float transparent=0;
+  while(sp){Entry e=stack[--sp];PrincipledGpu *m=e.m;
+    if(!e.leaf&&(m->left_subtree||m->secondary)){
+      float fac=compute_level_mix_fac(m,v,fabsf(dot3(v.Ns,v.incoming)));
+      stack[sp++]={m->secondary?m->secondary:m,e.w*(m->add_shader?1:fac),!m->secondary};
+      stack[sp++]={m->left_subtree?m->left_subtree:m,e.w*(m->add_shader?1:1-fac),!m->left_subtree};
+      continue;
+    }
+    float3 em=make_f3(m->emission);float alpha=m->alpha_blend;
+    if(m->emission_tex){const float *M=m->uv_transform;float2 uv=make_float2(M[0]*v.uv.x+M[1]*v.uv.y+M[2],M[3]*v.uv.x+M[4]*v.uv.y+M[5]);em=em*sample_rgba(m->emission_tex,m->emission_tex_w,m->emission_tex_h,m->emission_tex_channels,uv);}
+    if(m->shader_len){vibrt_cycles::float4 out[32];evaluate_shader(m,v,out);
+      if(m->shader_outputs&(1u<<5))em=make_float3(out[5].x,out[5].y,out[5].z);
+      if(m->shader_outputs&(1u<<6))em=em*out[6].x;
+      if(m->shader_outputs&(1u<<7))alpha=fminf(fmaxf(out[7].x,0.0f),1.0f);
+    }
+    emission=emission+em*(e.w*alpha);transparent+=e.w*(1-alpha);
+  }
+  return make_float4(emission.x,emission.y,emission.z,1-fminf(transparent,1.0f));
+}
+
+static __device__ float3 mesh_light_emission(const MeshLightTri &tri,float b1,float b2,float3 incoming,float distance) {
+  PathVertex v;fill_surface_vertex(&v,tri.geometry,tri.primitive,make_float2(b1,b2),incoming,distance,2u);
+  float4 e=emission_alpha(v);return make_float3(e.x,e.y,e.z);
 }
 
 // ---------- IES profile lookup ----------
@@ -2314,7 +2117,7 @@ static __device__ float power_heuristic_3(float pdf_self,
 // `shadow_transmittance` returns RGB so each light contribution is attenuated
 // by the per-channel volume transmittance. On scenes without volumes it
 // short-circuits to the legacy binary `shadow_visible` path.
-static __device__ float3 direct_light(const MaterialEvalGroup &e, float3 P,
+static __device__ __noinline__ float3 direct_light(const MaterialEvalGroup &e, float3 P,
                                       float3 wo, RNG &rng,
                                       const VolumeStack &vstack) {
   float3 L = make_float3(0, 0, 0);
@@ -2529,16 +2332,7 @@ static __device__ float3 direct_light(const MaterialEvalGroup &e, float3 P,
                   // point — without this, all triangles of a textured
                   // emissive mesh deliver a uniform glow regardless of
                   // which texel they cover.
-                  float3 Le = make_f3(tri.emission);
-                  if (tri.emission_tex != nullptr) {
-                    float2 uv = make_float2(
-                        tri.uv0[0] * b0 + tri.uv1[0] * b1 + tri.uv2[0] * b2,
-                        tri.uv0[1] * b0 + tri.uv1[1] * b1 + tri.uv2[1] * b2);
-                    float3 t = sample_rgba(
-                        tri.emission_tex, tri.emission_tex_w,
-                        tri.emission_tex_h, tri.emission_tex_channels, uv);
-                    Le = Le * t;
-                  }
+                  float3 Le = mesh_light_emission(tri,b1,b2,-wi,d);
                   // MIS against BSDF sampling. Power heuristic with β=2 —
                   // matches the envmap NEE block's choice. The matching
                   // BSDF-side branch in `trace_path` uses (1-w_light) on
@@ -2633,7 +2427,7 @@ static __device__ float3 direct_light(const MaterialEvalGroup &e, float3 P,
 // volume MIS only matters at scatter events that are followed by another
 // MIS-able interaction, and one-sample importance sampling of the lights
 // is already a substantial improvement over BSDF-only.
-static __device__ float3 direct_light_volume(float3 P, float3 wi_world,
+static __device__ __noinline__ float3 direct_light_volume(float3 P, float3 wi_world,
                                               const Volume *vol,
                                               const VolumeStack &vstack,
                                               RNG &rng) {
@@ -2786,16 +2580,7 @@ static __device__ float3 direct_light_volume(float3 P, float3 wi_world,
                 if (pdf > 0.0f) {
                   // Per-sample emission radiance — same texture-aware
                   // path as the surface NEE block.
-                  float3 Le = make_f3(tri.emission);
-                  if (tri.emission_tex != nullptr) {
-                    float2 uv = make_float2(
-                        tri.uv0[0] * b0 + tri.uv1[0] * b1 + tri.uv2[0] * b2,
-                        tri.uv0[1] * b0 + tri.uv1[1] * b1 + tri.uv2[1] * b2);
-                    float3 t = sample_rgba(
-                        tri.emission_tex, tri.emission_tex_w,
-                        tri.emission_tex_h, tri.emission_tex_channels, uv);
-                    Le = Le * t;
-                  }
+                  float3 Le = mesh_light_emission(tri,b1,b2,-wi,d);
                   add(wi, Le / pdf, vis);
                 }
               }
@@ -2828,11 +2613,16 @@ static __device__ float3 direct_light_volume(float3 P, float3 wi_world,
 
 // ---------- Closesthit / Miss / Raygen ----------
 
-extern "C" __global__ void __closesthit__ch() {
-  PathVertex *v = get_path_vertex();
-  HitGroupData *hg = (HitGroupData *)optixGetSbtDataPointer();
-
-  unsigned int prim = optixGetPrimitiveIndex();
+static __device__ float3 transform_vector(const float *m, float3 v) {
+  return make_float3(m[0]*v.x+m[1]*v.y+m[2]*v.z,m[4]*v.x+m[5]*v.y+m[6]*v.z,m[8]*v.x+m[9]*v.y+m[10]*v.z);
+}
+static __device__ float3 transform_point(const float *m, float3 v) {
+  return transform_vector(m,v)+make_float3(m[3],m[7],m[11]);
+}
+static __device__ float3 transform_normal(const float *inverse, float3 v) {
+  return make_float3(inverse[0]*v.x+inverse[4]*v.y+inverse[8]*v.z,inverse[1]*v.x+inverse[5]*v.y+inverse[9]*v.z,inverse[2]*v.x+inverse[6]*v.y+inverse[10]*v.z);
+}
+static __device__ __noinline__ void fill_surface_vertex(PathVertex *v, HitGroupData *hg, unsigned int prim, float2 bary, float3 incoming, float distance, unsigned int flags) {
   int i0 = hg->indices[prim * 3 + 0];
   int i1 = hg->indices[prim * 3 + 1];
   int i2 = hg->indices[prim * 3 + 2];
@@ -2840,17 +2630,16 @@ extern "C" __global__ void __closesthit__ch() {
   float3 p1 = make_f3(&hg->vertices[i1 * 3]);
   float3 p2 = make_f3(&hg->vertices[i2 * 3]);
 
-  float2 bary = optixGetTriangleBarycentrics();
   float b0 = 1.0f - bary.x - bary.y;
   float3 P_local = p0 * b0 + p1 * bary.x + p2 * bary.y;
 
-  float3 P = optixTransformPointFromObjectToWorldSpace(P_local);
+  float3 P = transform_point(hg->object_to_world, P_local);
 
   // Geometric normal in object space
   float3 e1 = p1 - p0;
   float3 e2 = p2 - p0;
   float3 Ng_local = normalize3(cross3(e1, e2));
-  float3 Ng = normalize3(optixTransformNormalFromObjectToWorldSpace(Ng_local));
+  float3 Ng = normalize3(transform_normal(hg->world_to_object, Ng_local));
 
   // World-space triangle area for trace_path's mesh-light MIS gate. The
   // post-transform vertices feed `pdf_solid = d²/(area·cos_light)` so the
@@ -2860,9 +2649,9 @@ extern "C" __global__ void __closesthit__ch() {
   // factor below is what `optixTransformVectorFromObjectToWorldSpace`
   // implicitly does, but we compute the world-space cross from world
   // vertices for transparency.
-  float3 p0_w = optixTransformPointFromObjectToWorldSpace(p0);
-  float3 p1_w = optixTransformPointFromObjectToWorldSpace(p1);
-  float3 p2_w = optixTransformPointFromObjectToWorldSpace(p2);
+  float3 p0_w = transform_point(hg->object_to_world, p0);
+  float3 p1_w = transform_point(hg->object_to_world, p1);
+  float3 p2_w = transform_point(hg->object_to_world, p2);
   float3 e1_w = p1_w - p0_w;
   float3 e2_w = p2_w - p0_w;
   float3 ng_w = cross3(e1_w, e2_w);
@@ -2874,16 +2663,20 @@ extern "C" __global__ void __closesthit__ch() {
     float3 n1 = make_f3(&hg->normals[i1 * 3]);
     float3 n2 = make_f3(&hg->normals[i2 * 3]);
     float3 Ns_local = normalize3(n0 * b0 + n1 * bary.x + n2 * bary.y);
-    Ns = normalize3(optixTransformNormalFromObjectToWorldSpace(Ns_local));
+    Ns = normalize3(transform_normal(hg->world_to_object, Ns_local));
   }
 
   float2 uv = make_float2(0.0f, 0.0f);
+  float3 dpdu,dpdv;build_frame(Ns,dpdu,dpdv);
   if (hg->uvs != nullptr) {
     float2 uv0 = make_float2(hg->uvs[i0 * 2 + 0], hg->uvs[i0 * 2 + 1]);
     float2 uv1 = make_float2(hg->uvs[i1 * 2 + 0], hg->uvs[i1 * 2 + 1]);
     float2 uv2 = make_float2(hg->uvs[i2 * 2 + 0], hg->uvs[i2 * 2 + 1]);
     uv.x = b0 * uv0.x + bary.x * uv1.x + bary.y * uv2.x;
     uv.y = b0 * uv0.y + bary.x * uv1.y + bary.y * uv2.y;
+    float du1=uv1.x-uv0.x,dv1=uv1.y-uv0.y,du2=uv2.x-uv0.x,dv2=uv2.y-uv0.y;
+    float det=du1*dv2-dv1*du2;
+    if(fabsf(det)>1e-12f){dpdu=(e1_w*dv2-e2_w*dv1)*(1.0f/det);dpdv=(e2_w*du1-e1_w*du2)*(1.0f/det);}
   }
 
   // Authored per-vertex tangent (currently only emitted for hair ribbons).
@@ -2898,7 +2691,7 @@ extern "C" __global__ void __closesthit__ch() {
     float3 t2 = make_f3(&hg->tangents[i2 * 3]);
     float3 T_local = t0 * b0 + t1 * bary.x + t2 * bary.y;
     if (dot3(T_local, T_local) > 1e-12f) {
-      float3 Tw = optixTransformVectorFromObjectToWorldSpace(T_local);
+      float3 Tw = transform_vector(hg->object_to_world, T_local);
       float Tlen2 = dot3(Tw, Tw);
       if (Tlen2 > 1e-12f) {
         T = Tw * (1.0f / sqrtf(Tlen2));
@@ -2915,11 +2708,26 @@ extern "C" __global__ void __closesthit__ch() {
   }
 
   v->P = P;
+  v->geometry=hg;v->ray_length=distance;
+  v->path_depth=0;v->diffuse_depth=0;v->glossy_depth=0;v->transmission_depth=0;
+  v->path_flags=flags;
+  v->P_object=P_local;
+  float3 lo=make_f3(hg->bounds_min),hi=make_f3(hg->bounds_max);
+  v->generated=make_float3(hi.x>lo.x?(P_local.x-lo.x)/(hi.x-lo.x):0.5f,hi.y>lo.y?(P_local.y-lo.y)/(hi.y-lo.y):0.5f,hi.z>lo.z?(P_local.z-lo.z)/(hi.z-lo.z):0.5f);
+  v->N_object=normalize3(transform_normal(hg->object_to_world, Ns));
+  v->object_location=transform_point(hg->object_to_world, make_float3(0,0,0));
+  v->incoming=incoming;
+  v->dPdu=dpdu;v->dPdv=dpdv;
+  v->dOdu=transform_vector(hg->world_to_object, dpdu);v->dOdv=transform_vector(hg->world_to_object, dpdv);
+  float3 extent=hi-lo;
+  v->dGdu=make_float3(extent.x>0?v->dOdu.x/extent.x:0,extent.y>0?v->dOdu.y/extent.y:0,extent.z>0?v->dOdu.z/extent.z:0);
+  v->dGdv=make_float3(extent.x>0?v->dOdv.x/extent.x:0,extent.y>0?v->dOdv.y/extent.y:0,extent.z>0?v->dOdv.z/extent.z:0);
   v->Ng = Ng;
   v->Ns = Ns;
   v->T = T;
   v->uv = uv;
   v->vc = vc;
+  v->vertex_alpha=hg->vertex_alphas?hg->vertex_alphas[i0]*b0+hg->vertex_alphas[i1]*bary.x+hg->vertex_alphas[i2]*bary.y:1;
   v->mat = hg->mat;
   if (hg->material_indices != nullptr && hg->num_materials > 0) {
     unsigned int mi = hg->material_indices[prim];
@@ -2929,14 +2737,23 @@ extern "C" __global__ void __closesthit__ch() {
   // Hash the OptiX instance id into a uniform [0,1) for ObjectInfo.Random.
   // PCG-style multiplicative hash: cheap, decorrelated, deterministic per
   // instance — what Cycles uses for the same node.
-  unsigned int iid = optixGetInstanceId();
+  unsigned int iid = hg->instance_id;
   unsigned int h = iid * 747796405u + 2891336453u;
   h = ((h >> ((h >> 28u) + 4u)) ^ h) * 277803737u;
   h = (h >> 22u) ^ h;
   v->object_random = (float)h * (1.0f / 4294967296.0f);
   v->mesh_light_idx = hg->area_light_group;
   v->prim_area = prim_area;
+  v->light_pdf=hg->light_pdf?hg->light_pdf[prim]:0.0f;
   v->hit = 1;
+}
+
+static __device__ void fill_path_vertex(PathVertex *v) {
+  fill_surface_vertex(v,(HitGroupData*)optixGetSbtDataPointer(),optixGetPrimitiveIndex(),optixGetTriangleBarycentrics(),-optixGetWorldRayDirection(),optixGetRayTmax(),(optixGetRayFlags()&OPTIX_RAY_FLAG_TERMINATE_ON_FIRST_HIT)?2u:1u);
+}
+
+extern "C" __global__ void __closesthit__ch() {
+  fill_path_vertex(get_path_vertex());
 }
 
 extern "C" __global__ void __closesthit__shadow() {
@@ -2991,7 +2808,11 @@ extern "C" __global__ void __anyhit__ah() {
   // every NEE call site). With the pure full-pass-through approximation
   // the camera-side window mix worked but rooms ended up ~5% too bright
   // because shadow rays through windows weren't attenuated.
-  if (is_shadow_ray && m->alpha_blend < 1.0f) {
+  float shadow_alpha=m->alpha_blend;
+  if(is_shadow_ray && (m->shader_len||m->secondary||m->left_subtree)) {
+    PathVertex v;fill_path_vertex(&v);shadow_alpha=emission_alpha(v).w;
+  }
+  if (is_shadow_ray && shadow_alpha < 1.0f) {
     float3 ray_o = optixGetWorldRayOrigin();
     float3 ray_d = optixGetWorldRayDirection();
     unsigned int h = __float_as_uint(ray_o.x) ^ __float_as_uint(ray_o.y * 1.31f) ^
@@ -3003,7 +2824,7 @@ extern "C" __global__ void __anyhit__ah() {
     h = ((h >> ((h >> 28u) + 4u)) ^ h) * 277803737u;
     h = (h >> 22u) ^ h;
     float u = (h >> 9) * (1.0f / 8388608.0f);
-    if (u >= m->alpha_blend) {
+    if (u >= shadow_alpha) {
       optixIgnoreIntersection();
     }
   }
@@ -3144,7 +2965,7 @@ static __device__ int intersect_rect_lights(float3 origin, float3 dir,
   return best;
 }
 
-static __device__ float3 trace_path(float3 origin, float3 dir, RNG &rng,
+static __device__ __noinline__ float3 trace_path(float3 origin, float3 dir, RNG &rng,
                                     float first_ray_tmin) {
   float3 throughput = make_float3(1, 1, 1);
   float3 L = make_float3(0, 0, 0);
@@ -3166,6 +2987,7 @@ static __device__ float3 trace_path(float3 origin, float3 dir, RNG &rng,
   unsigned int diffuse_bounces = 0;
   unsigned int glossy_bounces = 0;
   unsigned int transmission_bounces = 0;
+  unsigned int last_path_flags = 1u;
   // Filter-glossy state machine (mirrors Cycles' Light Paths > Filter
   // Glossy). Track the smallest BSDF pdf the path has sampled at a
   // glossy / transmission bounce. The next surface's BSDF α is clamped
@@ -3478,6 +3300,7 @@ static __device__ float3 trace_path(float3 origin, float3 dir, RNG &rng,
     // Stack-allocated leaves of the material's binary Mix tree. Lifetime
     // covers every direct_light / sample_bsdf call that reads `e_group`.
     MaterialEval e_slots[MAX_LEAVES];
+    v.path_depth=bounce;v.diffuse_depth=diffuse_bounces;v.glossy_depth=glossy_bounces;v.transmission_depth=transmission_bounces;v.path_flags=last_path_flags;
     float e_weights[MAX_LEAVES];
     // View cosine for view-dependent (Fresnel) mix factors. `dir` is the
     // incoming ray (origin→hit); |dot(Ns, dir)| is the incidence cosine.
@@ -3535,7 +3358,7 @@ static __device__ float3 trace_path(float3 origin, float3 dir, RNG &rng,
         e_contrib = clamp_indirect(e_contrib, params.clamp_indirect);
       L = L + e_contrib;
     } else if (v.mesh_light_idx >= 0 && v.mat != nullptr
-               && v.mat->emission_tex == nullptr
+               && v.light_pdf > 0.0f
                && luminance(e.emission) > 0.0f
                && params.mesh_light_total_power > 0.0f
                && v.prim_area > 1e-12f
@@ -3554,8 +3377,7 @@ static __device__ float3 trace_path(float3 origin, float3 dir, RNG &rng,
       // matches the NEE block above) take the absolute value.
       float cos_light = fabsf(dot3(v.Ng, dir));
       if (cos_light > 1e-6f) {
-        float pmf = v.prim_area * lum_e /
-                    fmaxf(params.mesh_light_total_power, 1e-30f);
+        float pmf = v.prim_area * v.light_pdf;
         float pdf_solid = d2 / fmaxf(v.prim_area * cos_light, 1e-30f);
         float pdf_light = pdf_solid * pmf;
         float w_bsdf = power_heuristic(prev_bsdf_pdf, pdf_light);
@@ -3584,6 +3406,7 @@ static __device__ float3 trace_path(float3 origin, float3 dir, RNG &rng,
     float3 contrib = bs.f / bs.pdf;
     throughput = throughput * contrib;
     last_specular = bs.specular;
+    last_path_flags=(bs.lobe==LOBE_DIFFUSE?4u:bs.lobe==LOBE_GLOSSY?8u:0u)|(bs.specular?16u:0u)|(dot3(bs.wi,v.Ng)*dot3(-dir,v.Ng)>0?32u:64u);
     prev_bsdf_pdf = bs.pdf;
     prev_normal = e_slots[0].Ns;
 

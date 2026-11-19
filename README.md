@@ -8,6 +8,7 @@ A GPU path-tracing renderer for Blender, powered by NVIDIA OptiX 9.
 |-------|-------------|
 | [`optix-sys`](optix-sys/) | Raw FFI bindings to OptiX 9.0.0 (bindgen) |
 | [`optix`](optix/) | Safe Rust wrapper with RAII, builders, and type-safe enums |
+| [`vibrt-nodes`](vibrt-nodes/) | Standalone shader and sky nodes with shared C++/CUDA evaluation |
 | [`vibrt`](vibrt/) | OptiX path-tracing renderer with a Blender-native JSON+binary input format |
 
 The [`blender/vibrt_blender/`](blender/) directory contains the Blender addon that registers `vibrt` as a render engine, exports the scene, spawns the renderer, and loads the result back into Blender.
@@ -21,10 +22,12 @@ The [`blender/vibrt_blender/`](blender/) directory contains the Blender addon th
 - Indirect-contribution luminance clamp to suppress fireflies
 - Triangle mesh geometry with multi-material slots (per-triangle material index); multi-object scenes via single-level OptiX instancing
 - Right-handed Z-up (no axis conversion from Blender)
+- Native Preetham, Hosek/Wilkie and single/multiple scattering sky models on Blender 5.1
 - Output: EXR (linear RGBA float), PNG (tonemapped sRGB), or raw float binary (addon ingestion)
 
 ## Requirements
 
+- **C++17 compiler** (MSVC, Clang or GCC) — for the bundled atmosphere models
 - **NVIDIA OptiX SDK 9.0.0** — set `OPTIX_ROOT` or install at default location
 - **CUDA Toolkit** — for NVRTC runtime compilation
 - **LLVM/Clang** — for bindgen (set `LIBCLANG_PATH` if not auto-detected)

@@ -145,6 +145,38 @@ impl Pipeline {
     }
 
     /// Set the stack sizes for the pipeline.
+    /// Compute actual program requirements instead of guessing a fixed stack.
+    /// This is optixUtilComputeStackSizes with no callable program groups.
+    pub fn set_stack_size_for_programs(
+        &self,
+        groups: &[&ProgramGroup],
+        max_trace_depth: u32,
+        max_traversable_graph_depth: u32,
+    ) -> Result<u32> {
+        let mut sizes: optix_sys::OptixStackSizes = unsafe { std::mem::zeroed() };
+        for group in groups {
+            let mut current: optix_sys::OptixStackSizes = unsafe { std::mem::zeroed() };
+            error::check(unsafe {
+                (self.table.raw.optixProgramGroupGetStackSize.unwrap())(
+                    group.raw,
+                    &mut current,
+                    self.raw,
+                )
+            })?;
+            sizes.cssRG = sizes.cssRG.max(current.cssRG);
+            sizes.cssMS = sizes.cssMS.max(current.cssMS);
+            sizes.cssCH = sizes.cssCH.max(current.cssCH);
+            sizes.cssAH = sizes.cssAH.max(current.cssAH);
+            sizes.cssIS = sizes.cssIS.max(current.cssIS);
+        }
+        let hit_or_miss = sizes.cssCH.max(sizes.cssMS);
+        let continuation = sizes.cssRG
+            + max_trace_depth.saturating_sub(1) * hit_or_miss
+            + max_trace_depth.min(1) * hit_or_miss.max(sizes.cssIS + sizes.cssAH);
+        self.set_stack_size(0, 0, continuation, max_traversable_graph_depth)?;
+        Ok(continuation)
+    }
+
     pub fn set_stack_size(
         &self,
         direct_callable_from_traversal: u32,

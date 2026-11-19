@@ -388,7 +388,8 @@ def _const_f(sock, default):
 
 
 def _export_mesh(
-    obj_eval, writer, textures: list, vc_attr_name: str | None = None
+    obj_eval, writer, textures: list, vc_attr_name: str | None = None,
+    uv_map_name: str | None = None,
 ) -> dict | None:
     """Export a mesh + per-triangle material indices.
 
@@ -420,9 +421,9 @@ def _export_mesh(
                 )
         num_slots = len(obj_eval.material_slots)
         native = native_scene.accelerator()
-        arrays = native.read_mesh(mesh, num_slots, vc_attr_name) if native else None
+        arrays = native.read_mesh(mesh, num_slots, vc_attr_name, uv_map_name) if native else None
         if arrays is None:
-            arrays = _mesh_arrays_python(mesh, num_slots, vc_attr_name)
+            arrays = _mesh_arrays_python(mesh, num_slots, vc_attr_name, uv_map_name)
         desc = {}
         for name, values in arrays.items():
             write = writer.write_u32 if name in {"indices", "material_indices"} else writer.write_f32
@@ -437,7 +438,7 @@ def _export_mesh(
         obj_eval.to_mesh_clear()
 
 
-def _mesh_arrays_python(mesh, num_slots, vc_attr_name=None):
+def _mesh_arrays_python(mesh, num_slots, vc_attr_name=None, uv_map_name=None):
     """Public-API fallback and reference implementation for native sync tests."""
     import numpy as np
 
@@ -455,7 +456,7 @@ def _mesh_arrays_python(mesh, num_slots, vc_attr_name=None):
         "normals": split_normals,
         "indices": np.arange(ntri * 3, dtype=np.uint32),
     }
-    uv_layer = mesh.uv_layers.active
+    uv_layer = mesh.uv_layers.get(uv_map_name) if uv_map_name else mesh.uv_layers.active
     if uv_layer is not None:
         uv_all = np.empty(len(mesh.loops) * 2, dtype=np.float32)
         uv_layer.data.foreach_get("uv", uv_all)
@@ -464,14 +465,16 @@ def _mesh_arrays_python(mesh, num_slots, vc_attr_name=None):
         tri_mat_idx = np.empty(ntri, dtype=np.int32)
         mesh.loop_triangles.foreach_get("material_index", tri_mat_idx)
         arrays["material_indices"] = tri_mat_idx.astype(np.uint32)
-    if vc_attr_name:
+    if vc_attr_name is not None:
         color_attrs = getattr(mesh, "color_attributes", None) or []
-        target = next((ca for ca in color_attrs if ca.name == vc_attr_name), None)
+        target = (next((ca for ca in color_attrs if ca.name == vc_attr_name), None)
+                  if vc_attr_name else getattr(color_attrs, "active_color", None))
         if target is not None and target.domain in {"CORNER", "POINT"}:
             rgba = np.empty(len(target.data) * 4, dtype=np.float32)
             target.data.foreach_get("color", rgba)
             indices = tri_loop_idx if target.domain == "CORNER" else tri_vert_idx
             arrays["vertex_colors"] = np.ascontiguousarray(rgba.reshape(-1, 4)[indices, :3].reshape(-1))
+            arrays["vertex_alphas"] = np.ascontiguousarray(rgba.reshape(-1, 4)[indices, 3])
     return arrays
 
 
@@ -1063,16 +1066,11 @@ def _export_light(obj, writer, textures: list) -> dict | None:
     return None
 
 
-# Cache populated by `prebake_sky_envmaps_for_world` (called from
-# `RenderEngine.update()` — see engine.py). `_export_world` consumes
-# entries here when it sees a `ShaderNodeTexSky` node.
-#
-# Why a cache? The bake uses `bpy.ops.render.render` against a temp scene,
-# which Blender silently turns into an all-zero render when invoked from
-# inside `RenderEngine.render()`. Calling it from `update()` instead
-# (which Blender invokes BEFORE handing control to render()) works fine.
-# The exporter, which runs inside render(), reads the cache to get
-# already-baked pixels.
+# Per-render environment maps published by sky_bake.prepare_scene_async.
+# Native models fill this directly; unsupported graphs use an isolated Blender
+# worker while geometry/materials export. prepare_world joins that worker.
+# Nested renders and temporary scene creation are unsafe in both render()
+# and update() on Blender's F12 job thread, so only the worker runs Cycles.
 _SKY_BAKE_CACHE: dict[str, tuple] = {}
 
 
@@ -1132,6 +1130,8 @@ def _world_sky_node(world):
         return None
     bg = surf.links[0].from_node
     if bg.bl_idname != "ShaderNodeBackground":
+        return None
+    if bg.inputs["Strength"].is_linked:
         return None
     col = bg.inputs.get("Color")
     if col is None or not col.is_linked:
@@ -1468,7 +1468,7 @@ def _try_export_mixed_world(world, mix_pat, writer, textures, lights_json):
 def _try_export_split_world(world, split_pat, writer, textures):
     """Emit a Mixed envmap with `split_by_camera_ray=true` from a
     Light-Path-driven Mix Shader. Returns None when the per-branch
-    bakes aren't in `_SKY_BAKE_CACHE` (e.g. update() didn't run, or a
+    bakes aren't in `_SKY_BAKE_CACHE` (e.g. preparation didn't run, or a
     bake failed) so the caller falls back to the combined-bake path.
 
     Layer convention: `a` = lighting branch (drives the CDF / NEE),
@@ -1487,8 +1487,8 @@ def _try_export_split_world(world, split_pat, writer, textures):
             f"detected but per-branch bakes were not cached "
             f"(lighting={'OK' if baked_a is not None else 'MISSING'}, "
             f"camera={'OK' if baked_b is not None else 'MISSING'}) — "
-            f"falling back to legacy combined bake. Was the engine "
-            f"update() hook invoked?"
+            f"falling back to legacy combined bake. Run sky preparation "
+            f"before exporting the world."
         )
         return None
     rgb_a, aw, ah, _ = baked_a
@@ -1528,13 +1528,11 @@ def _try_export_split_world(world, split_pat, writer, textures):
 
 
 def _world_needs_full_bake(world) -> bool:
-    """True when the world's shader graph isn't a plain
-    `ShaderNodeBackground -> Output.Surface`. Catches the
-    `MixShader(Background_a, Background_b)` pattern that scenes like
-    pabellon_barcelona use to blend a Sky Texture with a curve-shifted
-    duplicate, and falls through any other unrecognised topology to a
-    Cycles-evaluated equirect bake instead of the
-    "treat-world-as-black" branch in `_export_world`.
+    """Evaluate graphs that cannot be exported as a direct Background layer.
+
+    This includes shader mixes, linked strength and color processing between
+    a texture and the Background. Preparation uses native sky evaluation or
+    the isolated Cycles fallback, preserving the complete graph's radiance.
     """
     if world is None or not world.use_nodes or world.node_tree is None:
         return False
@@ -1548,7 +1546,27 @@ def _world_needs_full_bake(world) -> bool:
     surf = out.inputs.get("Surface")
     if surf is None or not surf.is_linked:
         return False
-    return surf.links[0].from_node.bl_idname != "ShaderNodeBackground"
+    node = surf.links[0].from_node
+    if node.bl_idname != "ShaderNodeBackground":
+        return True
+    color = node.inputs.get("Color")
+    return node.inputs["Strength"].is_linked or (
+        color.is_linked and color.links[0].from_node.bl_idname not in {
+            "ShaderNodeTexSky", "ShaderNodeTexEnvironment", "ShaderNodeRGB", "ShaderNodeBlackbody",
+        }
+    )
+
+
+def _mixed_world_uses_layers(pattern):
+    """Whether both branches fit the exporter's direct envmap-layer format."""
+    for background in pattern[:2]:
+        color = background.inputs["Color"]
+        if background.inputs["Strength"].is_linked or not color.is_linked:
+            return False
+        source = color.links[0].from_node
+        if source.bl_idname not in {"ShaderNodeTexSky", "ShaderNodeTexEnvironment", "ShaderNodeTexImage"}:
+            return False
+    return True
 
 
 def prebake_sky_envmaps_for_world(world, w: int = 2048, h: int = 1024) -> None:
@@ -1598,7 +1616,7 @@ def prebake_sky_envmaps_for_world(world, w: int = 2048, h: int = 1024) -> None:
     # native-resolution textures. The full-world bake fallback below is
     # still kept for any topology we don't recognise.
     mix_pat = _detect_mix_world(world)
-    if mix_pat is not None:
+    if mix_pat is not None and _mixed_world_uses_layers(mix_pat):
         for sky_node in _walk_world_for_sky_nodes(world):
             _prebake_sky_node_alone(world, sky_node, w=w, h=h)
         return
@@ -1749,7 +1767,7 @@ def _prebake_sky_texture(world, sky, w: int, h: int) -> None:
     except Exception as ex:
         _emit(
             f"[vibrt] warn: world {world.name!r}: failed to bake "
-            f"ShaderNodeTexSky ({sky.sky_type}) via Cycles in update(): "
+            f"ShaderNodeTexSky ({sky.sky_type}) via Cycles in the sky worker: "
             f"{ex} — world background will fall back to constant"
         )
         return
@@ -1761,6 +1779,16 @@ def _prebake_sky_texture(world, sky, w: int, h: int) -> None:
         )
         return
     rgb, bw, bh = baked
+    # _export_world applies Background.Strength to the sky and extracted sun.
+    # The Cycles reference bake already includes it; remove it before caching.
+    output = world.node_tree.nodes.get("World Output") or next(
+        n for n in world.node_tree.nodes if n.bl_idname == "ShaderNodeOutputWorld"
+    )
+    background = output.inputs["Surface"].links[0].from_node
+    if background.bl_idname == "ShaderNodeBackground":
+        strength = float(background.inputs["Strength"].default_value)
+        if strength != 0.0:
+            rgb = rgb / strength
     sun_light = _extract_sun_from_bake_inplace(rgb, bw, bh, sky, world.name)
     _SKY_BAKE_CACHE[key] = (rgb, bw, bh, sun_light)
     _emit(
@@ -1780,7 +1808,7 @@ def _prebake_world_full(world, w: int, h: int) -> None:
     except Exception as ex:
         _emit(
             f"[vibrt] warn: world {world.name!r}: failed to bake "
-            f"complex world graph via Cycles in update(): {ex} — "
+            f"complex world graph via Cycles in the sky worker: {ex} — "
             f"world background will fall back to constant"
         )
         return
@@ -2343,7 +2371,7 @@ def _bake_sky_world_to_pixels(world, w: int = 1024, h: int = 512):
         # 64 spp doesn't hit them often enough for the average pixel to
         # carry the sun's full luminance. 256 spp + denoising disabled is
         # a reasonable trade — adds a few extra seconds to the one-time
-        # update-step bake. 1024 spp doesn't help meaningfully on tested
+        # sky bake. 1024 spp doesn't help meaningfully on tested
         # scenes (pabellon's HDRI is already SDR-clipped and Nishita
         # converges by 256), so the extra cost isn't worth it.
         tmp.cycles.samples = 256
@@ -2535,6 +2563,27 @@ def _export_world(world, writer, textures: list, lights_json: list | None = None
         col = list(world.color)[:3] if world else [0.05, 0.05, 0.05]
         return {"type": "constant", "color": col, "strength": 1.0}
 
+    # A full graph evaluation already includes Background.Strength and color
+    # operations. Consume it before the direct Background shortcuts below.
+    full_key = _world_generic_cache_key(world)
+    full_baked = _SKY_BAKE_CACHE.get(full_key)
+    if full_baked is not None:
+        rgb, bw, bh, sun_light = full_baked
+        pb = material_export._PreBakedTexture(
+            rgb=rgb, w=bw, h=bh, cache_key=full_key,
+        )
+        tex_id = material_export.export_image_texture(
+            pb, writer, textures, colorspace="linear"
+        )
+        if sun_light is not None and lights_json is not None:
+            lights_json.append(dict(sun_light))
+        return {
+            "type": "envmap",
+            "texture": tex_id,
+            "rotation_z_rad": 0.0,
+            "strength": 1.0,
+        }
+
     out = world.node_tree.nodes.get("World Output")
     if out is None:
         out = next(
@@ -2587,13 +2636,9 @@ def _export_world(world, writer, textures: list, lights_json: list | None = None
                     }
             elif linked.bl_idname == "ShaderNodeTexSky":
                 # Procedural sky (Nishita / Hosek-Wilkie / Preetham). The
-                # actual bake — a tiny equirectangular Cycles render of
-                # the sky world — runs in `RenderEngine.update()` (see
-                # engine.py and `prebake_sky_envmaps_for_world`); it
-                # CANNOT run inside the exporter because we're already
-                # inside `RenderEngine.render()`, and Cycles silently
-                # produces an all-zero image for nested renders. Here we
-                # just look up the cached pixels and route them through
+                # native evaluator (or isolated Cycles fallback) produces an
+                # equirectangular image. prepare_world ensures it is ready;
+                # nested renders inside the exporter are unsafe. Route it through
                 # `_PreBakedTexture` so they land on the world dict as a
                 # regular envmap.
                 key = _sky_node_cache_key(world, linked)
@@ -2603,8 +2648,8 @@ def _export_world(world, writer, textures: list, lights_json: list | None = None
                         f"[vibrt] warn: world {world.name!r}: "
                         f"ShaderNodeTexSky ({linked.sky_type}) was not "
                         f"pre-baked (key={key!r}) — falling back to "
-                        f"constant background. Was the engine.update() "
-                        f"hook invoked?"
+                        f"constant background. Run sky preparation "
+                        f"before exporting the world."
                     )
                 else:
                     rgb, bw, bh, sun_light = baked
@@ -2678,14 +2723,13 @@ def _export_world(world, writer, textures: list, lights_json: list | None = None
         split = _try_export_split_world(world, split_pat, writer, textures)
         if split is not None:
             return split
-        # If the per-branch bake didn't land in cache, fall through to
-        # the legacy full-world bake (which captures only the camera
-        # branch — same behaviour as before this change).
+        # If preparation produced neither branch maps nor a full bake,
+        # fall through to the mixed-world conversion and warning below.
 
     # Option A: detect `MixShader(Background_a, Background_b, fac=const)`
     # and emit `WorldDesc::Mixed` so each layer can be sampled at its
     # native resolution (HDRI direct, Sky Texture per-node bake) instead
-    # of the combined world bake we used to fall back to.
+        # of a combined world map.
     mix_pat = _detect_mix_world(world)
     if mix_pat is not None:
         mixed = _try_export_mixed_world(world, mix_pat, writer, textures,
@@ -2693,32 +2737,7 @@ def _export_world(world, writer, textures: list, lights_json: list | None = None
         if mixed is not None:
             return mixed
         # If conversion failed (unsupported source on a layer), fall
-        # through to the legacy combined-bake path below.
-
-    # Surface is driven by something we don't fold host-side (MixShader,
-    # nested colour math, …). Look for a generic full-world bake the
-    # prebake step should have left behind, and emit it as a plain
-    # envmap. Strength=1 because the bake captured the world's
-    # Cycles-evaluated output already.
-    full_key = _world_generic_cache_key(world)
-    full_baked = _SKY_BAKE_CACHE.get(full_key)
-    if full_baked is not None:
-        rgb, bw, bh, sun_light = full_baked
-        pb = material_export._PreBakedTexture(
-            rgb=rgb, w=bw, h=bh, cache_key=full_key,
-        )
-        tex_id = material_export.export_image_texture(
-            pb, writer, textures, colorspace="linear"
-        )
-        if sun_light is not None and lights_json is not None:
-            lights_json.append(dict(sun_light))
-        return {
-            "type": "envmap",
-            "texture": tex_id,
-            "rotation_z_rad": 0.0,
-            "strength": 1.0,
-        }
-
+        # through to the warning below if preparation produced no full bake.
     _emit(
         f"[vibrt] warn: world {world.name!r}: World Output Surface driven by "
         f"{src.bl_idname} (expected ShaderNodeBackground) and no generic "
@@ -2757,6 +2776,7 @@ def export_scene_to_memory(
     texture_pct: int | None = None,
     *,
     serialize: bool = True,
+    prepare_world=None,
 ) -> tuple[str | dict, list, list]:
     """Build (scene.json, mesh_blobs, texture_arrays) in RAM.
 
@@ -2773,9 +2793,12 @@ def export_scene_to_memory(
     - `texture_arrays`: per-texture float32 RGBA buffers, kept separate
       from mesh blobs so the Rust side can take them as a typed
       `Vec<PyBuffer<f32>>` for the GPU upload path.
+
+    If supplied, `prepare_world` waits for asynchronous sky preparation
+    after geometry/material export, before the environment maps are read.
     """
     writer = BinWriter()
-    scene_dict = _export_into(depsgraph, writer, texture_pct)
+    scene_dict = _export_into(depsgraph, writer, texture_pct, prepare_world)
     return (
         json.dumps(scene_dict, indent=2) if serialize else scene_dict,
         writer.mesh_blobs,
@@ -2787,6 +2810,7 @@ def _export_into(
     depsgraph: bpy.types.Depsgraph,
     writer: "BinWriter",
     texture_pct: int | None,
+    prepare_world=None,
 ) -> dict:
     """Drive the export, writing blobs through `writer`. Returns the
     JSON-serialisable scene dict.
@@ -2815,6 +2839,7 @@ def _export_into(
     # it so the material JSON stays clean and record it per-material so meshes
     # that reference the material can emit the matching vertex-colour blob.
     material_vc_attr: dict[str, str] = {}
+    material_uv_map: dict[str, str] = {}
     # Material indices flagged as Cycles daylight portals — `MixShader(Emission,
     # Transparent)` with TexSky driving the emission. These aren't real
     # emitters; treating them as such double-counts the sky once via the world
@@ -2895,13 +2920,29 @@ def _export_into(
                             f"recovered emission {em_rgb} "
                             f"{'with IES profile' if em_ies else '(no IES)'}"
                         )
-                vc_attr = exported.pop("_vertex_color_attr", None)
+                # A shared mesh stream must satisfy every leaf in a shader tree.
+                def attributes(key):
+                    found = set()
+                    def visit(p):
+                        if key in p:
+                            found.add(p.pop(key))
+                        for child in ("left_subtree", "secondary"):
+                            if p.get(child):
+                                visit(p[child])
+                    visit(exported)
+                    if len(found) > 1:
+                        raise ValueError(f"{mat.name}: multiple {key} layers need separate mesh attributes")
+                    return next(iter(found), None)
+                vc_attr = attributes("_vertex_color_attr")
+                uv_attr = attributes("_uv_map")
                 is_portal = bool(exported.pop("_is_daylight_portal", False))
                 lampout_ies = exported.pop("_lampout_ies", None)
                 if lampout_ies is not None:
                     material_lampout_ies[len(materials)] = lampout_ies
-                if vc_attr:
+                if vc_attr is not None:
                     material_vc_attr[mat.name] = vc_attr
+                if uv_attr is not None:
+                    material_uv_map[mat.name] = uv_attr
                 if is_portal:
                     # vibrt has no portal sampling; the artist's portal hint
                     # collapses to "this mesh is a transparent window".
@@ -2931,11 +2972,21 @@ def _export_into(
                 if obj_eval.type == "MESH":
                     slot_mat_ids: list[int] = []
                     vc_attr_name: str | None = None
+                    uv_map_name: str | None = None
                     if obj_eval.material_slots:
                         for slot in obj_eval.material_slots:
                             slot_mat_ids.append(resolve_material(slot.material))
-                            if slot.material is not None and vc_attr_name is None:
-                                vc_attr_name = material_vc_attr.get(slot.material.name)
+                            if slot.material is not None:
+                                vc = material_vc_attr.get(slot.material.name)
+                                uv = material_uv_map.get(slot.material.name)
+                                if vc is not None:
+                                    if vc_attr_name is not None and vc != vc_attr_name:
+                                        raise ValueError(f"{obj_eval.name}: materials require different color layers")
+                                    vc_attr_name = vc
+                                if uv is not None:
+                                    if uv_map_name is not None and uv != uv_map_name:
+                                        raise ValueError(f"{obj_eval.name}: materials require different UV layers")
+                                    uv_map_name = uv
                     if not slot_mat_ids:
                         slot_mat_ids = [resolve_material(None)]
 
@@ -3006,15 +3057,20 @@ def _export_into(
                         # the now-empty window).
                         if mid in portal_mat_ids:
                             return False
-                        m = materials[mid]
-                        return any(e > 1e-6 for e in m.get("emission", [0, 0, 0]))
+                        def emits(m):
+                            outputs = m.get("shader_graph", {}).get("outputs", {})
+                            return (any(e > 1e-6 for e in m.get("emission", [0, 0, 0]))
+                                    or "emission" in outputs or "emission_strength" in outputs
+                                    or any(emits(m[k]) for k in ("left_subtree", "secondary") if m.get(k)))
+                        return emits(materials[mid])
 
                     has_emissive_slot = any(
                         _slot_is_emissive(mid) for mid in slot_mat_ids
                     )
 
                     visible_camera = getattr(obj, "visible_camera", True)
-                    if has_emissive_slot and not visible_camera and not inst.is_instance:
+                    graph_emitter = any("shader_graph" in materials[mid] or "secondary" in materials[mid] for mid in slot_mat_ids)
+                    if has_emissive_slot and not visible_camera and not inst.is_instance and not graph_emitter:
                         # Camera-hidden emissive meshes get the BLAS-
                         # coexistence path when the rect-promotion
                         # approximation isn't a strict win: BMW27's
@@ -3078,11 +3134,11 @@ def _export_into(
                             and not getattr(obj, "show_instancer_for_render", True)):
                         continue
 
-                    mkey = f"{obj_eval.data.name}#{obj_eval.name}#vc={vc_attr_name}"
+                    mkey = f"{obj_eval.data.name}#{obj_eval.name}#vc={vc_attr_name}#uv={uv_map_name}"
                     mesh_id = mesh_cache.get(mkey)
                     if mesh_id is None:
                         t_mesh = time.perf_counter()
-                        mesh = _export_mesh(obj_eval, writer, textures, vc_attr_name)
+                        mesh = _export_mesh(obj_eval, writer, textures, vc_attr_name, uv_map_name)
                         dt_mesh = time.perf_counter() - t_mesh
                         mesh_s += dt_mesh
                         if mesh is None:
@@ -3099,6 +3155,8 @@ def _export_into(
                         "mesh": mesh_id,
                         "material": slot_mat_ids[0],
                         "transform": _matrix_to_row_major(inst.matrix_world),
+                        "object_color": list(obj.color),
+                        "object_index": int(obj.pass_index),
                     }
                     if len(slot_mat_ids) > 1:
                         obj_desc["materials"] = slot_mat_ids
@@ -3193,6 +3251,10 @@ def _export_into(
             if cam_obj is None:
                 raise RuntimeError("No active camera in scene")
 
+            t_sky_wait = time.perf_counter()
+            if prepare_world is not None:
+                prepare_world()
+            sky_wait_s = time.perf_counter() - t_sky_wait
             t_world = time.perf_counter()
             world = _export_world(scene.world, writer, textures, lights_json,
                                    scene=scene)
@@ -3327,7 +3389,7 @@ def _export_into(
         f"[vibrt]   hair={hair_s:.2f}s  loop_overhead={loop_overhead_s:.2f}s  "
         f"depsgraph_iter={depsgraph_iter_s:.2f}s  alloc={alloc_s:.2f}s  "
         f"pre_loop={pre_loop_s:.2f}s  post_loop={post_loop_s:.2f}s  "
-        f"world={world_s:.2f}s  other={other_s:.2f}s"
+        f"world={world_s:.2f}s  sky_wait={sky_wait_s:.2f}s  other={other_s:.2f}s"
     )
     if slow_meshes:
         desc = ", ".join(f"{n}({t:.0f}k tri, {d:.2f}s)" for n, t, d in

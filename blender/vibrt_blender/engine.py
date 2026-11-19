@@ -37,25 +37,6 @@ class VibrtRenderEngine(bpy.types.RenderEngine):
     # disable it for the user, just don't force it on either.
     bl_use_postprocess = False
 
-    def update(self, data=None, depsgraph=None):
-        # F12 calls update() on Blender's render job thread. Creating a
-        # temporary scene/camera here races the UI's depsgraph and can crash
-        # Blender before vibrt starts. Bake in an isolated background process.
-        scene = depsgraph.scene if depsgraph is not None else bpy.context.scene
-        self._sky_bake_error = None
-        try:
-            exporter.clear_sky_bake_cache()
-            sky_bake.prepare_scene(
-                scene, cancel=self.test_break,
-                log=lambda msg: self.report({"INFO"}, msg),
-            )
-        except KeyboardInterrupt:
-            self._sky_bake_error = "Sky preparation cancelled"
-            self.report({"INFO"}, self._sky_bake_error)
-        except Exception as ex:
-            self._sky_bake_error = f"vibrt: sky preparation failed: {ex}"
-            self.report({"ERROR"}, self._sky_bake_error)
-
     def update_render_passes(self, scene=None, renderlayer=None):
         """Tell Blender which passes we'll write so they exist on the
         RenderResult and the compositor's `Render Layers` node exposes them.
@@ -86,8 +67,6 @@ class VibrtRenderEngine(bpy.types.RenderEngine):
         )
 
     def render(self, depsgraph: bpy.types.Depsgraph):
-        if getattr(self, "_sky_bake_error", None):
-            return
         scene = depsgraph.scene_eval
         rd = scene.render
         width = int(rd.resolution_x * rd.resolution_percentage / 100.0)
@@ -128,6 +107,8 @@ class VibrtRenderEngine(bpy.types.RenderEngine):
             self._render_in_process(depsgraph, width, height, denoise)
         except KeyboardInterrupt:
             self.report({"WARNING"}, "Render cancelled")
+        except Exception as ex:
+            self.report({"ERROR"}, f"vibrt: render failed: {ex}")
         finally:
             if compositor_disabled_here:
                 original_scene.render.use_compositing = prev_use_compositing
@@ -152,11 +133,21 @@ class VibrtRenderEngine(bpy.types.RenderEngine):
             self.update_stats("vibrt", "Exporting scene...")
             self.report({"INFO"}, f"vibrt: rendering {width}x{height} in-process")
             t_export = time.perf_counter()
-            scene_data, mesh_blobs, texture_arrays = (
-                exporter.export_scene_to_memory(
+            exporter.clear_sky_bake_cache()
+            # Evaluate supported skies in-process. For unsupported graphs,
+            # overlap the isolated Cycles worker with geometry/texture export,
+            # then join before the exporter consumes its environment pixels.
+            with sky_bake.prepare_scene_async(
+                depsgraph.scene, cancel=self.test_break, log=_to_info,
+            ) as finish_sky:
+                def prepare_world():
+                    self.update_stats("vibrt", "Preparing sky lighting...")
+                    finish_sky()
+
+                scene_data, mesh_blobs, texture_arrays = exporter.export_scene_to_memory(
                     depsgraph, serialize=native_scene.accelerator() is None,
+                    prepare_world=prepare_world,
                 )
-            )
             n_blobs = len(mesh_blobs)
             n_arrays = len(texture_arrays)
             mesh_mb = sum(b.nbytes for b in mesh_blobs) / 1024 / 1024

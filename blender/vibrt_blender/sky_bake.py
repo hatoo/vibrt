@@ -1,7 +1,8 @@
-"""Prepare procedural environment maps without mutating the rendering scene."""
+"""Prepare native sky maps, with an isolated Cycles fallback for unsupported graphs."""
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
@@ -24,19 +25,32 @@ def _needs_world_bake(world):
     return exporter._world_needs_full_bake(world)
 
 
-def _run_worker(command, directory, cancel):
-    """Write worker output to a log file and reap it on Esc/errors."""
+@contextmanager
+def _start_worker(command, directory, cancel):
+    """Start immediately; yield a waiter and reap on cancellation/export errors."""
     log_path = directory / "worker.log"
     with log_path.open("w", encoding="utf-8") as output:
         process = subprocess.Popen(
             command, stdout=output, stderr=subprocess.STDOUT,
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
-        try:
+
+        def wait():
+            if cancel():
+                raise KeyboardInterrupt("Sky preparation cancelled")
             while process.poll() is None:
                 if cancel():
                     raise KeyboardInterrupt("Sky preparation cancelled")
                 time.sleep(0.1)
+            transcript = log_path.read_text(encoding="utf-8", errors="replace")
+            if process.returncode:
+                raise RuntimeError(
+                    f"sky bake worker exited with {process.returncode}:\n{transcript[-4000:]}"
+                )
+            return transcript
+
+        try:
+            yield wait
         finally:
             if process.poll() is None:
                 process.terminate()
@@ -45,31 +59,48 @@ def _run_worker(command, directory, cancel):
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.wait()
-    transcript = log_path.read_text(encoding="utf-8", errors="replace")
-    if process.returncode:
-        raise RuntimeError(
-            f"sky bake worker exited with {process.returncode}:\n{transcript[-4000:]}"
-        )
-    return transcript
+
+
+def _run_worker(command, directory, cancel):
+    with _start_worker(command, directory, cancel) as wait:
+        return wait()
 
 
 def prepare_scene(scene, *, cancel=lambda: False, log=print, width=None, height=None):
-    """Snapshot only sky inputs, including unsaved edits and linked assets.
+    """Blocking convenience wrapper for scripts and sky-only preparation."""
+    with prepare_scene_async(scene, cancel=cancel, log=log, width=width, height=height) as wait:
+        wait()
+
+
+@contextmanager
+def prepare_scene_async(scene, *, cancel=lambda: False, log=print, width=None, height=None):
+    """Evaluate supported sky graphs natively; otherwise snapshot their inputs.
 
     No scenes, objects, node trees, or render results are created/edited in
     the caller. Blender's library writer captures the existing datablocks
-    and their dependencies; all scene construction and Cycles work happens
-    in a fresh background Blender, with user addons and auto-execution off.
+    and their dependencies for the fallback; all scene construction and
+    Cycles work happens in a fresh background Blender, with user addons
+    and auto-execution off. Native evaluation creates only numeric buffers.
+
+    Geometry and materials may be exported while the worker runs. Call the
+    yielded function before exporting the world to publish the completed
+    environment maps. Leaving the context always reaps the worker, even if
+    export fails before reaching the world. No Python threads access bpy.
     """
     import bpy
-    import numpy as np
     from . import exporter
 
     if (width is None) != (height is None):
         raise ValueError("Specify both sky bake dimensions or neither")
+    from . import native_sky
+
+    if native_sky.prepare_scene(scene, cancel=cancel, log=log, width=width, height=height):
+        yield lambda: None
+        return
     bake_world = _needs_world_bake(scene.world)
     portals = exporter._portal_emissions_to_bake(scene)
     if not bake_world and not portals:
+        yield lambda: None
         return
     if cancel():
         raise KeyboardInterrupt("Sky preparation cancelled")
@@ -99,21 +130,38 @@ def prepare_scene(scene, *, cancel=lambda: False, log=print, width=None, height=
             "--disable-autoexec", "--python-exit-code", "1",
             "--python", str(Path(__file__).resolve()), "--", str(directory),
         ]
-        transcript = _run_worker(command, directory, cancel)
-        for line in transcript.splitlines():
-            if line.startswith("[vibrt]"):
-                log(line)
-        manifest = json.loads((directory / "result.json").read_text(encoding="utf-8"))
-        if not manifest:
-            raise RuntimeError("Sky preparation produced no environment maps")
-        cache = {}
-        for index, entry in enumerate(manifest):
-            pixels = np.load(directory / f"bake-{index}.npy", allow_pickle=False)
-            w, h = entry["width"], entry["height"]
-            if pixels.shape != (h, w, 3) or pixels.dtype != np.float32:
-                raise RuntimeError("Sky bake worker returned an invalid pixel buffer")
-            cache[entry["key"]] = (pixels, w, h, entry["sun"])
-        exporter._SKY_BAKE_CACHE.update(cache)
+        with _start_worker(command, directory, cancel) as wait:
+            published = False
+
+            def finish():
+                nonlocal published
+                if published:
+                    return
+                transcript = wait()
+                for line in transcript.splitlines():
+                    if line.startswith("[vibrt]"):
+                        log(line)
+                # Publish atomically only after every buffer is validated.
+                exporter._SKY_BAKE_CACHE.update(_read_results(directory))
+                published = True
+
+            yield finish
+
+
+def _read_results(directory):
+    import numpy as np
+
+    manifest = json.loads((directory / "result.json").read_text(encoding="utf-8"))
+    if not manifest:
+        raise RuntimeError("Sky preparation produced no environment maps")
+    cache = {}
+    for index, entry in enumerate(manifest):
+        pixels = np.load(directory / f"bake-{index}.npy", allow_pickle=False)
+        w, h = entry["width"], entry["height"]
+        if pixels.shape != (h, w, 3) or pixels.dtype != np.float32:
+            raise RuntimeError("Sky bake worker returned an invalid pixel buffer")
+        cache[entry["key"]] = (pixels, w, h, entry["sun"])
+    return cache
 
 
 def run_worker(directory):

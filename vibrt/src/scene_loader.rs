@@ -20,6 +20,7 @@ pub struct LoadedMesh<'bin> {
     /// f32 x 3 per vertex; empty when the mesh has no vertex colour attribute
     /// referenced by any material. See `MeshDesc::vertex_colors`.
     pub vertex_colors: Cow<'bin, [f32]>,
+    pub vertex_alphas: Cow<'bin, [f32]>,
     /// f32 x 3 per vertex; empty when the mesh has no authored tangent (the
     /// common case — only hair ribbon meshes ship one today). See
     /// `MeshDesc::tangents`.
@@ -76,6 +77,8 @@ pub struct LoadedMeshLightTri {
     /// texture, or `None` for constant-emissive materials. The kernel
     /// samples at the NEE-sample's barycentric → UV when set.
     pub emission_tex_idx: Option<u32>,
+    pub primitive: u32,
+    pub sampling_luminance: f32,
 }
 
 /// World-space triangle table + per-triangle CDF for one emissive mesh,
@@ -575,6 +578,20 @@ pub fn load_scene<'a>(
 /// table for the device-side NEE sampler. Triangles whose material has
 /// zero emission (or whose area is degenerate) are skipped; if no
 /// emissive triangles remain the entry is dropped.
+fn emission_sampling_weight(mat: &crate::scene_format::PrincipledMaterial) -> f32 {
+    let mut weight =
+        (0.2126 * mat.emission[0] + 0.7152 * mat.emission[1] + 0.0722 * mat.emission[2]).max(0.0);
+    if mat.shader_graph.as_ref().is_some_and(|g| {
+        g.outputs.contains_key("emission") || g.outputs.contains_key("emission_strength")
+    }) {
+        weight = weight.max(1.0);
+    }
+    for child in [&mat.left_subtree, &mat.secondary].into_iter().flatten() {
+        weight += emission_sampling_weight(child);
+    }
+    weight
+}
+
 fn build_mesh_lights(
     file: &SceneFile,
     objects: &[LoadedObject],
@@ -626,11 +643,8 @@ fn build_mesh_lights(
             // is the typical case. Don't gate on luminance there — the
             // texture might be locally bright even if `emission` is
             // moderate.
-            let lum_const = 0.2126 * em[0] + 0.7152 * em[1] + 0.0722 * em[2];
-            if mat.emission_tex.is_none() && lum_const <= 1e-8 {
-                continue;
-            }
-            if mat.emission_tex.is_some() && lum_const <= 1e-8 {
+            let lum_const = emission_sampling_weight(mat);
+            if lum_const <= 1e-8 {
                 continue;
             }
             let i0 = mesh.indices[tri * 3] as usize;
@@ -696,6 +710,8 @@ fn build_mesh_lights(
                 uv2: xform(uv(i2)),
                 emission: em,
                 emission_tex_idx: mat.emission_tex,
+                primitive: tri as u32,
+                sampling_luminance: lum_const,
             });
         }
         if tris.is_empty() {
@@ -712,7 +728,7 @@ fn build_mesh_lights(
         let n = tris.len();
         let mut cdf = vec![0.0f32; n + 1];
         for (i, t) in tris.iter().enumerate() {
-            let lum = 0.2126 * t.emission[0] + 0.7152 * t.emission[1] + 0.0722 * t.emission[2];
+            let lum = t.sampling_luminance;
             cdf[i + 1] = cdf[i] + t.area * lum.max(0.0);
         }
         let total = cdf[n];
@@ -1086,6 +1102,10 @@ fn load_mesh<'a>(desc: &MeshDesc, blobs: &[&'a [u8]]) -> Result<LoadedMesh<'a>> 
         Some(idx) => cast_f32_slice(lookup_blob(blobs, idx)?),
         None => Cow::Owned(Vec::new()),
     };
+    let vertex_alphas = match desc.vertex_alphas {
+        Some(idx) => cast_f32_slice(lookup_blob(blobs, idx)?),
+        None => Cow::Owned(Vec::new()),
+    };
     let tangents = match desc.tangents {
         Some(idx) => cast_f32_slice(lookup_blob(blobs, idx)?),
         None => Cow::Owned(Vec::new()),
@@ -1112,6 +1132,11 @@ fn load_mesh<'a>(desc: &MeshDesc, blobs: &[&'a [u8]]) -> Result<LoadedMesh<'a>> 
             vertices.len()
         ));
     }
+    if !vertex_alphas.is_empty() && vertex_alphas.len() != vertices.len() / 3 {
+        return Err(anyhow!(
+            "mesh vertex_alphas must contain one value per vertex"
+        ));
+    }
     if !tangents.is_empty() && tangents.len() != vertices.len() {
         return Err(anyhow!(
             "mesh tangents len {} != vertices len {} (expected f32x3 per vertex)",
@@ -1127,6 +1152,7 @@ fn load_mesh<'a>(desc: &MeshDesc, blobs: &[&'a [u8]]) -> Result<LoadedMesh<'a>> 
         indices,
         material_indices,
         vertex_colors,
+        vertex_alphas,
         tangents,
     })
 }

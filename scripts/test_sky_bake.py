@@ -4,6 +4,7 @@ Run: blender -b --factory-startup --python-exit-code 1 --python scripts/test_sky
 """
 
 from pathlib import Path
+import os
 import sys
 
 import bpy
@@ -11,6 +12,9 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "blender"))
 from vibrt_blender import exporter, sky_bake
+
+# This suite exercises worker isolation; native model accuracy is tested separately.
+os.environ["VIBRT_CYCLES_SKY"] = "1"
 
 bpy.ops.wm.read_factory_settings(use_empty=True)
 scene = bpy.context.scene
@@ -39,7 +43,15 @@ for turbidity in (2.0, 6.0):
     assert reference
     exporter.clear_sky_bake_cache()
     before = scene_ids()
-    sky_bake.prepare_scene(scene, width=64, height=32)
+    if turbidity == 2.0:
+        sky_bake.prepare_scene(scene, width=64, height=32)
+    else:
+        with sky_bake.prepare_scene_async(scene, width=64, height=32) as finish:
+            assert not exporter._SKY_BAKE_CACHE, "Sky published before the export barrier"
+            finish()
+            ready = dict(exporter._SKY_BAKE_CACHE)
+            finish()
+            assert all(exporter._SKY_BAKE_CACHE[key] is value for key, value in ready.items())
     actual = exporter._SKY_BAKE_CACHE
     assert actual.keys() == reference.keys()
     assert scene_ids() == before, "Worker preparation mutated Blender's scene datablocks"

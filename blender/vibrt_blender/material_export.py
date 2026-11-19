@@ -13,7 +13,7 @@ import time
 
 import bpy
 
-from . import native_scene
+from . import native_scene, node_ops
 
 
 _LOGGED_WARNINGS: set = set()
@@ -652,7 +652,10 @@ def _resolve_exact_scalar(sock, depth: int = 0) -> float | None:
         mode = getattr(src, "clamp_type", "MINMAX")
         if mode == "RANGE" and mn > mx:
             mn, mx = mx, mn
-        return max(mn, min(mx, v))
+        elif mn > mx:
+            # Preserve the scalar folder's lower-bound-first convention.
+            mx = mn
+        return float(node_ops.apply(dict(type="clamp", min=mn, max=mx), [v, v, v])[0])
     if bl == "ShaderNodeMix" and getattr(src, "data_type", "RGBA") == "FLOAT":
         fac_sock = next((i for i in src.inputs
                          if i.name == "Factor" and i.type == "VALUE"), None)
@@ -669,10 +672,8 @@ def _resolve_exact_scalar(sock, depth: int = 0) -> float | None:
             return None
         if bool(getattr(src, "clamp_factor", True)):
             fa = max(0.0, min(1.0, fa))
-        out = va * (1.0 - fa) + vb * fa
-        if bool(getattr(src, "clamp_result", False)):
-            out = max(0.0, min(1.0, out))
-        return out
+        return float(node_ops.apply(dict(type="mix", fac=fa,
+            clamp=bool(getattr(src, "clamp_result", False))), [va, va, va], [vb, vb, vb])[0])
     if bl == "ShaderNodeInvert":
         fac_sock = src.inputs.get("Fac")
         col_sock = src.inputs.get("Color")
@@ -687,7 +688,7 @@ def _resolve_exact_scalar(sock, depth: int = 0) -> float | None:
         x = _resolve_exact_scalar(col_sock, depth + 1)
         if x is None:
             return None
-        return x * (1.0 - fac) + (1.0 - x) * fac
+        return float(node_ops.apply(dict(type="invert", fac=fac), [x, x, x])[0])
     return None
 
 
@@ -1014,126 +1015,20 @@ def _eval_math_constant(node, depth: int) -> float | None:
     c = _resolve_constant_scalar(inputs[2], depth) if len(inputs) > 2 else None
     if a is None:
         return None
-    try:
-        if op == "ADD":
-            if b is None:
-                return None
-            r = a + b
-        elif op == "SUBTRACT":
-            if b is None:
-                return None
-            r = a - b
-        elif op == "MULTIPLY":
-            if b is None:
-                return None
-            r = a * b
-        elif op == "DIVIDE":
-            if b is None:
-                return None
-            r = a / b if b != 0 else 0.0
-        elif op == "MULTIPLY_ADD":
-            if b is None or c is None:
-                return None
-            r = a * b + c
-        elif op == "POWER":
-            if b is None:
-                return None
-            r = a ** b if a >= 0 or float(b).is_integer() else 0.0
-        elif op == "LOGARITHM":
-            if b is None or a <= 0 or b <= 0 or b == 1:
-                return None
-            r = math.log(a, b)
-        elif op == "MINIMUM":
-            if b is None:
-                return None
-            r = min(a, b)
-        elif op == "MAXIMUM":
-            if b is None:
-                return None
-            r = max(a, b)
-        elif op == "LESS_THAN":
-            if b is None:
-                return None
-            r = 1.0 if a < b else 0.0
-        elif op == "GREATER_THAN":
-            if b is None:
-                return None
-            r = 1.0 if a > b else 0.0
-        elif op == "COMPARE":
-            if b is None:
-                return None
-            eps = c if c is not None else 0.0
-            r = 1.0 if abs(a - b) <= eps else 0.0
-        elif op == "MODULO":
-            if b is None:
-                return None
-            r = math.fmod(a, b) if b != 0 else 0.0
-        elif op == "SMOOTH_MIN":
-            if b is None:
-                return None
-            r = min(a, b)
-        elif op == "SMOOTH_MAX":
-            if b is None:
-                return None
-            r = max(a, b)
-        elif op == "ARCTAN2":
-            if b is None:
-                return None
-            r = math.atan2(a, b)
-        elif op == "SQRT":
-            r = math.sqrt(max(a, 0.0))
-        elif op == "INVERSE_SQRT":
-            r = 1.0 / math.sqrt(a) if a > 0 else 0.0
-        elif op == "ABSOLUTE":
-            r = abs(a)
-        elif op == "EXPONENT":
-            r = math.exp(a)
-        elif op == "SIGN":
-            r = float((a > 0) - (a < 0))
-        elif op == "ROUND":
-            r = float(round(a))
-        elif op == "FLOOR":
-            r = math.floor(a)
-        elif op == "CEIL":
-            r = math.ceil(a)
-        elif op == "FRACT":
-            r = a - math.floor(a)
-        elif op == "TRUNC":
-            r = math.trunc(a)
-        elif op == "SINE":
-            r = math.sin(a)
-        elif op == "COSINE":
-            r = math.cos(a)
-        elif op == "TANGENT":
-            r = math.tan(a)
-        elif op == "ARCSINE":
-            r = math.asin(max(-1.0, min(1.0, a)))
-        elif op == "ARCCOSINE":
-            r = math.acos(max(-1.0, min(1.0, a)))
-        elif op == "ARCTANGENT":
-            r = math.atan(a)
-        elif op == "HYPERBOLIC_SINE":
-            r = math.sinh(a)
-        elif op == "HYPERBOLIC_COSINE":
-            r = math.cosh(a)
-        elif op == "HYPERBOLIC_TANGENT":
-            r = math.tanh(a)
-        elif op == "RADIANS":
-            r = math.radians(a)
-        elif op == "DEGREES":
-            r = math.degrees(a)
-        else:
-            _warn(
-                f"math-fold-op:{op}",
-                f"{_node_tag(node)}: op={op!r} can't be constant-folded — "
-                f"chain stopped at this node",
-            )
-            return None
-    except (ValueError, OverflowError, ZeroDivisionError):
+    unary = {"SQRT", "INVERSE_SQRT", "ABSOLUTE", "EXPONENT", "SIGN", "ROUND", "FLOOR", "CEIL",
+             "FRACT", "TRUNC", "SINE", "COSINE", "TANGENT", "ARCSINE", "ARCCOSINE", "ARCTANGENT",
+             "HYPERBOLIC_SINE", "HYPERBOLIC_COSINE", "HYPERBOLIC_TANGENT", "RADIANS", "DEGREES"}
+    if (op not in unary and b is None) or (op == "MULTIPLY_ADD" and c is None):
         return None
-    if getattr(node, "use_clamp", False):
-        r = max(0.0, min(1.0, r))
-    return float(r)
+    try:
+        settings = dict(type="scalar_math", op=op.lower(), b=b or 0.0, c=c or 0.0,
+                        clamp=bool(getattr(node, "use_clamp", False)))
+        return float(node_ops.apply(settings, [a, a, a])[0])
+    except ValueError as ex:
+        # Unsupported operations and invalid domains remain non-foldable.
+        if "unknown Math op" in str(ex):
+            _warn(f"math-fold-op:{op}", f"{_node_tag(node)}: op={op!r} can't be constant-folded")
+        return None
 
 
 def _blackbody_to_linear_rgb(kelvin: float) -> list[float]:
@@ -2176,61 +2071,18 @@ def _math_transform(node, chain_input_name=None):
         tuple(round(float(v), 6) for v in other_vals),
     )
 
-    def _finish(out):
-        if use_clamp:
-            out = np.clip(out, 0.0, 1.0)
-        return out.astype(np.float32)
-
-    # Chain side is always the "A" operand in the op; the other constant(s)
-    # become "B" (and "C" for ternary ops). Non-commutative ops split on
-    # chain_idx so SUBTRACT(chain=0) stays "chain - k" but SUBTRACT(chain=1)
-    # becomes "k - chain".
-    b = other_vals[0] if other_vals else 0.0
-    if op == "ADD":
-        def apply(rgb):
-            return _finish(rgb + b)
-    elif op == "SUBTRACT":
-        if chain_idx == 0:
-            def apply(rgb):
-                return _finish(rgb - b)
-        else:
-            def apply(rgb):
-                return _finish(b - rgb)
-    elif op == "MULTIPLY":
-        def apply(rgb):
-            return _finish(rgb * b)
-    elif op == "DIVIDE":
-        if chain_idx == 0:
-            def apply(rgb):
-                denom = b if abs(b) > 1e-12 else 1.0
-                return _finish(rgb / denom)
-        else:
-            def apply(rgb):
-                return _finish(np.where(rgb == 0.0, 0.0, b / np.where(rgb == 0.0, 1.0, rgb)))
-    elif op == "POWER":
-        if chain_idx == 0:
-            def apply(rgb):
-                return _finish(np.power(np.maximum(rgb, 0.0), b))
-        else:
-            def apply(rgb):
-                return _finish(np.power(max(b, 0.0), rgb))
-    elif op == "MULTIPLY_ADD" and len(other_vals) >= 2:
-        c = other_vals[1]
-        def apply(rgb):
-            return _finish(rgb * b + c)
-    elif op == "MINIMUM":
-        def apply(rgb):
-            return _finish(np.minimum(rgb, b))
-    elif op == "MAXIMUM":
-        def apply(rgb):
-            return _finish(np.maximum(rgb, b))
-    else:
-        _warn(
-            f"math-op:{op}",
-            f"{_node_tag(node)}: op={op!r} not baked — chain short-circuited",
-        )
+    supported = {"ADD", "SUBTRACT", "MULTIPLY", "DIVIDE", "POWER", "MULTIPLY_ADD", "MINIMUM", "MAXIMUM"}
+    if op not in supported or (op == "MULTIPLY_ADD" and len(other_vals) < 2):
+        _warn(f"math-op:{op}", f"{_node_tag(node)}: op={op!r} not baked")
         return None
-    return id_tuple, apply
+    b = other_vals[0] if other_vals else 0.0
+    # Preserve the existing exporter's near-zero constant-denominator policy.
+    if op == "DIVIDE" and chain_idx == 0 and abs(b) <= 1e-12:
+        b = 1.0
+    settings = dict(type="math", op=op.lower(), b=b,
+                    c=other_vals[1] if len(other_vals) > 1 else 0.0,
+                    swap=chain_idx != 0, clamp=use_clamp)
+    return id_tuple, lambda rgb: node_ops.apply(settings, rgb)
 
 
 def _rgbcurve_transform(node):
@@ -2258,22 +2110,11 @@ def _rgbcurve_transform(node):
         )
         luts.append(lut)
 
-    def apply(rgb):
-        out = np.empty_like(rgb)
-        for ch in range(3):
-            lut = luts[ch]
-            v = np.clip(rgb[..., ch], 0.0, 1.0) * (N - 1)
-            i0 = v.astype(np.int32)
-            i1 = np.minimum(i0 + 1, N - 1)
-            f = v - i0
-            out[..., ch] = lut[i0] * (1.0 - f) + lut[i1] * f
-        return out
-
-    return id_tuple, apply
+    settings = dict(type="rgb_curve", lut=np.asarray(luts).ravel().tolist())
+    return id_tuple, lambda rgb: node_ops.apply(settings, rgb)
 
 
 def _gamma_transform(node):
-    import numpy as np
     if node.inputs["Gamma"].is_linked:
         _warn(
             f"gamma-linked:{node.as_pointer()}",
@@ -2283,16 +2124,13 @@ def _gamma_transform(node):
     gamma = _socket_f(node.inputs["Gamma"])
     id_tuple = ("Gamma", round(gamma, 6))
 
-    def apply(rgb):
-        return np.power(np.maximum(rgb, 0.0), gamma).astype(np.float32)
-
-    return id_tuple, apply
+    settings = dict(type="gamma", gamma=gamma, preserve_negative=False)
+    return id_tuple, lambda rgb: node_ops.apply(settings, rgb)
 
 
 def _brightcontrast_transform(node):
     # Blender formula: a = 1 + contrast; b = 0.5*(1 - a) + bright;
     # out = max(a*col + b, 0).
-    import numpy as np
     if node.inputs["Bright"].is_linked or node.inputs["Contrast"].is_linked:
         _warn(
             f"brcon-linked:{node.as_pointer()}",
@@ -2301,18 +2139,12 @@ def _brightcontrast_transform(node):
         return None
     bright = _socket_f(node.inputs["Bright"])
     contrast = _socket_f(node.inputs["Contrast"])
-    a = 1.0 + contrast
-    b = 0.5 * (1.0 - a) + bright
     id_tuple = ("BrightContrast", round(bright, 6), round(contrast, 6))
-
-    def apply(rgb):
-        return np.maximum(rgb * a + b, 0.0).astype(np.float32)
-
-    return id_tuple, apply
+    settings = dict(type="bright_contrast", bright=bright, contrast=contrast)
+    return id_tuple, lambda rgb: node_ops.apply(settings, rgb)
 
 
 def _invert_transform(node):
-    import numpy as np
     if node.inputs["Fac"].is_linked:
         _warn(
             f"inv-linked:{node.as_pointer()}",
@@ -2322,14 +2154,10 @@ def _invert_transform(node):
     fac = _socket_f(node.inputs["Fac"])
     id_tuple = ("Invert", round(fac, 6))
 
-    def apply(rgb):
-        return (rgb * (1.0 - fac) + (1.0 - rgb) * fac).astype(np.float32)
-
-    return id_tuple, apply
+    return id_tuple, lambda rgb: node_ops.apply(dict(type="invert", fac=fac), rgb)
 
 
 def _huesat_transform(node):
-    import numpy as np
     # Each scalar parameter on this node may be driven by a chain (e.g. a
     # ColorRamp into Hue, or a Math op driving Fac). We accept the chain as
     # long as it folds to a constant — that's enough for lone_monk's
@@ -2361,44 +2189,8 @@ def _huesat_transform(node):
         round(hue, 6), round(sat, 6), round(val, 6), round(fac, 6),
     )
 
-    def apply(rgb):
-        r, g, b = rgb[..., 0], rgb[..., 1], rgb[..., 2]
-        mx = np.max(rgb, axis=-1)
-        mn = np.min(rgb, axis=-1)
-        d = mx - mn
-        dsafe = np.maximum(d, 1e-12)
-        v = mx
-        s = np.where(mx > 0, d / np.maximum(mx, 1e-12), 0.0)
-        rc = (mx - r) / dsafe
-        gc = (mx - g) / dsafe
-        bc = (mx - b) / dsafe
-        h = np.where(r == mx, bc - gc,
-            np.where(g == mx, 2.0 + rc - bc, 4.0 + gc - rc))
-        h = np.where(d > 0, (h / 6.0) % 1.0, 0.0)
-
-        h = (h + hue - 0.5) % 1.0
-        s = np.clip(s * sat, 0.0, 1.0)
-        v = v * val
-
-        i = np.floor(h * 6.0).astype(np.int32)
-        f = h * 6.0 - i
-        p = v * (1.0 - s)
-        q = v * (1.0 - s * f)
-        t = v * (1.0 - s * (1.0 - f))
-        i = i % 6
-        r2 = np.where(i == 0, v, np.where(i == 1, q,
-             np.where(i == 2, p, np.where(i == 3, p,
-             np.where(i == 4, t, v)))))
-        g2 = np.where(i == 0, t, np.where(i == 1, v,
-             np.where(i == 2, v, np.where(i == 3, q,
-             np.where(i == 4, p, p)))))
-        b2 = np.where(i == 0, p, np.where(i == 1, p,
-             np.where(i == 2, t, np.where(i == 3, v,
-             np.where(i == 4, v, q)))))
-        hsv_rgb = np.stack([r2, g2, b2], axis=-1)
-        return (rgb * (1.0 - fac) + hsv_rgb * fac).astype(np.float32)
-
-    return id_tuple, apply
+    settings = dict(type="hue_sat", hue=hue, saturation=sat, value=val, fac=fac)
+    return id_tuple, lambda rgb: node_ops.apply(settings, rgb)
 
 
 def _colorramp_transform(node):
@@ -2422,19 +2214,11 @@ def _colorramp_transform(node):
         elems_id,
     )
 
-    def apply(rgb):
-        y = 0.2126 * rgb[..., 0] + 0.7152 * rgb[..., 1] + 0.0722 * rgb[..., 2]
-        y = np.clip(y, 0.0, 1.0) * (N - 1)
-        i0 = y.astype(np.int32)
-        i1 = np.minimum(i0 + 1, N - 1)
-        f = (y - i0)[..., None]
-        return (lut[i0] * (1.0 - f) + lut[i1] * f).astype(np.float32)
-
-    return id_tuple, apply
+    settings = dict(type="color_ramp", lut=lut.ravel().tolist(), luminance=True)
+    return id_tuple, lambda rgb: node_ops.apply(settings, rgb)
 
 
 def _clamp_transform(node):
-    import numpy as np
     if node.inputs["Min"].is_linked or node.inputs["Max"].is_linked:
         _warn(
             f"clamp-linked:{node.as_pointer()}",
@@ -2448,10 +2232,8 @@ def _clamp_transform(node):
         mn, mx = mx, mn
     id_tuple = ("Clamp", mode, round(mn, 6), round(mx, 6))
 
-    def apply(rgb):
-        return np.clip(rgb, mn, mx).astype(np.float32)
-
-    return id_tuple, apply
+    settings = dict(type="clamp", min=mn, max=mx)
+    return id_tuple, lambda rgb: node_ops.apply(settings, rgb)
 
 
 _SUPPORTED_MIX_BLENDS = frozenset((
@@ -2462,49 +2244,11 @@ _SUPPORTED_MIX_BLENDS = frozenset((
 
 
 def _rgb_to_hsv_np(rgb):
-    """Vectorised RGB→HSV that matches Blender's `rgb_to_hsv` (intern/cycles
-    convention): H in [0, 1), S in [0, 1], V in [0, 1]. Operates on the last
-    axis (..., 3) and returns the same shape."""
-    import numpy as np
-    r, g, b = rgb[..., 0], rgb[..., 1], rgb[..., 2]
-    mx = np.maximum(np.maximum(r, g), b)
-    mn = np.minimum(np.minimum(r, g), b)
-    v = mx
-    delta = mx - mn
-    s = np.where(mx > 0.0, delta / np.maximum(mx, 1e-30), 0.0)
-    # Hue piecewise.
-    rc = (mx - r) / np.maximum(delta, 1e-30)
-    gc = (mx - g) / np.maximum(delta, 1e-30)
-    bc = (mx - b) / np.maximum(delta, 1e-30)
-    h = np.where(r == mx, bc - gc,
-        np.where(g == mx, 2.0 + rc - bc, 4.0 + gc - rc))
-    h = (h / 6.0) % 1.0
-    h = np.where(delta > 0.0, h, 0.0)
-    return np.stack([h, s, v], axis=-1).astype(np.float32)
+    return node_ops.apply({"type": "rgb_to_hsv"}, rgb)
 
 
-def _hsv_to_rgb_np(hsv):
-    """Vectorised inverse of `_rgb_to_hsv_np`."""
-    import numpy as np
-    h, s, v = hsv[..., 0], hsv[..., 1], hsv[..., 2]
-    h6 = (h % 1.0) * 6.0
-    i = np.floor(h6).astype(np.int32) % 6
-    f = h6 - i.astype(np.float32)
-    p = v * (1.0 - s)
-    q = v * (1.0 - s * f)
-    t = v * (1.0 - s * (1.0 - f))
-    # `np.choose` chokes on >32-D inputs even for tiny arrays — use boolean
-    # masks instead, which broadcast cleanly through any shape.
-    r = np.where(i == 0, v, np.where(i == 1, q,
-        np.where(i == 2, p, np.where(i == 3, p,
-        np.where(i == 4, t, v)))))
-    g = np.where(i == 0, t, np.where(i == 1, v,
-        np.where(i == 2, v, np.where(i == 3, q,
-        np.where(i == 4, p, p)))))
-    b = np.where(i == 0, p, np.where(i == 1, p,
-        np.where(i == 2, t, np.where(i == 3, v,
-        np.where(i == 4, v, q)))))
-    return np.stack([r, g, b], axis=-1).astype(np.float32)
+def _hsv_to_rgb_np(rgb):
+    return node_ops.apply({"type": "hsv_to_rgb"}, rgb)
 
 
 def _find_base_color_attribute(sock, depth: int = 0) -> str | None:
@@ -2567,78 +2311,7 @@ def _mix_node_params(node):
 
 
 def _apply_mix_blend(col1, col2, fac, blend: str, use_clamp: bool):
-    """Blender ramp_blend applied to two arrays (or array + broadcast scalar).
-
-    `fac` is either a Python float or a numpy array broadcastable against
-    `col1`/`col2` (e.g. `(h, w, 1)` for a textured Factor).
-    """
-    import numpy as np
-    facm = 1.0 - fac
-    if blend == "MIX":
-        out = col1 * facm + col2 * fac
-    elif blend == "MULTIPLY":
-        out = col1 * (facm + fac * col2)
-    elif blend == "ADD":
-        out = col1 + fac * col2
-    elif blend == "SUBTRACT":
-        out = col1 - fac * col2
-    elif blend == "SCREEN":
-        out = 1.0 - (facm + fac * (1.0 - col2)) * (1.0 - col1)
-    elif blend == "DIVIDE":
-        col2_safe = np.where(col2 == 0.0, 1.0, col2)
-        out = np.where(col2 == 0.0, col1, facm * col1 + fac * col1 / col2_safe)
-    elif blend == "DIFFERENCE":
-        out = facm * col1 + fac * np.abs(col1 - col2)
-    elif blend == "DARKEN":
-        out = facm * col1 + fac * np.minimum(col1, col2)
-    elif blend == "LIGHTEN":
-        # Blender's asymmetric formula: max(col1, col2*fac).
-        out = np.maximum(col1, col2 * fac)
-    elif blend == "OVERLAY":
-        lo = col1 * (facm + 2.0 * fac * col2)
-        hi = 1.0 - (facm + 2.0 * fac * (1.0 - col2)) * (1.0 - col1)
-        out = np.where(col1 < 0.5, lo, hi)
-    elif blend == "SOFT_LIGHT":
-        scr = 1.0 - (1.0 - col2) * (1.0 - col1)
-        out = facm * col1 + fac * ((1.0 - col1) * col2 * col1 + col1 * scr)
-    elif blend == "LINEAR_LIGHT":
-        out = col1 + fac * (2.0 * col2 - 1.0)
-    elif blend in ("HUE", "SATURATION", "COLOR", "VALUE"):
-        # HSV-based blends. Build a "target" RGB by swapping one or more
-        # HSV channels from col2 into col1, then lerp(col1, target, fac).
-        # Cycles short-circuits when the relevant col2 saturation is 0
-        # (HUE / SATURATION / COLOR) so the col1 chromaticity survives.
-        a1 = np.asarray(col1, dtype=np.float32)
-        a2 = np.asarray(col2, dtype=np.float32)
-        target_shape = np.broadcast_shapes(a1.shape, a2.shape)
-        c1 = np.broadcast_to(a1, target_shape)
-        c2 = np.broadcast_to(a2, target_shape)
-        hsv1 = _rgb_to_hsv_np(c1)
-        hsv2 = _rgb_to_hsv_np(c2)
-        if blend == "HUE":
-            tmp_hsv = np.stack([hsv2[..., 0], hsv1[..., 1], hsv1[..., 2]], axis=-1)
-            tmp_rgb = _hsv_to_rgb_np(tmp_hsv)
-            mixed = c1 * (1.0 - fac) + tmp_rgb * fac
-            out = np.where((hsv2[..., 1] != 0.0)[..., None], mixed, c1)
-        elif blend == "SATURATION":
-            tmp_hsv = np.stack([hsv1[..., 0], hsv2[..., 1], hsv1[..., 2]], axis=-1)
-            tmp_rgb = _hsv_to_rgb_np(tmp_hsv)
-            mixed = c1 * (1.0 - fac) + tmp_rgb * fac
-            out = np.where((hsv1[..., 1] != 0.0)[..., None], mixed, c1)
-        elif blend == "COLOR":
-            tmp_hsv = np.stack([hsv2[..., 0], hsv2[..., 1], hsv1[..., 2]], axis=-1)
-            tmp_rgb = _hsv_to_rgb_np(tmp_hsv)
-            mixed = c1 * (1.0 - fac) + tmp_rgb * fac
-            out = np.where((hsv2[..., 1] != 0.0)[..., None], mixed, c1)
-        else:  # VALUE
-            tmp_hsv = np.stack([hsv1[..., 0], hsv1[..., 1], hsv2[..., 2]], axis=-1)
-            tmp_rgb = _hsv_to_rgb_np(tmp_hsv)
-            out = c1 * (1.0 - fac) + tmp_rgb * fac
-    else:
-        raise AssertionError(f"unreachable blend: {blend}")
-    if use_clamp:
-        out = np.clip(out, 0.0, 1.0)
-    return out.astype(np.float32)
+    return node_ops.apply(dict(type="mix", blend=blend.lower(), clamp=use_clamp), col1, col2, fac)
 
 
 def _mix_transform(node, chain_input_name):
@@ -3338,6 +3011,46 @@ def _default_params() -> dict:
 
 
 def _resolve_shader(node, writer, textures, mat_name: str) -> dict:
+    from .shader_graph import compile_leaf, UnsupportedNode
+    if node.bl_idname in {"ShaderNodeMixShader", "ShaderNodeAddShader"}:
+        from .shader_graph import Compiler
+        is_add = node.bl_idname == "ShaderNodeAddShader"
+        inputs = list(node.inputs)[0 if is_add else 1:]
+        children = []
+        for socket in inputs:
+            socket = _follow_reroutes(socket)
+            if socket.is_linked:
+                children.append(_resolve_shader(socket.links[0].from_node, writer, textures, mat_name))
+            else:
+                children.append(dict(_default_params(), base_color=[0.0]*3, pure_diffuse=True, specular_ior_level=0.0))
+        params = dict(_default_params(), left_subtree=children[0], secondary=children[1], add_shader=is_add)
+        if not is_add:
+            params["mix_fac"] = float(node.inputs[0].default_value)
+            if node.inputs[0].is_linked:
+                compiler = Compiler(writer, textures, tuple(_GROUP_STACK))
+                factor = compiler.input(node.inputs[0])
+                params["shader_graph"] = compiler.graph({"mix_fac": factor})
+                compiler.attach_attributes(params)
+        return params
+    try:
+        compiled = compile_leaf(node, writer, textures, tuple(_GROUP_STACK))
+        if compiled is not None:
+            return compiled
+    except UnsupportedNode as exc:
+        _warn(f"shader-graph:{mat_name}:{node.name}",
+              f"{mat_name}: shader graph limitation: {exc}; using legacy material conversion")
+    params = _resolve_shader_legacy(node, writer, textures, mat_name)
+    if node.bl_idname not in {"ShaderNodeMixShader", "ShaderNodeAddShader", "ShaderNodeGroup"}:
+        from .shader_graph import attach, UnsupportedNode
+        try:
+            params = attach(node, params, writer, textures, tuple(_GROUP_STACK))
+        except UnsupportedNode as exc:
+            _warn(f"shader-graph:{mat_name}:{node.name}",
+                  f"{mat_name}: shader graph limitation: {exc}; using legacy material conversion")
+    return params
+
+
+def _resolve_shader_legacy(node, writer, textures, mat_name: str) -> dict:
     """Return Principled-equivalent params for any surface-shader node."""
     bl = node.bl_idname
     if bl == "ShaderNodeBsdfPrincipled":

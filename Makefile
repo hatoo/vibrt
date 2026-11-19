@@ -55,14 +55,18 @@ ADDON_SOURCES := $(wildcard blender/vibrt_blender/*.py)
 
 FORCE:
 
-# Pure-Python unit tests (no Blender / CUDA required). Each test file
+# CPU node-core and Python tests (no Blender / CUDA required). Each Python file
 # runs as a standalone script; we glob the directory so adding a new
 # test_*.py picks it up automatically.
-test: check-layouts
+test: check-layouts test-nodes
 	@for f in blender/vibrt_blender/test_*.py; do \
 		echo "=== $$f ==="; \
 		$(PYTHON) $$f || exit 1; \
 	done
+
+.PHONY: test-nodes
+test-nodes:
+	cargo test -p vibrt-nodes
 
 # Sanity-check that every #[repr(C)] struct in vibrt/src/gpu_types.rs
 # matches its declaration in vibrt/src/devicecode.h field-for-field.

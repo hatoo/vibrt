@@ -2,24 +2,7 @@
 
 #include <optix_types.h>
 
-/// Single node in a material's colour graph. Layout mirrors
-/// `gpu_types::ColorGraphNode` on the Rust side.
-struct ColorGraphNode {
-  unsigned int tag;
-  unsigned int payload[15];
-};
-
-#define COLOR_NODE_CONST 0u
-#define COLOR_NODE_IMAGE_TEX 1u
-#define COLOR_NODE_MIX 2u
-#define COLOR_NODE_INVERT 3u
-#define COLOR_NODE_MATH 4u
-#define COLOR_NODE_HUE_SAT 5u
-#define COLOR_NODE_RGB_CURVE 6u
-#define COLOR_NODE_BRIGHT_CONTRAST 7u
-#define COLOR_NODE_VERTEX_COLOR 8u
-#define COLOR_NODE_OBJECT_RANDOM 9u
-#define COLOR_NODE_COLOR_RAMP 10u
+#include "vibrt_nodes_types.h"
 
 /// Homogeneous volume parameters. Mirrors `gpu_types::VolumeGpu`.
 struct Volume {
@@ -30,6 +13,7 @@ struct Volume {
   float emission[3];
   float anisotropy;
 };
+
 
 struct PrincipledGpu {
   float base_color[3];
@@ -96,6 +80,9 @@ struct PrincipledGpu {
   ColorGraphNode *color_graph_nodes;
   int color_graph_len;
   int color_graph_output;
+  unsigned long long shader_nodes;
+  int shader_len;
+  unsigned int shader_outputs;
   Volume *volume;       // nullptr if the material has no volume
   int volume_only;      // 1 if Surface socket is unlinked (boundary is invisible)
   // 1 = Cycles' ShaderNodeBsdfAnisotropic / Glossy semantics on the
@@ -132,6 +119,7 @@ struct PrincipledGpu {
   // both children non-null ignore their own lobe params.
   PrincipledGpu *left_subtree;
   float mix_fac;
+  int add_shader;
   float *mix_fac_tex;
   int mix_fac_tex_w;
   int mix_fac_tex_h;
@@ -150,7 +138,16 @@ struct HitGroupData {
   PrincipledGpu **materials;
   int num_materials;
   float *vertex_colors; // f32x3 per vertex, nullptr if absent
+  float *vertex_alphas; // f32 per vertex, nullptr means one
   float *tangents;      // f32x3 per vertex (object space), nullptr if absent
+  float bounds_min[3];
+  float bounds_max[3];
+  float object_to_world[12];
+  float world_to_object[12];
+  float object_color[4];
+  unsigned int object_index;
+  unsigned int instance_id;
+  float *light_pdf; // Joint light-selection probability per unit triangle area.
 };
 
 struct PointLight {
@@ -226,6 +223,9 @@ struct AreaRectLight {
 // surfaces (CRT screens, LED panels with patterns, etc.) without
 // collapsing them to a uniform glow.
 struct MeshLightTri {
+  HitGroupData *geometry;
+  unsigned int primitive;
+  unsigned int _pad_geometry;
   float v0[3];
   float _pad0;
   float v1[3];

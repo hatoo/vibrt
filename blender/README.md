@@ -39,7 +39,8 @@ for shipping the source layout.
 
 3. Assign materials using the **Principled BSDF** shader.
 
-4. Optionally set a World background with an **Environment Texture** (HDRI).
+4. Optionally set a World background with an **Environment Texture** (HDRI)
+   or **Sky Texture**.
 
 5. In the Sampling panel, set **Samples** (`vibrt_spp`) and **Clamp Indirect** (`vibrt_clamp_indirect`).
 
@@ -54,24 +55,42 @@ accumulate on the GPU, and Render Result and the sample counter update up to
 samples and keeps the latest preview; optional denoising runs once at the end.
 Scene export, compilation, and GPU setup still finish before sampling starts.
 
-Procedural skies and daylight-portal lighting are prepared separately in a
-background Blender process. Only their world/material inputs are snapshotted,
-including unsaved node edits; the main scene still renders in-process. This
-avoids creating temporary scenes inside F12's render thread. Esc cancels the
-preparation worker as well as the render.
+On Blender 5.1 with the default Linear Rec.709 working space, procedural skies
+are evaluated directly by `vibrt_native`. Preetham, Hosek/Wilkie, single
+scattering and multiple scattering use Blender's atmosphere equations and
+tables. RGB Curves, Hue/Saturation, Gamma, Invert and supported color/shader
+mixes also work, including classroom's daylight-portal sky. Preparation uses
+the current unsaved settings and creates no temporary Blender scenes.
+
+Unsupported node graphs, custom OCIO configurations and other Blender versions
+use an isolated Cycles worker. Only the world/material inputs are snapshotted;
+the worker runs alongside geometry export. Esc cancels the worker and render.
+Set `VIBRT_CYCLES_SKY=1` before launching Blender to force this reference path.
+Building the native extension now also requires a C++17 compiler; bundled
+model sources and license notices are described in
+[`vibrt-nodes/third_party/sky`](../vibrt-nodes/third_party/sky/README.md).
+
+Sky and color/math calculations live in the independent
+[`vibrt-nodes`](../vibrt-nodes/README.md) crate. Python reads Blender nodes and
+tables, while native CPU batches and the CUDA graph interpreter share the
+color implementation. `cargo test -p vibrt-nodes` tests this core without
+Blender or CUDA. The Python binding tests require a staged native extension.
 
 For regression checks, run `make test` with a POSIX shell, then:
 
 ```
+blender -b --factory-startup --python-exit-code 1 --python scripts/test_native_sky.py
 blender -b --factory-startup --python-exit-code 1 --python scripts/test_sky_bake.py
 blender -b --factory-startup --python-exit-code 1 --python scripts/test_progressive_render.py
 blender scene.blend --python scripts/test_render_job.py -- --expect-sky --expect-progress
 ```
 
-The second command tests two asynchronous F12-style renders and exits Blender;
+The last command tests two asynchronous F12-style renders and exits Blender;
 use a separate process. It writes previews under `target/render-job-test/`
 without saving the scene or preferences. Omit `--expect-sky` for scenes without
-procedural sky or portal lighting.
+procedural sky or portal lighting. Add `--expect-native-sky` to assert that a
+supported sky never starts a Cycles worker. The native-sky test compares sky
+models, sun discs, color processing and camera-ray splits against Cycles.
 
 The progressive GPU test checks identical results to a single launch,
 normalization of the first sample, final denoising, snapshot lifetime,
@@ -79,6 +98,13 @@ cancellation, and callback errors. The render-job test inspects actual Blender
 passes while F12 is still running.
 
 ## Supported features
+
+The [shader node support matrix](../docs/shader-nodes.md) inventories all 99
+Blender 5.1.1 node types, including partial, legacy and unsupported paths.
+The general graph evaluates linked material parameters, procedural/image
+textures, color/vector math and Mix/Add shaders on the GPU. It is limited to
+256 value nodes per graph, 16 closure leaves and 8 shader-tree levels.
+Cycles-compatible node math does not imply identical BSDF or volume models.
 
 ### Scene synchronization
 
