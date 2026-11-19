@@ -162,6 +162,15 @@ pub fn load_scene_from_bytes<'a>(
 ) -> Result<LoadedScene<'a>> {
     let file: SceneFile = serde_json::from_str(json_text).context("parsing scene.json")?;
 
+    load_scene(file, mesh_blobs, texture_arrays)
+}
+
+/// Load an already-deserialized scene, including the live Python dict path.
+pub fn load_scene<'a>(
+    file: SceneFile,
+    mesh_blobs: &[&'a [u8]],
+    texture_arrays: &[&'a [f32]],
+) -> Result<LoadedScene<'a>> {
     if file.version != 1 {
         return Err(anyhow!("unsupported scene.json version: {}", file.version));
     }
@@ -185,9 +194,9 @@ pub fn load_scene_from_bytes<'a>(
     for (mi, mdesc) in file.meshes.iter().enumerate() {
         if let (Some(tex_id), s) = (mdesc.displacement_tex, mdesc.displacement_strength) {
             if s != 0.0 {
-                let tex = textures.get(tex_id as usize).ok_or_else(|| {
-                    anyhow!("mesh {} displacement_tex index out of range", mi)
-                })?;
+                let tex = textures
+                    .get(tex_id as usize)
+                    .ok_or_else(|| anyhow!("mesh {} displacement_tex index out of range", mi))?;
                 let m = &mut meshes[mi];
                 if m.uvs.is_empty() {
                     eprintln!(
@@ -276,8 +285,7 @@ pub fn load_scene_from_bytes<'a>(
                 // flux-preservation path.
                 let coeff = match ies {
                     Some(p) if p.peak_absolute_candela > 1e-6 => {
-                        power * p.peak_absolute_candela
-                            / (4.0 * std::f32::consts::PI)
+                        power * p.peak_absolute_candela / (4.0 * std::f32::consts::PI)
                     }
                     Some(p) if p.integral_norm > 1e-6 => power / p.integral_norm,
                     _ => power / (4.0 * std::f32::consts::PI),
@@ -355,8 +363,7 @@ pub fn load_scene_from_bytes<'a>(
                         // `coeff = power × peak_absolute_candela / (4π)`.
                         // (Previously divided by π, a 4× over-delivery that
                         // made ies_light's spot ~2.4× too bright.)
-                        power * p.peak_absolute_candela
-                            / (4.0 * std::f32::consts::PI)
+                        power * p.peak_absolute_candela / (4.0 * std::f32::consts::PI)
                     }
                     Some(p) if p.integral_norm > 1e-6 => power / p.integral_norm,
                     _ => power / (4.0 * std::f32::consts::PI),
@@ -366,9 +373,7 @@ pub fn load_scene_from_bytes<'a>(
                 // 3×3 rotation part of `t4`. The IES table is sampled
                 // in this frame with theta from local -Z (the cone axis).
                 let light_rotation = [
-                    t4[0], t4[1], t4[2],
-                    t4[4], t4[5], t4[6],
-                    t4[8], t4[9], t4[10],
+                    t4[0], t4[1], t4[2], t4[4], t4[5], t4[6], t4[8], t4[9], t4[10],
                 ];
                 spot_lights.push(SpotLight {
                     position,
@@ -426,8 +431,7 @@ pub fn load_scene_from_bytes<'a>(
                 // a future scene needing a separate Cycles-parity fix.
                 let coeff = match ies {
                     Some(p) if p.peak_absolute_candela > 1e-6 => {
-                        power * p.peak_absolute_candela
-                            / (area * std::f32::consts::PI)
+                        power * p.peak_absolute_candela / (area * std::f32::consts::PI)
                     }
                     _ => power / (area * std::f32::consts::PI),
                 };
@@ -436,9 +440,7 @@ pub fn load_scene_from_bytes<'a>(
                 // part of `t4`. The IES table is sampled with theta from
                 // local +Z (the rect emission direction).
                 let light_rotation = [
-                    t4[0], t4[1], t4[2],
-                    t4[4], t4[5], t4[6],
-                    t4[8], t4[9], t4[10],
+                    t4[0], t4[1], t4[2], t4[4], t4[5], t4[6], t4[8], t4[9], t4[10],
                 ];
                 rect_lights.push(AreaRectLight {
                     corner,
@@ -477,9 +479,7 @@ pub fn load_scene_from_bytes<'a>(
     };
 
     let (envmap_rgb, envmap_layer_a_rgb, envmap_layer_b_rgb) = match &file.world {
-        Some(WorldDesc::Envmap { texture, .. }) => {
-            (Some(extract_rgb(*texture)?), None, None)
-        }
+        Some(WorldDesc::Envmap { texture, .. }) => (Some(extract_rgb(*texture)?), None, None),
         Some(WorldDesc::Mixed {
             a,
             b,
@@ -498,11 +498,19 @@ pub fn load_scene_from_bytes<'a>(
                 // camera-ray direct lookup in `world_background`.
                 let identity = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
                 build_mixed_envmap_grid(
-                    &layer_a, &a.rotation, a.strength,
-                    &a.projection, &a.extension,
-                    &layer_a, &identity, 0.0,
-                    &a.projection, &a.extension,
-                    0.0, 2048, 1024,
+                    &layer_a,
+                    &a.rotation,
+                    a.strength,
+                    &a.projection,
+                    &a.extension,
+                    &layer_a,
+                    &identity,
+                    0.0,
+                    &a.projection,
+                    &a.extension,
+                    0.0,
+                    2048,
+                    1024,
                 )
             } else {
                 // Host-rasterise a "mixed grid" by sampling each layer at
@@ -521,11 +529,19 @@ pub fn load_scene_from_bytes<'a>(
                 // can drive this safely; the per-layer cap stays the
                 // input image's native resolution.
                 build_mixed_envmap_grid(
-                    &layer_a, &a.rotation, a.strength,
-                    &a.projection, &a.extension,
-                    &layer_b, &b.rotation, b.strength,
-                    &b.projection, &b.extension,
-                    *fac, 2048, 1024,
+                    &layer_a,
+                    &a.rotation,
+                    a.strength,
+                    &a.projection,
+                    &a.extension,
+                    &layer_b,
+                    &b.rotation,
+                    b.strength,
+                    &b.projection,
+                    &b.extension,
+                    *fac,
+                    2048,
+                    1024,
                 )
             };
             (Some(mixed), Some(layer_a), Some(layer_b))
@@ -759,7 +775,12 @@ fn parse_extension(s: &str) -> LayerExtension {
 /// continuous texture space (0..1 covers the whole image; values
 /// outside that range are handled per `extension`).
 fn bilinear_fetch(
-    rgb: &[f32], w: u32, h: u32, u: f32, v: f32, extension: LayerExtension,
+    rgb: &[f32],
+    w: u32,
+    h: u32,
+    u: f32,
+    v: f32,
+    extension: LayerExtension,
 ) -> [f32; 3] {
     if let LayerExtension::Clip = extension {
         if !(0.0..=1.0).contains(&u) || !(0.0..=1.0).contains(&v) {
@@ -775,20 +796,21 @@ fn bilinear_fetch(
     let wrap_repeat = |i: i32, m: u32| -> u32 {
         let m_ = m as i32;
         let r = i % m_;
-        if r < 0 { (r + m_) as u32 } else { r as u32 }
+        if r < 0 {
+            (r + m_) as u32
+        } else {
+            r as u32
+        }
     };
-    let clamp_edge = |i: i32, m: u32| -> u32 {
-        i.max(0).min(m as i32 - 1) as u32
+    let clamp_edge = |i: i32, m: u32| -> u32 { i.max(0).min(m as i32 - 1) as u32 };
+    let (xfn, yfn): (Box<dyn Fn(i32, u32) -> u32>, Box<dyn Fn(i32, u32) -> u32>) = match extension {
+        LayerExtension::Repeat => (Box::new(wrap_repeat), Box::new(wrap_repeat)),
+        // For Extend and Clip we clamp; Clip already returned early
+        // for fully out-of-range UVs, but the bilinear taps near
+        // the edge still need a defined fetch — clamping there
+        // matches Cycles' behaviour.
+        _ => (Box::new(clamp_edge), Box::new(clamp_edge)),
     };
-    let (xfn, yfn): (Box<dyn Fn(i32, u32) -> u32>, Box<dyn Fn(i32, u32) -> u32>) =
-        match extension {
-            LayerExtension::Repeat => (Box::new(wrap_repeat), Box::new(wrap_repeat)),
-            // For Extend and Clip we clamp; Clip already returned early
-            // for fully out-of-range UVs, but the bilinear taps near
-            // the edge still need a defined fetch — clamping there
-            // matches Cycles' behaviour.
-            _ => (Box::new(clamp_edge), Box::new(clamp_edge)),
-        };
     let x0u = xfn(x0, w);
     let x1u = xfn(x0 + 1, w);
     let y0u = yfn(y0, h);
@@ -802,9 +824,11 @@ fn bilinear_fetch(
     let c01 = fetch(x0u, y1u);
     let c11 = fetch(x1u, y1u);
     let lerp = |a: [f32; 3], b: [f32; 3], t: f32| {
-        [a[0] + (b[0] - a[0]) * t,
-         a[1] + (b[1] - a[1]) * t,
-         a[2] + (b[2] - a[2]) * t]
+        [
+            a[0] + (b[0] - a[0]) * t,
+            a[1] + (b[1] - a[1]) * t,
+            a[2] + (b[2] - a[2]) * t,
+        ]
     };
     let c0 = lerp(c00, c10, dx);
     let c1 = lerp(c01, c11, dx);
@@ -818,8 +842,13 @@ fn bilinear_fetch(
 /// usual u-wrap, v-clamp; Flat projection honours the requested
 /// extension mode in both axes.
 fn sample_layer_at_dir(
-    rgb: &[f32], w: u32, h: u32, rotation: &[f32; 9], dir: [f32; 3],
-    projection: LayerProjection, extension: LayerExtension,
+    rgb: &[f32],
+    w: u32,
+    h: u32,
+    rotation: &[f32; 9],
+    dir: [f32; 3],
+    projection: LayerProjection,
+    extension: LayerExtension,
 ) -> [f32; 3] {
     let r = rotation;
     let dr = [
@@ -847,7 +876,11 @@ fn sample_layer_at_dir(
             let wrap = |v: i32, m: u32| -> u32 {
                 let m_ = m as i32;
                 let r = v % m_;
-                if r < 0 { (r + m_) as u32 } else { r as u32 }
+                if r < 0 {
+                    (r + m_) as u32
+                } else {
+                    r as u32
+                }
             };
             let x1 = wrap(x0 + 1, w);
             let x0u = wrap(x0, w);
@@ -862,9 +895,11 @@ fn sample_layer_at_dir(
             let c01 = fetch(x0u, y1u);
             let c11 = fetch(x1, y1u);
             let lerp = |a: [f32; 3], b: [f32; 3], t: f32| {
-                [a[0] + (b[0] - a[0]) * t,
-                 a[1] + (b[1] - a[1]) * t,
-                 a[2] + (b[2] - a[2]) * t]
+                [
+                    a[0] + (b[0] - a[0]) * t,
+                    a[1] + (b[1] - a[1]) * t,
+                    a[2] + (b[2] - a[2]) * t,
+                ]
             };
             let c0 = lerp(c00, c10, dx);
             let c1 = lerp(c01, c11, dx);
@@ -884,11 +919,19 @@ fn sample_layer_at_dir(
 /// given target resolution. Used to drive the importance-sampling CDF
 /// for `WorldDesc::Mixed` worlds and read directly by the kernel.
 fn build_mixed_envmap_grid(
-    layer_a: &(Vec<f32>, u32, u32), rot_a: &[f32; 9], strength_a: f32,
-    proj_a: &str, ext_a: &str,
-    layer_b: &(Vec<f32>, u32, u32), rot_b: &[f32; 9], strength_b: f32,
-    proj_b: &str, ext_b: &str,
-    fac: f32, target_w: u32, target_h: u32,
+    layer_a: &(Vec<f32>, u32, u32),
+    rot_a: &[f32; 9],
+    strength_a: f32,
+    proj_a: &str,
+    ext_a: &str,
+    layer_b: &(Vec<f32>, u32, u32),
+    rot_b: &[f32; 9],
+    strength_b: f32,
+    proj_b: &str,
+    ext_b: &str,
+    fac: f32,
+    target_w: u32,
+    target_h: u32,
 ) -> (Vec<f32>, u32, u32) {
     use rayon::prelude::*;
     let pi = std::f32::consts::PI;
@@ -917,12 +960,9 @@ fn build_mixed_envmap_grid(
                 let b = sample_layer_at_dir(b_rgb, *b_w, *b_h, rot_b, dir, pb, eb);
                 let i = (x * 3) as usize;
                 let one_minus_fac = 1.0 - fac;
-                row[i] = a[0] * strength_a * one_minus_fac
-                       + b[0] * strength_b * fac;
-                row[i + 1] = a[1] * strength_a * one_minus_fac
-                           + b[1] * strength_b * fac;
-                row[i + 2] = a[2] * strength_a * one_minus_fac
-                           + b[2] * strength_b * fac;
+                row[i] = a[0] * strength_a * one_minus_fac + b[0] * strength_b * fac;
+                row[i + 1] = a[1] * strength_a * one_minus_fac + b[1] * strength_b * fac;
+                row[i + 2] = a[2] * strength_a * one_minus_fac + b[2] * strength_b * fac;
             }
         });
     (grid, target_w, target_h)
@@ -1091,10 +1131,7 @@ fn load_mesh<'a>(desc: &MeshDesc, blobs: &[&'a [u8]]) -> Result<LoadedMesh<'a>> 
     })
 }
 
-fn load_texture<'a>(
-    desc: &TextureDesc,
-    texture_arrays: &[&'a [f32]],
-) -> Result<LoadedTexture<'a>> {
+fn load_texture<'a>(desc: &TextureDesc, texture_arrays: &[&'a [f32]]) -> Result<LoadedTexture<'a>> {
     // Texture pixels always travel as a caller-owned f32 slice (parked in
     // a `Vec<PyBuffer<f32>>` on the Python side). `array_index` picks the
     // right one — pixel data was removed from the bin.

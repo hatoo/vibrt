@@ -17,7 +17,13 @@ pub mod scene_loader;
 pub mod transform;
 
 #[cfg(feature = "python")]
+mod blender_mesh;
+#[cfg(feature = "python")]
 mod python;
+#[cfg(feature = "python")]
+mod python_pixels;
+#[cfg(feature = "python")]
+mod python_scene;
 
 pub use render::{render_to_pixels, Progress, RenderOptions, RenderOutput, StdoutProgress};
 pub use scene_loader::{load_scene_from_bytes, LoadedScene};

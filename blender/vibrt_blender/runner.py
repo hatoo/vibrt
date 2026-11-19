@@ -22,15 +22,14 @@ def find_native_module():
 
 
 def run_render_inproc(
-    scene_json: str,
+    scene_json: str | dict,
     mesh_blobs,
     report,
     is_break,
     denoise: bool = False,
     texture_arrays=None,
 ):
-    """Render `(scene.json, mesh_blobs, texture_arrays)` in-process via
-    `vibrt_native`.
+    """Render a live scene dict (or legacy JSON) and borrowed pixel/mesh buffers.
 
     Returns a `(pixels, depth)` tuple where `pixels` is a
     `(height, width, 4)` float32 ndarray (linear RGBA, top-left origin)

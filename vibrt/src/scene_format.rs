@@ -621,7 +621,9 @@ pub struct ObjectDesc {
     pub camera_visible: bool,
 }
 
-fn default_true() -> bool { true }
+fn default_true() -> bool {
+    true
+}
 
 /// One entry per emissive mesh registered for NEE. The loader looks up
 /// `objects[object_idx]` to find the mesh + materials + transform; any

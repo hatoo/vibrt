@@ -13,6 +13,8 @@ import time
 
 import bpy
 
+from . import native_scene
+
 
 _LOGGED_WARNINGS: set = set()
 _CURRENT_MATERIAL: str = ""
@@ -398,6 +400,9 @@ def _resample_bilinear(rgb, target_h: int, target_w: int):
     h, w, _ = rgb.shape
     if h == target_h and w == target_w:
         return rgb
+    native = native_scene.accelerator()
+    if native is not None and rgb.dtype == np.float32:
+        return native.resample_bilinear(np.ascontiguousarray(rgb), target_h, target_w)
     # X pass: interpolate columns, shape (h, target_w, c).
     xs = np.linspace(0.0, w - 1, target_w, dtype=np.float32)
     x0 = np.floor(xs).astype(np.int32)
@@ -428,6 +433,9 @@ def _srgb_to_linear_np(x):
     """
     import numpy as np
     xf = x if x.dtype == np.float32 else x.astype(np.float32)
+    native = native_scene.accelerator()
+    if native is not None:
+        return native.srgb_to_linear(np.ascontiguousarray(xf))
     lin = xf * np.float32(1.0 / 12.92)
     gamma = np.power(
         (xf + np.float32(0.055)) * np.float32(1.0 / 1.055),

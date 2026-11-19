@@ -1,9 +1,10 @@
 //! PyO3 bindings — gated by the `python` Cargo feature.
 //!
-//! Exposes a single `render(scene_json, mesh_blobs, opts, log_cb=None,
-//! cancel_cb=None, texture_arrays=None) -> ndarray` function that the
-//! Blender addon calls. Scene data crosses the FFI boundary as a `&str`
-//! plus two lists of buffer-protocol-pinned numpy arrays (mesh blobs as
+//! Exposes `render(scene_json, mesh_blobs, opts, log_cb=None,
+//! cancel_cb=None, texture_arrays=None)` plus native scene-sync helpers.
+//! The scene description is read directly from a Python dict; the legacy
+//! JSON string is also accepted. Two buffer-protocol-pinned array lists
+//! carry the large payloads (mesh blobs as
 //! bytes, texture pixels as f32) — never copied; Rust borrows for the
 //! duration of the call.
 //!
@@ -11,15 +12,13 @@
 //! is released for the entire render. Progress callbacks reacquire the GIL
 //! briefly via `Python::with_gil`.
 
-use crate::{
-    load_scene_from_bytes, render::RenderOutput, render_to_pixels, Progress, RenderOptions,
-};
+use crate::{render::RenderOutput, render_to_pixels, Progress, RenderOptions};
 use numpy::ndarray::Array;
 use numpy::{IntoPyArray, PyArray2, PyArray3};
 use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::{PyKeyboardInterrupt, PyRuntimeError};
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyDict, PyString};
 
 /// `Progress` impl backed by Python callables. Logs go through `log_cb`
 /// (called as `log_cb(msg: str)`) and cancellation polls `cancel_cb` (called
@@ -115,7 +114,7 @@ fn parse_options(opts: &Bound<'_, PyDict>) -> PyResult<RenderOptions> {
 ))]
 fn render<'py>(
     py: Python<'py>,
-    scene_json: &str,
+    scene_json: &Bound<'py, PyAny>,
     mesh_blobs: Vec<PyBuffer<u8>>,
     opts: &Bound<'py, PyDict>,
     log_cb: Option<PyObject>,
@@ -123,6 +122,14 @@ fn render<'py>(
     texture_arrays: Option<Vec<PyBuffer<f32>>>,
 ) -> PyResult<(Bound<'py, PyArray3<f32>>, Bound<'py, PyArray2<f32>>)> {
     let ro = parse_options(opts)?;
+    let t_scene = std::time::Instant::now();
+    let file = if let Ok(text) = scene_json.downcast::<PyString>() {
+        serde_json::from_str(text.to_str()?)
+            .map_err(|e| PyRuntimeError::new_err(format!("scene JSON: {e}")))?
+    } else {
+        crate::python_scene::from_python(scene_json)?
+    };
+    let description_time = t_scene.elapsed();
     let mut progress = PyProgress {
         log_cb,
         cancel_cb,
@@ -165,8 +172,12 @@ fn render<'py>(
     // deadlock against the Python interpreter.
     let render_result: anyhow::Result<RenderOutput> = py.allow_threads(|| {
         let t_load = std::time::Instant::now();
-        let scene = load_scene_from_bytes(scene_json, &blob_slices, &tex_slices)?;
-        progress.log(&format!("Scene load: {:.2?}", t_load.elapsed()));
+        let scene = crate::scene_loader::load_scene(file, &blob_slices, &tex_slices)?;
+        progress.log(&format!(
+            "Scene description: {:.2?}; Scene load: {:.2?}",
+            description_time,
+            t_load.elapsed()
+        ));
         render_to_pixels(&scene, &ro, &mut progress)
     });
 
@@ -179,17 +190,21 @@ fn render<'py>(
     let out = render_result.map_err(|e| PyRuntimeError::new_err(format!("vibrt: {e:#}")))?;
     let h = out.height as usize;
     let w = out.width as usize;
-    let arr = Array::from_shape_vec((h, w, 4), out.pixels).map_err(|e| {
-        PyRuntimeError::new_err(format!("pixel buffer reshape failed: {e}"))
-    })?;
-    let depth = Array::from_shape_vec((h, w), out.depth).map_err(|e| {
-        PyRuntimeError::new_err(format!("depth buffer reshape failed: {e}"))
-    })?;
+    let arr = Array::from_shape_vec((h, w, 4), out.pixels)
+        .map_err(|e| PyRuntimeError::new_err(format!("pixel buffer reshape failed: {e}")))?;
+    let depth = Array::from_shape_vec((h, w), out.depth)
+        .map_err(|e| PyRuntimeError::new_err(format!("depth buffer reshape failed: {e}")))?;
     Ok((arr.into_pyarray_bound(py), depth.into_pyarray_bound(py)))
 }
 
 #[pymodule]
 fn vibrt_native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(render, m)?)?;
+    m.add_function(wrap_pyfunction!(crate::blender_mesh::read_mesh, m)?)?;
+    m.add_function(wrap_pyfunction!(crate::python_pixels::srgb_to_linear, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        crate::python_pixels::resample_bilinear,
+        m
+    )?)?;
     Ok(())
 }

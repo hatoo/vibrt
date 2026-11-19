@@ -157,7 +157,9 @@ fn upload_ies_buffers<L: HasIes>(
 ) -> Result<Vec<optix_sys::CUdeviceptr>> {
     let mut out = Vec::new();
     for (i, profile) in profiles.iter().enumerate() {
-        let Some(p) = profile else { continue; };
+        let Some(p) = profile else {
+            continue;
+        };
         let n_v = p.thetas_deg.len();
         let n_h = p.phis_deg.len().max(1);
         if n_v == 0 || p.candelas.len() != n_v * p.phis_deg.len() {
@@ -411,7 +413,12 @@ pub fn render_to_pixels(
             None => 0,
         };
         let gpu = principled::make_material_data(
-            mat, tex_slots, graph, volume_ptr, secondary_ptr, left_subtree_ptr,
+            mat,
+            tex_slots,
+            graph,
+            volume_ptr,
+            secondary_ptr,
+            left_subtree_ptr,
         );
         Ok(alloc_and_copy(stream, &gpu)?)
     }
@@ -622,10 +629,7 @@ pub fn render_to_pixels(
             // isn't registered for mesh-light NEE. The closest-hit shader
             // checks `>= 0` to enable MIS-weighting of BSDF-sampled
             // emission against the NEE sampler.
-            area_light_group: object_to_mesh_light
-                .get(obj_idx)
-                .copied()
-                .unwrap_or(-1),
+            area_light_group: object_to_mesh_light.get(obj_idx).copied().unwrap_or(-1),
             material_indices: m.d_mat_indices,
             materials: materials_ptr,
             num_materials,
@@ -856,17 +860,13 @@ pub fn render_to_pixels(
             (0, 0, 0, 0, 0, 0.0)
         };
     // Mixed-envmap layers (uploaded only when WorldDesc::Mixed).
-    let (d_envmap_a, env_w_a, env_h_a) = if let Some((rgb, w, h)) =
-        &scene.envmap_layer_a_rgb
-    {
+    let (d_envmap_a, env_w_a, env_h_a) = if let Some((rgb, w, h)) = &scene.envmap_layer_a_rgb {
         let d = alloc_and_copy_slice(&stream, rgb)?;
         (d, *w as i32, *h as i32)
     } else {
         (0, 0, 0)
     };
-    let (d_envmap_b, env_w_b, env_h_b) = if let Some((rgb, w, h)) =
-        &scene.envmap_layer_b_rgb
-    {
+    let (d_envmap_b, env_w_b, env_h_b) = if let Some((rgb, w, h)) = &scene.envmap_layer_b_rgb {
         let d = alloc_and_copy_slice(&stream, rgb)?;
         (d, *w as i32, *h as i32)
     } else {
@@ -1023,8 +1023,7 @@ pub fn render_to_pixels(
     // sample — clip_start was set inside an unusually deep stack of
     // hidden geometry, and the affected pixels fell back to shading the
     // last back-face we hit. Emit one warn line so this isn't silent.
-    let back_face_warn: Vec<u32> =
-        stream.clone_dtoh(&d_back_face_warn).cuda()?;
+    let back_face_warn: Vec<u32> = stream.clone_dtoh(&d_back_face_warn).cuda()?;
     if let Some(&n) = back_face_warn.first() {
         if n > 0 {
             let spp = render_settings.spp.max(1) as f64;

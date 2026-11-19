@@ -68,6 +68,38 @@ procedural sky or portal lighting.
 
 ## Supported features
 
+### Scene synchronization
+
+Blender 5.1 uses a native mesh reader modeled on Cycles' synchronization:
+Rust reads Blender's evaluated position, corner, triangle, normal, UV, and
+float-color arrays in place, then writes the final renderer buffers once.
+RNA collection pointers locate these primitive arrays; no hardcoded C++
+`Mesh` offsets or custom Blender build are required. Byte colors still use
+Blender's color-managed getter. All references are consumed synchronously
+before `to_mesh_clear()`; only owned renderer arrays survive the call.
+
+The scene description crosses PyO3 as a live dictionary, without JSON
+encoding/decoding. Rust also processes color conversion and bilinear resizing
+on borrowed image arrays. Material graph translation and image pixel retrieval
+still use Blender's Python API; this is not a complete port of Cycles' shader
+synchronization. GPU uploads remain necessary.
+
+Direct mesh reads are enabled only for Blender 5.1, whose RNA layouts are
+verified against Blender's source. Other versions use `foreach_get`.
+Set `VIBRT_PYTHON_EXPORT=1` before launching Blender to compare the original
+mesh/pixel/JSON path. The default uses native synchronization.
+
+```
+blender -b --factory-startup --python-exit-code 1 --python scripts/test_native_scene.py
+blender -b scene.blend --python-exit-code 1 --python scripts/test_native_scene.py -- --scene
+```
+
+These check exact geometry/normal/UV/color parity, evaluated-mesh lifetime,
+pixel-operation accuracy, and scene schema errors. Run the asynchronous
+render-job check above after modifying the memory reader.
+
+### Rendering
+
 - Camera: perspective only (no DoF yet).
 - Meshes: triangulated, per-corner normals and UVs, multi-material slots (per-triangle material index).
 - Materials: Principled BSDF — base color, metallic, roughness, IOR, transmission, emission, anisotropy (+ rotation), coat (weight / roughness / IOR), sheen (weight / roughness / tint), subsurface (weight / radius / anisotropy), alpha cutout, normal map (with strength), bump, displacement. Image textures on base color / normal / roughness / metallic. Colour- and scalar-math node chains between TexImage and the BSDF are traversed; the effect of RGBCurve, Gamma, BrightContrast, Invert, HueSaturation, ColorRamp, Clamp and Mix/MixRGB (MIX / MULTIPLY / ADD / SUBTRACT, when the non-texture side is constant) is baked into the exported texture pixels. Other node effects are approximated by pass-through.

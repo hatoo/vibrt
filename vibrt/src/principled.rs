@@ -117,9 +117,8 @@ pub fn upload_color_graph(
     // compile-time size/align asserts in `gpu_types.rs`), so reinterpreting
     // the buffer as `&[u32]` is sound and lets us reuse the existing
     // CudaSlice<u32> storage in `bufs`.
-    let flat_u32: &[u32] = unsafe {
-        std::slice::from_raw_parts(flat.as_ptr() as *const u32, flat.len() * 16)
-    };
+    let flat_u32: &[u32] =
+        unsafe { std::slice::from_raw_parts(flat.as_ptr() as *const u32, flat.len() * 16) };
     let slice = stream.clone_htod(flat_u32).cuda()?;
     let ptr = dptr_u32(&slice, stream);
     bufs.push(slice);
@@ -189,9 +188,9 @@ fn flatten_one(
             p[2] = rgb[2].to_bits();
         }
         ColorNode::ImageTex { tex, uv } => {
-            let (ptr, w, h) = *textures.get(*tex as usize).ok_or_else(|| {
-                anyhow!("color_graph ImageTex.tex = {} out of range", tex)
-            })?;
+            let (ptr, w, h) = *textures
+                .get(*tex as usize)
+                .ok_or_else(|| anyhow!("color_graph ImageTex.tex = {} out of range", tex))?;
             out.tag = COLOR_NODE_IMAGE_TEX;
             p[0] = ptr as u32;
             p[1] = (ptr >> 32) as u32;

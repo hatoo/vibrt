@@ -14,7 +14,7 @@ import time
 
 import bpy
 
-from . import _log, exporter, runner, sky_bake
+from . import _log, exporter, runner, sky_bake, native_scene
 
 
 class VibrtRenderEngine(bpy.types.RenderEngine):
@@ -151,8 +151,10 @@ class VibrtRenderEngine(bpy.types.RenderEngine):
             self.update_stats("vibrt", "Exporting scene...")
             self.report({"INFO"}, f"vibrt: rendering {width}x{height} in-process")
             t_export = time.perf_counter()
-            json_str, mesh_blobs, texture_arrays = (
-                exporter.export_scene_to_memory(depsgraph)
+            scene_data, mesh_blobs, texture_arrays = (
+                exporter.export_scene_to_memory(
+                    depsgraph, serialize=native_scene.accelerator() is None,
+                )
             )
             n_blobs = len(mesh_blobs)
             n_arrays = len(texture_arrays)
@@ -168,7 +170,7 @@ class VibrtRenderEngine(bpy.types.RenderEngine):
             self.update_stats("vibrt", "Rendering...")
             t_render = time.perf_counter()
             pixels, depth = runner.run_render_inproc(
-                json_str,
+                scene_data,
                 mesh_blobs,
                 self.report,
                 self.test_break,

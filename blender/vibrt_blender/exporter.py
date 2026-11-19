@@ -19,7 +19,7 @@ import time
 
 import bpy
 
-from . import _log, hair_export, ies, material_export
+from . import _log, hair_export, ies, material_export, native_scene
 from ._log import log as _emit
 
 
@@ -395,16 +395,13 @@ def _export_mesh(
     Returns a dict suitable for a `MeshDesc` — always includes `material_indices`
     when there's more than one slot, otherwise the entry is omitted.
 
-    Vertex / normal / UV / index arrays are built through `foreach_get` into
-    numpy buffers. A Python-level per-triangle loop was the dominant export
-    cost on non-trivial meshes (seconds per 100k-tri object vs milliseconds).
+    On Blender 5.1, Rust reads the evaluated mesh's primitive spans directly
+    and packs renderer arrays once. Other versions use the public bulk API.
 
     If `vc_attr_name` is given and the mesh has a matching colour attribute,
     emits f32x3 per emitted vertex so the renderer can interpolate it against
     a material with `use_vertex_color=True`.
     """
-    import numpy as np
-
     mesh = obj_eval.to_mesh()
     try:
         mesh.calc_loop_triangles()
@@ -422,60 +419,15 @@ def _export_mesh(
                     f"calc_normals_split failed ({exc}) — using existing split normals"
                 )
         num_slots = len(obj_eval.material_slots)
-
-        tri_vert_idx = np.empty(ntri * 3, dtype=np.int32)
-        mesh.loop_triangles.foreach_get("vertices", tri_vert_idx)
-        tri_loop_idx = np.empty(ntri * 3, dtype=np.int32)
-        mesh.loop_triangles.foreach_get("loops", tri_loop_idx)
-        split_normals = np.empty(ntri * 9, dtype=np.float32)
-        mesh.loop_triangles.foreach_get("split_normals", split_normals)
-
-        nverts = len(mesh.vertices)
-        vcos = np.empty(nverts * 3, dtype=np.float32)
-        mesh.vertices.foreach_get("co", vcos)
-        vcos = vcos.reshape(-1, 3)
-        positions = np.ascontiguousarray(vcos[tri_vert_idx].reshape(-1))
-
-        uv_layer = mesh.uv_layers.active
-        if uv_layer is not None:
-            nloops = len(mesh.loops)
-            uv_all = np.empty(nloops * 2, dtype=np.float32)
-            uv_layer.data.foreach_get("uv", uv_all)
-            uv_all = uv_all.reshape(-1, 2)
-            uvs = np.ascontiguousarray(uv_all[tri_loop_idx].reshape(-1))
-        else:
-            uvs = None
-
-        indices = np.arange(ntri * 3, dtype=np.uint32)
-
-        desc = {
-            "vertices": writer.write_f32(positions),
-            "normals": writer.write_f32(split_normals),
-            "uvs": writer.write_f32(uvs) if uvs is not None else None,
-            "indices": writer.write_u32(indices),
-        }
-        if num_slots > 1:
-            tri_mat_idx = np.empty(ntri, dtype=np.int32)
-            mesh.loop_triangles.foreach_get("material_index", tri_mat_idx)
-            desc["material_indices"] = writer.write_u32(tri_mat_idx)
-        if vc_attr_name:
-            color_attrs = getattr(mesh, "color_attributes", None) or []
-            target = next((ca for ca in color_attrs if ca.name == vc_attr_name), None)
-            if target is not None:
-                n = len(target.data)
-                rgba = np.empty(n * 4, dtype=np.float32)
-                target.data.foreach_get("color", rgba)
-                rgba = rgba.reshape(n, 4)[:, :3]
-                if target.domain == "CORNER":
-                    per_corner = rgba[tri_loop_idx]
-                elif target.domain == "POINT":
-                    per_corner = rgba[tri_vert_idx]
-                else:
-                    per_corner = None
-                if per_corner is not None:
-                    desc["vertex_colors"] = writer.write_f32(
-                        np.ascontiguousarray(per_corner.reshape(-1))
-                    )
+        native = native_scene.accelerator()
+        arrays = native.read_mesh(mesh, num_slots, vc_attr_name) if native else None
+        if arrays is None:
+            arrays = _mesh_arrays_python(mesh, num_slots, vc_attr_name)
+        desc = {}
+        for name, values in arrays.items():
+            write = writer.write_u32 if name in {"indices", "material_indices"} else writer.write_f32
+            desc[name] = write(values)
+        desc.setdefault("uvs", None)
         disp_tex, disp_strength = _find_displacement(obj_eval, writer, textures)
         if disp_tex is not None and disp_strength != 0.0:
             desc["displacement_tex"] = disp_tex
@@ -483,6 +435,44 @@ def _export_mesh(
         return desc
     finally:
         obj_eval.to_mesh_clear()
+
+
+def _mesh_arrays_python(mesh, num_slots, vc_attr_name=None):
+    """Public-API fallback and reference implementation for native sync tests."""
+    import numpy as np
+
+    ntri = len(mesh.loop_triangles)
+    tri_vert_idx = np.empty(ntri * 3, dtype=np.int32)
+    mesh.loop_triangles.foreach_get("vertices", tri_vert_idx)
+    tri_loop_idx = np.empty(ntri * 3, dtype=np.int32)
+    mesh.loop_triangles.foreach_get("loops", tri_loop_idx)
+    split_normals = np.empty(ntri * 9, dtype=np.float32)
+    mesh.loop_triangles.foreach_get("split_normals", split_normals)
+    vcos = np.empty(len(mesh.vertices) * 3, dtype=np.float32)
+    mesh.vertices.foreach_get("co", vcos)
+    arrays = {
+        "vertices": np.ascontiguousarray(vcos.reshape(-1, 3)[tri_vert_idx].reshape(-1)),
+        "normals": split_normals,
+        "indices": np.arange(ntri * 3, dtype=np.uint32),
+    }
+    uv_layer = mesh.uv_layers.active
+    if uv_layer is not None:
+        uv_all = np.empty(len(mesh.loops) * 2, dtype=np.float32)
+        uv_layer.data.foreach_get("uv", uv_all)
+        arrays["uvs"] = np.ascontiguousarray(uv_all.reshape(-1, 2)[tri_loop_idx].reshape(-1))
+    if num_slots > 1:
+        tri_mat_idx = np.empty(ntri, dtype=np.int32)
+        mesh.loop_triangles.foreach_get("material_index", tri_mat_idx)
+        arrays["material_indices"] = tri_mat_idx.astype(np.uint32)
+    if vc_attr_name:
+        color_attrs = getattr(mesh, "color_attributes", None) or []
+        target = next((ca for ca in color_attrs if ca.name == vc_attr_name), None)
+        if target is not None and target.domain in {"CORNER", "POINT"}:
+            rgba = np.empty(len(target.data) * 4, dtype=np.float32)
+            target.data.foreach_get("color", rgba)
+            indices = tri_loop_idx if target.domain == "CORNER" else tri_vert_idx
+            arrays["vertex_colors"] = np.ascontiguousarray(rgba.reshape(-1, 4)[indices, :3].reshape(-1))
+    return arrays
 
 
 def _export_camera(scene, cam_obj, aspect: float) -> dict:
@@ -2765,11 +2755,15 @@ def _export_world_volume(world) -> dict | None:
 def export_scene_to_memory(
     depsgraph: bpy.types.Depsgraph,
     texture_pct: int | None = None,
-) -> tuple[str, list, list]:
+    *,
+    serialize: bool = True,
+) -> tuple[str | dict, list, list]:
     """Build (scene.json, mesh_blobs, texture_arrays) in RAM.
 
     All three feed `vibrt_native.render` directly:
-    - `json_str`: the scene description. Every BlobRef has been replaced
+    - `json_str`: the scene description (a live dict when serialize=False).
+      Rust reads that dict directly; JSON remains available for diagnostics.
+      Every BlobRef has been replaced
       with an `array_index: u32` referencing the corresponding entry in
       one of the two array lists.
     - `mesh_blobs`: contiguous numpy arrays for mesh / index / vertex-
@@ -2783,7 +2777,7 @@ def export_scene_to_memory(
     writer = BinWriter()
     scene_dict = _export_into(depsgraph, writer, texture_pct)
     return (
-        json.dumps(scene_dict, indent=2),
+        json.dumps(scene_dict, indent=2) if serialize else scene_dict,
         writer.mesh_blobs,
         writer.texture_arrays,
     )
