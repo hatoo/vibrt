@@ -32,6 +32,17 @@ Mix/Add trees skip graph opacity evaluation on shadow rays. Texture addressing
 avoids integer division for in-range coordinates and power-of-two wrapping,
 while preserving repeat, mirror, extend and clip behavior.
 
+Surface preparation combines input requirements across the complete Mix/Add
+tree. UV derivatives, generated coordinates, object normals and vertex colors
+are calculated only when used; triangle areas are needed only for mesh-light
+MIS. Bump evaluations offset the required coordinate inputs without copying
+the entire intersection record.
+
+Single-output constant, UV and flat UV-image graphs (including an optional
+socket conversion) use one packed instruction and bypass the GPU interpreter.
+They share its texture filtering, alpha handling and non-finite-value cleanup.
+Projected images and more complex graphs retain the general evaluator.
+
 Math implements 41 operations; Vector Math 30; color Mix 19. Noise supports
 1D–4D and all five fractal modes; Voronoi supports all five features, four
 distance metrics and normalization. Curves and color ramps use 257-sample
@@ -159,7 +170,8 @@ Native: **45**, Partial: **24**, Legacy: **8**, Unsupported: **17**, Outside Cyc
 ## Validation
 
 - `cargo test -p vibrt-nodes`: validation, reference fixtures and ABI boundaries.
-- `cargo test -p vibrt --lib`: opaque-tree classification and child fallbacks
+- `cargo test -p vibrt --lib`: material-tree input requirements, opaque-tree
+  classification and child fallbacks
   (requires the native renderer build dependencies).
 - `make test`: struct layouts and Python exporter/adapter regressions.
 - `blender -b --factory-startup --python-exit-code 1 --python scripts/test_shader_nodes.py`:

@@ -816,12 +816,27 @@ static __device__ __noinline__ float3 shadow_transmittance(float3 P, float3 dir,
 #include "vibrt_shader.h"
 
 static __device__ void shader_context(const PathVertex &v, vibrt_cycles::float4 *ctx,
-                                      unsigned int mask) {
+                                      unsigned int mask, int derivative = 0) {
   using vibrt_cycles::make_float4;
 #define NEED(I) (mask & (1u << (I)))
 #define CTX_VEC(I,V) if(NEED(I))ctx[I]=make_float4((V).x,(V).y,(V).z,1)
-  if(NEED(0))ctx[0]=make_float4(v.uv.x,v.uv.y,0,1);
-  CTX_VEC(1,v.generated);CTX_VEC(2,v.P_object);CTX_VEC(3,v.P);
+  constexpr float delta = 0.001f;
+  if(NEED(0))ctx[0]=make_float4(v.uv.x+(derivative==1?delta:0),v.uv.y+(derivative==2?delta:0),0,1);
+  if(NEED(1)) {
+    float3 G=v.generated;
+    if(derivative==1)G=G+v.dGdu*delta;else if(derivative==2)G=G+v.dGdv*delta;
+    CTX_VEC(1,G);
+  }
+  if(NEED(2)) {
+    float3 O=v.P_object;
+    if(derivative==1)O=O+v.dOdu*delta;else if(derivative==2)O=O+v.dOdv*delta;
+    CTX_VEC(2,O);
+  }
+  float3 P=v.P;
+  if(mask&((1u<<3)|(1u<<12)|(1u<<14))) {
+    if(derivative==1)P=P+v.dPdu*delta;else if(derivative==2)P=P+v.dPdv*delta;
+    CTX_VEC(3,P);
+  }
   CTX_VEC(4,v.Ns);CTX_VEC(5,v.Ng);CTX_VEC(6,v.incoming);
   if(NEED(7)||NEED(17)) {
     float3 T=v.dPdu,B;
@@ -835,7 +850,7 @@ static __device__ void shader_context(const PathVertex &v, vibrt_cycles::float4 
   CTX_VEC(10,v.object_location);
   if(NEED(11))ctx[11]=v.geometry?make_float4(v.geometry->object_color[0],v.geometry->object_color[1],v.geometry->object_color[2],v.geometry->object_color[3]):make_float4(1);
   if(NEED(12)||NEED(14)) {
-    float3 cp=v.P-make_f3(params.cam_eye);
+    float3 cp=P-make_f3(params.cam_eye);
     if(NEED(12)) {
       float3 cr=make_float3(dot3(cp,normalize3(make_f3(params.cam_u))),dot3(cp,normalize3(make_f3(params.cam_v))),dot3(cp,normalize3(make_f3(params.cam_w))));
       CTX_VEC(12,cr);
@@ -873,9 +888,21 @@ static __device__ void shader_context(const PathVertex &v, vibrt_cycles::float4 
 #undef CTX_VEC
 #undef NEED
 }
-static __device__ __noinline__ void evaluate_shader(PrincipledGpu *m,const PathVertex &v,vibrt_cycles::float4 *out,unsigned int requested=vibrt_shader::EVAL_ALL) {
-  vibrt_cycles::float4 ctx[32];shader_context(v,ctx,m->shader_contexts);
-  vibrt_shader::evaluate((const ShaderInstruction*)m->shader_nodes,m->shader_len,ctx,out,requested);
+static __device__ __noinline__ void evaluate_shader_vm(PrincipledGpu *m,const PathVertex &v,vibrt_cycles::float4 *out,unsigned int requested,int derivative) {
+  vibrt_cycles::float4 ctx[32];shader_context(v,ctx,m->shader_contexts,derivative);
+  vibrt_shader::evaluate_vm((const ShaderInstruction*)m->shader_nodes,m->shader_len,ctx,out,requested);
+}
+static __device__ __noinline__ void evaluate_shader_single(PrincipledGpu *m,float2 uv,vibrt_cycles::float4 *out,unsigned int requested) {
+  const ShaderInstruction &n=*(const ShaderInstruction*)m->shader_nodes;
+  if ((n.op >> 8) & requested)
+    vibrt_shader::evaluate_single(n,vibrt_cycles::make_float4(uv.x,uv.y,0,1),out);
+}
+static __device__ __forceinline__ void evaluate_shader(PrincipledGpu *m,const PathVertex &v,vibrt_cycles::float4 *out,unsigned int requested=vibrt_shader::EVAL_ALL,int derivative=0) {
+  if (m->shader_len == 1) {
+    float2 uv=v.uv;
+    if(derivative==1)uv.x+=0.001f;else if(derivative==2)uv.y+=0.001f;
+    evaluate_shader_single(m,uv,out,requested);
+  } else evaluate_shader_vm(m,v,out,requested,derivative);
 }
 static __device__ float3 eval_color_graph(
     ColorGraphNode *nodes, int n, int output, float2 uv, float3 vc, float random) {
@@ -1032,13 +1059,11 @@ static __device__ __noinline__ MaterialEval eval_material_one(const PathVertex &
       graph_normal=cache.normal;graph_tangent=cache.tangent;
     } else if(mask&(1u<<26)) {
       constexpr float delta=0.001f;
-      PathVertex du=v,dv=v;
-      du.uv.x+=delta;dv.uv.y+=delta;
-      du.P=du.P+v.dPdu*delta;dv.P=dv.P+v.dPdv*delta;
-      du.P_object=du.P_object+v.dOdu*delta;dv.P_object=dv.P_object+v.dOdv*delta;
-      du.generated=du.generated+v.dGdu*delta;dv.generated=dv.generated+v.dGdv*delta;
-      vibrt_cycles::float4 out_u[32],out_v[32];evaluate_shader(m,du,out_u,vibrt_shader::EVAL_BUMP);evaluate_shader(m,dv,out_v,vibrt_shader::EVAL_BUMP);
-      float dhdu=(out_u[26].x-out[26].x)/delta,dhdv=(out_v[26].x-out[26].x)/delta;
+      vibrt_cycles::float4 shifted[32];
+      evaluate_shader(m,v,shifted,vibrt_shader::EVAL_BUMP,1);
+      float dhdu=(shifted[26].x-out[26].x)/delta;
+      evaluate_shader(m,v,shifted,vibrt_shader::EVAL_BUMP,2);
+      float dhdv=(shifted[26].x-out[26].x)/delta;
       float3 r1=cross3(v.dPdv,graph_normal),r2=cross3(graph_normal,v.dPdu);
       float det=dot3(v.dPdu,r1);
       if(fabsf(det)>1e-12f){float3 bumped=normalize3(graph_normal-(r1*dhdu+r2*dhdv)*(out[28].x/det));float f=fminf(fmaxf(out[27].x,0.0f),1.0f);graph_normal=normalize3(graph_normal*(1-f)+bumped*f);}
@@ -2668,6 +2693,17 @@ static __device__ float3 transform_normal(const float *inverse, float3 v) {
   return make_float3(inverse[0]*v.x+inverse[4]*v.y+inverse[8]*v.z,inverse[1]*v.x+inverse[5]*v.y+inverse[9]*v.z,inverse[2]*v.x+inverse[6]*v.y+inverse[10]*v.z);
 }
 static __device__ __noinline__ void fill_surface_vertex(PathVertex *v, HitGroupData *hg, unsigned int prim, float2 bary, float3 incoming, float distance, unsigned int flags) {
+  v->mat = hg->mat;
+  if (hg->material_indices != nullptr && hg->num_materials > 0) {
+    unsigned int mi = hg->material_indices[prim];
+    if ((int)mi < hg->num_materials)
+      v->mat = hg->materials[mi];
+  }
+  unsigned int contexts = v->mat ? v->mat->surface_contexts : 0;
+  bool bump = v->mat && v->mat->surface_bump != 0;
+  bool derivatives = bump || (contexts & ((1u << 7) | (1u << 17)));
+  v->light_pdf = hg->light_pdf ? hg->light_pdf[prim] : 0.0f;
+  bool mesh_light = hg->area_light_group >= 0 && v->light_pdf > 0.0f;
   int i0 = hg->indices[prim * 3 + 0];
   int i1 = hg->indices[prim * 3 + 1];
   int i2 = hg->indices[prim * 3 + 2];
@@ -2686,21 +2722,19 @@ static __device__ __noinline__ void fill_surface_vertex(PathVertex *v, HitGroupD
   float3 Ng_local = normalize3(cross3(e1, e2));
   float3 Ng = normalize3(transform_normal(hg->world_to_object, Ng_local));
 
-  // World-space triangle area for trace_path's mesh-light MIS gate. The
-  // post-transform vertices feed `pdf_solid = d²/(area·cos_light)` so the
-  // BSDF-sampler-side weight matches what the NEE sampler computed at
-  // sample time. A non-uniform instance scale would change this versus
-  // the object-space area; transforming the cross product by the scale
-  // factor below is what `optixTransformVectorFromObjectToWorldSpace`
-  // implicitly does, but we compute the world-space cross from world
-  // vertices for transparency.
-  float3 p0_w = transform_point(hg->object_to_world, p0);
-  float3 p1_w = transform_point(hg->object_to_world, p1);
-  float3 p2_w = transform_point(hg->object_to_world, p2);
-  float3 e1_w = p1_w - p0_w;
-  float3 e2_w = p2_w - p0_w;
-  float3 ng_w = cross3(e1_w, e2_w);
-  float prim_area = 0.5f * sqrtf(dot3(ng_w, ng_w));
+  // Only mesh-light MIS and UV derivatives need world-space triangle edges.
+  // Keep the same arithmetic as light sampling, including instance scaling.
+  float3 e1_w = make_float3(0,0,0), e2_w = make_float3(0,0,0);
+  float prim_area = 0.0f;
+  if (mesh_light || (derivatives && hg->uvs != nullptr)) {
+    float3 p0_w = transform_point(hg->object_to_world, p0);
+    e1_w = transform_point(hg->object_to_world, p1) - p0_w;
+    e2_w = transform_point(hg->object_to_world, p2) - p0_w;
+    if (mesh_light) {
+      float3 ng_w = cross3(e1_w, e2_w);
+      prim_area = 0.5f * sqrtf(dot3(ng_w, ng_w));
+    }
+  }
 
   float3 Ns = Ng;
   if (hg->normals != nullptr) {
@@ -2712,16 +2746,19 @@ static __device__ __noinline__ void fill_surface_vertex(PathVertex *v, HitGroupD
   }
 
   float2 uv = make_float2(0.0f, 0.0f);
-  float3 dpdu,dpdv;build_frame(Ns,dpdu,dpdv);
+  float3 dpdu = make_float3(0,0,0), dpdv = make_float3(0,0,0);
+  if (derivatives) build_frame(Ns,dpdu,dpdv);
   if (hg->uvs != nullptr) {
     float2 uv0 = make_float2(hg->uvs[i0 * 2 + 0], hg->uvs[i0 * 2 + 1]);
     float2 uv1 = make_float2(hg->uvs[i1 * 2 + 0], hg->uvs[i1 * 2 + 1]);
     float2 uv2 = make_float2(hg->uvs[i2 * 2 + 0], hg->uvs[i2 * 2 + 1]);
     uv.x = b0 * uv0.x + bary.x * uv1.x + bary.y * uv2.x;
     uv.y = b0 * uv0.y + bary.x * uv1.y + bary.y * uv2.y;
-    float du1=uv1.x-uv0.x,dv1=uv1.y-uv0.y,du2=uv2.x-uv0.x,dv2=uv2.y-uv0.y;
-    float det=du1*dv2-dv1*du2;
-    if(fabsf(det)>1e-12f){dpdu=(e1_w*dv2-e2_w*dv1)*(1.0f/det);dpdv=(e2_w*du1-e1_w*du2)*(1.0f/det);}
+    if (derivatives) {
+      float du1=uv1.x-uv0.x,dv1=uv1.y-uv0.y,du2=uv2.x-uv0.x,dv2=uv2.y-uv0.y;
+      float det=du1*dv2-dv1*du2;
+      if(fabsf(det)>1e-12f){dpdu=(e1_w*dv2-e2_w*dv1)*(1.0f/det);dpdv=(e2_w*du1-e1_w*du2)*(1.0f/det);}
+    }
   }
 
   // Authored per-vertex tangent (currently only emitted for hair ribbons).
@@ -2745,7 +2782,7 @@ static __device__ __noinline__ void fill_surface_vertex(PathVertex *v, HitGroupD
   }
 
   float3 vc = make_float3(1.0f, 1.0f, 1.0f);
-  if (hg->vertex_colors != nullptr) {
+  if ((contexts & (1u << 8)) && hg->vertex_colors != nullptr) {
     float3 c0 = make_f3(&hg->vertex_colors[i0 * 3]);
     float3 c1 = make_f3(&hg->vertex_colors[i1 * 3]);
     float3 c2 = make_f3(&hg->vertex_colors[i2 * 3]);
@@ -2758,27 +2795,28 @@ static __device__ __noinline__ void fill_surface_vertex(PathVertex *v, HitGroupD
   v->path_flags=flags;
   v->P_object=P_local;
   float3 lo=make_f3(hg->bounds_min),hi=make_f3(hg->bounds_max);
-  v->generated=make_float3(hi.x>lo.x?(P_local.x-lo.x)/(hi.x-lo.x):0.5f,hi.y>lo.y?(P_local.y-lo.y)/(hi.y-lo.y):0.5f,hi.z>lo.z?(P_local.z-lo.z)/(hi.z-lo.z):0.5f);
-  v->N_object=normalize3(transform_normal(hg->object_to_world, Ns));
-  v->object_location=transform_point(hg->object_to_world, make_float3(0,0,0));
+  v->generated = make_float3(0,0,0);
+  if (contexts & (1u << 1))
+    v->generated=make_float3(hi.x>lo.x?(P_local.x-lo.x)/(hi.x-lo.x):0.5f,hi.y>lo.y?(P_local.y-lo.y)/(hi.y-lo.y):0.5f,hi.z>lo.z?(P_local.z-lo.z)/(hi.z-lo.z):0.5f);
+  v->N_object = (contexts & (1u << 13)) ? normalize3(transform_normal(hg->object_to_world, Ns)) : make_float3(0,0,0);
+  v->object_location = make_float3(hg->object_to_world[3],hg->object_to_world[7],hg->object_to_world[11]);
   v->incoming=incoming;
   v->dPdu=dpdu;v->dPdv=dpdv;
-  v->dOdu=transform_vector(hg->world_to_object, dpdu);v->dOdv=transform_vector(hg->world_to_object, dpdv);
-  float3 extent=hi-lo;
-  v->dGdu=make_float3(extent.x>0?v->dOdu.x/extent.x:0,extent.y>0?v->dOdu.y/extent.y:0,extent.z>0?v->dOdu.z/extent.z:0);
-  v->dGdv=make_float3(extent.x>0?v->dOdv.x/extent.x:0,extent.y>0?v->dOdv.y/extent.y:0,extent.z>0?v->dOdv.z/extent.z:0);
+  v->dOdu=v->dOdv=v->dGdu=v->dGdv=make_float3(0,0,0);
+  if (bump && (contexts & ((1u << 1) | (1u << 2)))) {
+    v->dOdu=transform_vector(hg->world_to_object, dpdu);v->dOdv=transform_vector(hg->world_to_object, dpdv);
+    if (contexts & (1u << 1)) {
+      float3 extent=hi-lo;
+      v->dGdu=make_float3(extent.x>0?v->dOdu.x/extent.x:0,extent.y>0?v->dOdu.y/extent.y:0,extent.z>0?v->dOdu.z/extent.z:0);
+      v->dGdv=make_float3(extent.x>0?v->dOdv.x/extent.x:0,extent.y>0?v->dOdv.y/extent.y:0,extent.z>0?v->dOdv.z/extent.z:0);
+    }
+  }
   v->Ng = Ng;
   v->Ns = Ns;
   v->T = T;
   v->uv = uv;
   v->vc = vc;
-  v->vertex_alpha=hg->vertex_alphas?hg->vertex_alphas[i0]*b0+hg->vertex_alphas[i1]*bary.x+hg->vertex_alphas[i2]*bary.y:1;
-  v->mat = hg->mat;
-  if (hg->material_indices != nullptr && hg->num_materials > 0) {
-    unsigned int mi = hg->material_indices[prim];
-    if ((int)mi < hg->num_materials)
-      v->mat = hg->materials[mi];
-  }
+  v->vertex_alpha=(contexts & (1u << 8)) && hg->vertex_alphas?hg->vertex_alphas[i0]*b0+hg->vertex_alphas[i1]*bary.x+hg->vertex_alphas[i2]*bary.y:1;
   // Hash the OptiX instance id into a uniform [0,1) for ObjectInfo.Random.
   // PCG-style multiplicative hash: cheap, decorrelated, deterministic per
   // instance — what Cycles uses for the same node.
@@ -2789,7 +2827,6 @@ static __device__ __noinline__ void fill_surface_vertex(PathVertex *v, HitGroupD
   v->object_random = (float)h * (1.0f / 4294967296.0f);
   v->mesh_light_idx = hg->area_light_group;
   v->prim_area = prim_area;
-  v->light_pdf=hg->light_pdf?hg->light_pdf[prim]:0.0f;
   v->hit = 1;
 }
 

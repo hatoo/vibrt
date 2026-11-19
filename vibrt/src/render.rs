@@ -504,6 +504,9 @@ pub fn render_to_pixels(
             gpu.shader_outputs = binding.outputs;
             gpu.shader_contexts = binding.contexts;
         }
+        let (contexts, bump) = principled::surface_requirements(mat)?;
+        gpu.surface_contexts = contexts;
+        gpu.surface_bump = i32::from(bump);
         Ok(alloc_and_copy(stream, &gpu)?)
     }
     for mat in &scene.file.materials {

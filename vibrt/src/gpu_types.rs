@@ -85,6 +85,9 @@ pub struct PrincipledGpu {
     /// A leaf in the Mix/Add tree can change opacity. Legacy cutouts and
     /// transmission are handled separately by the any-hit program.
     pub shader_has_alpha: i32,
+    /// Contexts and bump derivatives required by the complete Mix/Add tree.
+    pub surface_contexts: u32,
+    pub surface_bump: i32,
     /// Optional pointer to a `VolumeGpu`. Non-null means the bounded mesh is
     /// a volume container (junk_shop's `Smoke` is the canonical case).
     pub volume: optix_sys::CUdeviceptr,

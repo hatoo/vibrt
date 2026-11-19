@@ -209,7 +209,33 @@ template <typename T> VN_DEVICE float4 voronoi(const VoronoiParams &params, T p,
 #define VIBRT_SHADER_STACK_SIZE 256
 #endif
 enum EvalGroup { EVAL_ALL = 1, EVAL_BUMP = 2, EVAL_ALPHA = 4, EVAL_EMISSION = 8, EVAL_MIX = 16 };
-VN_INLINE void evaluate(const ShaderInstruction *nodes, int count, const float4 *ctx,
+VN_INLINE float4 finite_value(float4 r) {
+  for (int ch = 0; ch < 4; ch++)
+    if (!(fabsf(r[ch]) <= FLT_MAX)) r[ch] = 0;
+  return r;
+}
+// Whole-program forms packed by shader.rs; image filtering remains shared with
+// the general evaluator. No operand stack or instruction loop is needed.
+VN_INLINE void evaluate_single(const ShaderInstruction &n, float4 uv, float4 *outputs) {
+  float4 r = finite_value(uv);
+  if ((n.op & 255) == 252)
+    r = make_float4(n.params[0], n.params[1], n.params[2], n.params[3]);
+#if (VIBRT_SHADER_OPS & (1ull << 25))
+  if ((n.op & 255) == 254) {
+    r = image_sample(n, xyz(r));
+    if (n.modes[3]) r = scalar(r.w);
+    r = finite_value(r);
+    switch (n.inputs[2]) {
+    case 1: r = scalar(luminance(xyz(r))); break;
+    case 2: r = scalar((r.x + r.y + r.z) / 3); break;
+    case 3: r = scalar(r.w); break;
+    case 4: r = scalar(r.x); break;
+    }
+  }
+#endif
+  outputs[n.inputs[1]] = finite_value(r);
+}
+VN_INLINE void evaluate_vm(const ShaderInstruction *nodes, int count, const float4 *ctx,
                         float4 *outputs, unsigned int requested = EVAL_ALL) {
   float4 slots[VIBRT_SHADER_STACK_SIZE];
   for (int i = 0; i < count; i++) {
@@ -700,13 +726,20 @@ VN_INLINE void evaluate(const ShaderInstruction *nodes, int count, const float4 
       continue;
     }
     // Match shader-domain behavior at singular inputs without propagating NaNs.
-    for (int ch = 0; ch < 4; ch++)
-      if (!(fabsf(r[ch]) <= FLT_MAX))
-        r[ch] = 0;
-    slots[n.op >> 16] = r;
+    slots[n.op >> 16] = finite_value(r);
 #undef A
 #undef S
 #undef V
+  }
+}
+VN_INLINE void evaluate(const ShaderInstruction *nodes, int count, const float4 *ctx,
+                        float4 *outputs, unsigned int requested = EVAL_ALL) {
+  if (count == 1) {
+    const ShaderInstruction &n = nodes[0];
+    if ((n.op >> 8) & requested)
+      evaluate_single(n, (n.op & 255) == 252 ? make_float4(0) : ctx[0], outputs);
+  } else {
+    evaluate_vm(nodes, count, ctx, outputs, requested);
   }
 }
 } // namespace vibrt_shader

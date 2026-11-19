@@ -41,6 +41,29 @@ fn shader_has_alpha(mat: &PrincipledMaterial) -> bool {
             .map_or_else(leaf_alpha, shader_has_alpha)
 }
 
+/// Surface attributes used anywhere in a Mix/Add tree, including its factor.
+/// The legacy color evaluator also accepts vertex color and object randomness.
+pub fn surface_requirements(mat: &PrincipledMaterial) -> Result<(u32, bool)> {
+    let mut contexts = 0;
+    let mut bump = false;
+    if let Some(graph) = &mat.shader_graph {
+        contexts |= graph.required_contexts()?;
+        bump = graph.outputs.contains_key("bump_height");
+    }
+    if mat.use_vertex_color || mat.color_graph.is_some() {
+        contexts |= 1 << 8;
+    }
+    if mat.color_graph.is_some() {
+        contexts |= 1 << 9;
+    }
+    for child in [&mat.left_subtree, &mat.secondary].into_iter().flatten() {
+        let (child_contexts, child_bump) = surface_requirements(child)?;
+        contexts |= child_contexts;
+        bump |= child_bump;
+    }
+    Ok((contexts, bump))
+}
+
 /// Upload all textures once; returns parallel vector of device slices + dims.
 pub fn upload_textures(
     textures: &[LoadedTexture],
@@ -362,6 +385,8 @@ pub fn make_material_data(
         shader_outputs: 0,
         shader_contexts: 0,
         shader_has_alpha: i32::from(shader_has_alpha(mat)),
+        surface_contexts: 0,
+        surface_bump: 0,
         volume: volume_ptr,
         volume_only: if mat.volume_only { 1 } else { 0 },
         pure_glossy: if mat.pure_glossy { 1 } else { 0 },
@@ -389,6 +414,29 @@ pub fn make_material_data(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn surface_inputs_include_factors_nested_leaves_and_legacy_colors() {
+        let mat: PrincipledMaterial = serde_json::from_value(json!({
+            "base_color":[1,1,1],
+            "shader_graph":{"nodes":[{"op":"context","modes":[16,0,0,0]}],
+                            "outputs":{"mix_fac":0}},
+            "left_subtree":{"base_color":[1,1,1],"use_vertex_color":true},
+            "secondary":{"base_color":[1,1,1],
+                "shader_graph":{"nodes":[{"op":"context","modes":[1,0,0,0]}],
+                                "outputs":{"bump_height":0}},
+                "secondary":{"base_color":[1,1,1],
+                    "shader_graph":{"nodes":[{"op":"context","modes":[13,0,0,0]}],
+                                    "outputs":{"base_color":0}}}}
+        }))
+        .unwrap();
+        assert_eq!(
+            surface_requirements(&mat).unwrap(),
+            ((1 << 1) | (1 << 8) | (1 << 13) | (1 << 16), true)
+        );
+        let plain = serde_json::from_value(json!({"base_color":[1,1,1]})).unwrap();
+        assert_eq!(surface_requirements(&plain).unwrap(), (0, false));
+    }
 
     #[test]
     fn opaque_trees_ignore_unused_internal_leaf_parameters() {

@@ -135,6 +135,41 @@ pub struct ShaderInstruction {
 }
 const _: () = assert!(std::mem::size_of::<ShaderInstruction>() == 104);
 
+// Whole-program forms shared with native/shader.h. One instruction writes one
+// socket directly: inputs = [context slot, output socket, optional conversion].
+// Retain the image's modes/params so filtering and alpha association are exact.
+fn specialize_single_output(program: &[ShaderInstruction]) -> Option<ShaderInstruction> {
+    let first = *program.first()?;
+    let output = *program.last()?;
+    if output.op & 255 != 255 {
+        return None;
+    }
+    let (mut instruction, opcode, conversion) = match program {
+        [_, _] if first.op & 255 == 0 => (first, 252, 0),
+        [_, _] if first.op & 255 == 1 && first.modes[0] == 0 => (first, 253, 0),
+        [_, image, ..]
+            if first.op & 255 == 1
+                && first.modes[0] == 0
+                && image.op & 255 == 25
+                && image.modes[2] == 0
+                && image.params[1] == 0.0 =>
+        {
+            let conversion = match program {
+                [_, _, _] => 0,
+                [_, _, convert, _] if convert.op & 255 == 2 => convert.modes[0] + 1,
+                _ => return None,
+            };
+            (*image, 254, conversion)
+        }
+        _ => return None,
+    };
+    instruction.op = opcode | (output.op & 0xff00);
+    instruction.inputs = [0; 12];
+    instruction.inputs[1] = output.modes[0];
+    instruction.inputs[2] = conversion;
+    Some(instruction)
+}
+
 impl ShaderGraph {
     pub fn validate(&self) -> Result<()> {
         ensure!(
@@ -301,6 +336,18 @@ impl ShaderGraph {
         textures: &[(u64, i32, i32)],
         tables: &[u64],
     ) -> Result<Vec<ShaderInstruction>> {
+        let packed = self.pack_general(textures, tables)?;
+        Ok(match specialize_single_output(&packed) {
+            Some(instruction) => vec![instruction],
+            None => packed,
+        })
+    }
+
+    fn pack_general(
+        &self,
+        textures: &[(u64, i32, i32)],
+        tables: &[u64],
+    ) -> Result<Vec<ShaderInstruction>> {
         self.validate()?;
         ensure!(
             tables.len() == self.nodes.len(),
@@ -406,6 +453,135 @@ fn evaluate_selected(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn run_program(
+        program: &[ShaderInstruction],
+        context: &[f32; 128],
+        group: u32,
+    ) -> [[f32; 4]; 32] {
+        let mut output = [[-123.0; 4]; 32];
+        // SAFETY: callers supply validated programs and keep image bindings
+        // alive; context and output have the fixed ABI sizes.
+        unsafe {
+            vibrt_shader_eval(
+                program.as_ptr(),
+                program.len() as u32,
+                context.as_ptr(),
+                output.as_mut_ptr().cast(),
+                group,
+            );
+        }
+        output
+    }
+
+    #[test]
+    fn specialized_images_match_vm_filtering_alpha_conversion_and_output_groups() {
+        for (width, height) in [(3, 5), (4, 2)] {
+            let pixels: Vec<f32> = (0..width * height)
+                .flat_map(|i| [i as f32 / 11.0, 0.25, 0.5, (i % 4) as f32 / 3.0])
+                .collect();
+            for interpolation in 0..4 {
+                for extension in 0..4 {
+                    for alpha_flags in 0..8 {
+                        for conversion in 0..5 {
+                            let mut nodes = vec![
+                                json!({"op":"context","modes":[0,0,0,0]}),
+                                json!({"op":"image","inputs":[0],"texture":0,
+                                    "modes":[interpolation,extension,0,alpha_flags & 1],
+                                    "params":[0,0,(alpha_flags >> 1) & 1,alpha_flags >> 2]}),
+                            ];
+                            if conversion != 0 {
+                                nodes.push(json!({"op":"convert","inputs":[1],
+                                                  "modes":[conversion-1,0,0,0]}));
+                            }
+                            let graph: ShaderGraph = serde_json::from_value(json!({
+                                "outputs":{"mix_fac":nodes.len()-1},"nodes":nodes,
+                            }))
+                            .unwrap();
+                            let textures = [(pixels.as_ptr() as u64, width, height)];
+                            let tables = vec![0; graph.nodes.len()];
+                            let specialized = graph.pack(&textures, &tables).unwrap();
+                            let general = graph.pack_general(&textures, &tables).unwrap();
+                            assert_eq!(specialized.len(), 1);
+                            for uv in [[-1.3, 2.7], [0.0, 1.0], [0.37, 0.61], [1.4, -0.2]] {
+                                let mut context = [0.0; 128];
+                                context[..4].copy_from_slice(&[uv[0], uv[1], 0.0, 1.0]);
+                                for group in
+                                    [EVAL_ALL, EVAL_MIX, EVAL_ALPHA, EVAL_BUMP, EVAL_EMISSION]
+                                {
+                                    assert_eq!(
+                                        run_program(&specialized, &context, group),
+                                        run_program(&general, &context, group)
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn specialization_keeps_projected_images_and_multiple_outputs_on_vm() {
+        let pixels = [1.0f32; 16];
+        for (projection, environment) in [(1, 0), (2, 0), (3, 0), (0, 1), (0, 2), (0, 3)] {
+            let graph: ShaderGraph = serde_json::from_value(json!({"nodes":[
+                {"op":"context","modes":[0,0,0,0]},
+                {"op":"image","inputs":[0],"texture":0,
+                 "modes":[0,0,projection,0],"params":[0,environment,0,0]}
+            ],"outputs":{"base_color":1}}))
+            .unwrap();
+            assert_eq!(
+                graph
+                    .pack(&[(pixels.as_ptr() as u64, 2, 2)], &[0, 0])
+                    .unwrap()
+                    .len(),
+                3
+            );
+        }
+        for node in [
+            json!({"op":"constant","params":[0.2,0.4,0.6,0.8]}),
+            json!({"op":"context","modes":[0,0,0,0]}),
+        ] {
+            let mut graph: ShaderGraph = serde_json::from_value(json!({
+                "nodes":[node],"outputs":{"alpha":0}
+            }))
+            .unwrap();
+            let mut context = [0.0; 128];
+            context[..4].copy_from_slice(&[0.1, 0.3, 0.5, 1.0]);
+            let specialized = graph.pack(&[], &[0]).unwrap();
+            assert_eq!(specialized.len(), 1);
+            for group in [EVAL_ALL, EVAL_ALPHA, EVAL_MIX] {
+                assert_eq!(
+                    run_program(&specialized, &context, group),
+                    run_program(&graph.pack_general(&[], &[0]).unwrap(), &context, group)
+                );
+            }
+            graph.outputs.insert("emission".into(), 0);
+            assert_eq!(graph.pack(&[], &[0]).unwrap().len(), 3);
+        }
+    }
+
+    #[test]
+    fn specialized_images_preserve_vm_nonfinite_sanitization() {
+        let pixels = [f32::INFINITY, f32::NAN, f32::MAX, 0.5];
+        let graph: ShaderGraph = serde_json::from_value(json!({"nodes":[
+            {"op":"context","modes":[0,0,0,0]},
+            {"op":"image","inputs":[0],"texture":0},
+            {"op":"convert","inputs":[1],"modes":[0,0,0,0]}
+        ],"outputs":{"base_color":2}}))
+        .unwrap();
+        let textures = [(pixels.as_ptr() as u64, 1, 1)];
+        let specialized = graph.pack(&textures, &[0; 3]).unwrap();
+        let general = graph.pack_general(&textures, &[0; 3]).unwrap();
+        let mut context = [0.0; 128];
+        context[0] = f32::NAN;
+        assert_eq!(
+            run_program(&specialized, &context, EVAL_ALL),
+            run_program(&general, &context, EVAL_ALL)
+        );
+    }
 
     #[test]
     fn image_address_modes_preserve_negative_and_repeated_coordinates() {
