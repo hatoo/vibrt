@@ -1,6 +1,6 @@
 //! Validated, typed shader DAG. C++ implements every numerical operation.
 use anyhow::{bail, ensure, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 pub const MAX_NODES: usize = 256;
@@ -100,13 +100,13 @@ pub const OPS: [(&str, usize); 40] = [
     ("tangent", 0),
 ];
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct ShaderGraph {
     pub nodes: Vec<ShaderNode>,
     pub outputs: BTreeMap<String, u32>,
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct ShaderNode {
     pub op: String,
     #[serde(default)]
@@ -406,6 +406,84 @@ fn evaluate_selected(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn image_address_modes_preserve_negative_and_repeated_coordinates() {
+        for (width, height) in [(1, 1), (2, 4), (3, 5), (4, 2)] {
+            let pixels: Vec<f32> = (0..width * height)
+                .flat_map(|i| [i as f32 + 1.0, 0.25, 0.5, 1.0])
+                .collect();
+            for extension in 0..4 {
+                let graph: ShaderGraph = serde_json::from_value(json!({"nodes":[
+                    {"op":"context","modes":[0,0,0,0]},
+                    {"op":"image","inputs":[0],"texture":0,"modes":[1,extension,0,0]}
+                ],"outputs":{"base_color":1}}))
+                .unwrap();
+                let packed = graph
+                    .pack(&[(pixels.as_ptr() as u64, width, height)], &[0, 0])
+                    .unwrap();
+                let wrap = |i: i32, n: i32| match extension {
+                    0 => i.rem_euclid(n),
+                    3 => {
+                        let j = i.rem_euclid(2 * n);
+                        if j < n {
+                            j
+                        } else {
+                            2 * n - 1 - j
+                        }
+                    }
+                    _ => i.clamp(0, n - 1),
+                };
+                for x in [
+                    -2 * width - 1,
+                    -width,
+                    -1,
+                    0,
+                    width - 1,
+                    width,
+                    width + 1,
+                    2 * width + 1,
+                ] {
+                    for y in [
+                        -2 * height - 1,
+                        -height,
+                        -1,
+                        0,
+                        height - 1,
+                        height,
+                        height + 1,
+                        2 * height + 1,
+                    ] {
+                        let mut context = [0.0; 128];
+                        context[0] = (x as f32 + 0.25) / width as f32;
+                        context[1] = (y as f32 + 0.25) / height as f32;
+                        let mut output = [[0.0; 4]; 32];
+                        // SAFETY: pack validates indices; the CPU image and all
+                        // fixed-size input/output arrays stay alive during FFI.
+                        unsafe {
+                            vibrt_shader_eval(
+                                packed.as_ptr(),
+                                packed.len() as u32,
+                                context.as_ptr(),
+                                output.as_mut_ptr().cast(),
+                                EVAL_ALL,
+                            );
+                        }
+                        let expected =
+                            if extension == 2 && (x < 0 || x >= width || y < 0 || y >= height) {
+                                0.0
+                            } else {
+                                (wrap(y, height) * width + wrap(x, width)) as f32 + 1.0
+                            };
+                        assert_eq!(
+                            output[0][0], expected,
+                            "{width}x{height}, extension={extension}, ({x},{y})"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn selected_outputs_preserve_shared_dependencies_and_reused_slots() {

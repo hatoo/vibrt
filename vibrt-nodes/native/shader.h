@@ -95,12 +95,21 @@ VN_INLINE float3 vector_transform(float3 v, const float4 *ctx, int type, int fro
   return normal ? safe_normalize(v) : v;
 }
 VN_INLINE int tex_index(int i, int n, int extension) {
+  if ((unsigned int)i < (unsigned int)n)
+    return i;
   if (extension == 0) {
+    // Texture dimensions are commonly powers of two. Masking also gives the
+    // correct positive remainder for negative coordinates without integer division.
+    if ((n & (n - 1)) == 0)
+      return i & (n - 1);
     i %= n;
     return i < 0 ? i + n : i;
   }
   if (extension == 3) {
-    i %= n * 2;
+    if ((n & (n - 1)) == 0)
+      i &= n * 2 - 1;
+    else
+      i %= n * 2;
     if (i < 0)
       i += n * 2;
     return i < n ? i : 2 * n - 1 - i;
@@ -116,7 +125,7 @@ VN_INLINE float4 texel(const ShaderInstruction &n, int x, int y) {
   float a = n.params[2] != 0 ? p[3] : 1;
   return make_float4(p[0] * a, p[1] * a, p[2] * a, p[3]);
 }
-VN_DEVICE float4 image_sample_raw(const ShaderInstruction &n, float3 v) {
+VN_INLINE float4 image_sample_raw(const ShaderInstruction &n, float3 v) {
   if (n.modes[0] == 1)
     return texel(n, (int)floorf(v.x * n.width), (int)floorf(v.y * n.height));
   float x = v.x * n.width - 0.5f, y = v.y * n.height - 0.5f;
@@ -136,7 +145,7 @@ VN_DEVICE float4 image_sample_raw(const ShaderInstruction &n, float3 v) {
   return mix(mix(texel(n, ix, iy), texel(n, ix + 1, iy), tx),
              mix(texel(n, ix, iy + 1), texel(n, ix + 1, iy + 1), tx), ty);
 }
-VN_DEVICE float4 image_sample(const ShaderInstruction &n, float3 v) {
+VN_INLINE float4 image_sample(const ShaderInstruction &n, float3 v) {
   float4 r = image_sample_raw(n, v);
   if (n.params[3] != 0 && r.w != 0 && r.w != 1) {
     float a = r.w;
@@ -200,7 +209,7 @@ template <typename T> VN_DEVICE float4 voronoi(const VoronoiParams &params, T p,
 #define VIBRT_SHADER_STACK_SIZE 256
 #endif
 enum EvalGroup { EVAL_ALL = 1, EVAL_BUMP = 2, EVAL_ALPHA = 4, EVAL_EMISSION = 8, EVAL_MIX = 16 };
-VN_DEVICE void evaluate(const ShaderInstruction *nodes, int count, const float4 *ctx,
+VN_INLINE void evaluate(const ShaderInstruction *nodes, int count, const float4 *ctx,
                         float4 *outputs, unsigned int requested = EVAL_ALL) {
   float4 slots[VIBRT_SHADER_STACK_SIZE];
   for (int i = 0; i < count; i++) {

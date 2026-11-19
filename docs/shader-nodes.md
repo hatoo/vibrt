@@ -25,6 +25,13 @@ to a power of two. Bump derivatives evaluate height dependencies; shadow rays
 evaluate opacity; light samples evaluate emission and opacity. Coordinate and
 matrix preparation is limited to contexts actually read by each graph.
 
+Identical graph programs share one GPU upload within a render. Adjacent BSDF
+closures can reuse the last graph's values and bumped normal at the same
+intersection; the cache resets for every surface evaluation. Fully opaque
+Mix/Add trees skip graph opacity evaluation on shadow rays. Texture addressing
+avoids integer division for in-range coordinates and power-of-two wrapping,
+while preserving repeat, mirror, extend and clip behavior.
+
 Math implements 41 operations; Vector Math 30; color Mix 19. Noise supports
 1D–4D and all five fractal modes; Voronoi supports all five features, four
 distance metrics and normalization. Curves and color ramps use 257-sample
@@ -152,6 +159,8 @@ Native: **45**, Partial: **24**, Legacy: **8**, Unsupported: **17**, Outside Cyc
 ## Validation
 
 - `cargo test -p vibrt-nodes`: validation, reference fixtures and ABI boundaries.
+- `cargo test -p vibrt --lib`: opaque-tree classification and child fallbacks
+  (requires the native renderer build dependencies).
 - `make test`: struct layouts and Python exporter/adapter regressions.
 - `blender -b --factory-startup --python-exit-code 1 --python scripts/test_shader_nodes.py`:
   315 operation/mode cases compared with Cycles and actual CUDA renders.

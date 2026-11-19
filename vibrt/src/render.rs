@@ -422,8 +422,7 @@ pub fn render_to_pixels(
     // Colour-graph buffers (node records + per-node LUT data) live for the
     // lifetime of the render; stash them so their CudaSlice drops are
     // deferred. Separate u32 / f32 vectors because RGBCurve LUTs are float.
-    let mut _color_graph_buffers: Vec<CudaSlice<u32>> = Vec::new();
-    let mut _color_graph_lut_buffers: Vec<CudaSlice<f32>> = Vec::new();
+    let mut graph_storage = principled::GraphStorage::default();
     // Volume parameter blocks live alongside materials. Each material that
     // has a Volume slot gets one allocation; the device-side `PrincipledGpu`
     // holds a pointer back to it (or null when absent).
@@ -439,8 +438,7 @@ pub fn render_to_pixels(
         mat: &scene_format::PrincipledMaterial,
         tex_slots: &[(optix_sys::CUdeviceptr, i32, i32)],
         stream: &Arc<CudaStream>,
-        color_graph_buffers: &mut Vec<CudaSlice<u32>>,
-        color_graph_lut_buffers: &mut Vec<CudaSlice<f32>>,
+        graph_storage: &mut principled::GraphStorage,
         volume_storage: &mut Vec<optix_sys::CUdeviceptr>,
         depth: u32,
     ) -> Result<optix_sys::CUdeviceptr> {
@@ -455,8 +453,8 @@ pub fn render_to_pixels(
                 g,
                 tex_slots,
                 stream,
-                color_graph_buffers,
-                color_graph_lut_buffers,
+                &mut graph_storage.nodes,
+                &mut graph_storage.tables,
             )?,
             None => principled::ColorGraphGpu::default(),
         };
@@ -474,8 +472,7 @@ pub fn render_to_pixels(
                 sec,
                 tex_slots,
                 stream,
-                color_graph_buffers,
-                color_graph_lut_buffers,
+                graph_storage,
                 volume_storage,
                 depth + 1,
             )?,
@@ -486,8 +483,7 @@ pub fn render_to_pixels(
                 lhs,
                 tex_slots,
                 stream,
-                color_graph_buffers,
-                color_graph_lut_buffers,
+                graph_storage,
                 volume_storage,
                 depth + 1,
             )?,
@@ -502,18 +498,11 @@ pub fn render_to_pixels(
             left_subtree_ptr,
         );
         if let Some(graph) = &mat.shader_graph {
-            (
-                gpu.shader_nodes,
-                gpu.shader_len,
-                gpu.shader_outputs,
-                gpu.shader_contexts,
-            ) = principled::upload_shader_graph(
-                graph,
-                tex_slots,
-                stream,
-                color_graph_buffers,
-                color_graph_lut_buffers,
-            )?;
+            let binding = principled::upload_shader_graph(graph, tex_slots, stream, graph_storage)?;
+            gpu.shader_nodes = binding.nodes;
+            gpu.shader_len = binding.len;
+            gpu.shader_outputs = binding.outputs;
+            gpu.shader_contexts = binding.contexts;
         }
         Ok(alloc_and_copy(stream, &gpu)?)
     }
@@ -522,8 +511,7 @@ pub fn render_to_pixels(
             mat,
             &tex_slots,
             &stream,
-            &mut _color_graph_buffers,
-            &mut _color_graph_lut_buffers,
+            &mut graph_storage,
             &mut _volume_storage,
             0,
         )?;

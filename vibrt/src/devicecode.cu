@@ -941,8 +941,15 @@ struct MaterialEvalGroup {
 // (m = v.mat->secondary). The vertex-level inputs (uv, vertex color,
 // tangents, normals) come from `v` regardless of which closure is being
 // evaluated.
+struct ShaderEvalCache {
+  unsigned long long nodes;
+  vibrt_cycles::float4 outputs[32];
+  float3 normal, tangent;
+};
+
 static __device__ __noinline__ MaterialEval eval_material_one(const PathVertex &v,
                                                   PrincipledGpu *m,
+                                                  ShaderEvalCache &cache,
                                                   float min_alpha = 0.0f) {
   MaterialEval e;
   e.mat = m;
@@ -1005,7 +1012,9 @@ static __device__ __noinline__ MaterialEval eval_material_one(const PathVertex &
   e.metallic = fminf(fmaxf(e.metallic, 0.0f), 1.0f);
   float3 graph_normal=v.Ns,graph_tangent=v.T;
   if(m->shader_nodes && m->shader_len>0) {
-    vibrt_cycles::float4 out[32];evaluate_shader(m,v,out);
+    vibrt_cycles::float4 *out=cache.outputs;
+    bool cached=cache.nodes==m->shader_nodes;
+    if(!cached)evaluate_shader(m,v,out);
     unsigned int mask=m->shader_outputs;
 #define GRAPH_SCALAR(I,F) if(mask&(1u<<I))e.F=out[I].x
 #define GRAPH_COLOR(I,F) if(mask&(1u<<I))e.F=make_float3(out[I].x,out[I].y,out[I].z)
@@ -1019,7 +1028,9 @@ static __device__ __noinline__ MaterialEval eval_material_one(const PathVertex &
     GRAPH_SCALAR(20,hair_offset);GRAPH_SCALAR(21,hair_roughness_u);GRAPH_SCALAR(22,hair_roughness_v);
     if(mask&(1u<<24))graph_normal=normalize3(make_float3(out[24].x,out[24].y,out[24].z));
     if(mask&(1u<<25))graph_tangent=normalize3(make_float3(out[25].x,out[25].y,out[25].z));
-    if(mask&(1u<<26)) {
+    if(cached) {
+      graph_normal=cache.normal;graph_tangent=cache.tangent;
+    } else if(mask&(1u<<26)) {
       constexpr float delta=0.001f;
       PathVertex du=v,dv=v;
       du.uv.x+=delta;dv.uv.y+=delta;
@@ -1032,6 +1043,7 @@ static __device__ __noinline__ MaterialEval eval_material_one(const PathVertex &
       float det=dot3(v.dPdu,r1);
       if(fabsf(det)>1e-12f){float3 bumped=normalize3(graph_normal-(r1*dhdu+r2*dhdv)*(out[28].x/det));float f=fminf(fmaxf(out[27].x,0.0f),1.0f);graph_normal=normalize3(graph_normal*(1-f)+bumped*f);}
     }
+    cache.nodes=m->shader_nodes;cache.normal=graph_normal;cache.tangent=graph_tangent;
 #undef GRAPH_SCALAR
 #undef GRAPH_COLOR
   }
@@ -1227,6 +1239,9 @@ static __device__ __noinline__ int eval_material(const PathVertex &v,
   Frame stack[STACK_DEPTH];
   int sp = 0;
   stack[sp++] = {v.mat, 1.0f, false};
+  // The cache is reset for every intersection. Adjacent closures can share a
+  // graph, but values must never leak between objects or path vertices.
+  ShaderEvalCache cache;cache.nodes=0;
   int n = 0;
   while (sp > 0 && n < max_leaves) {
     Frame f = stack[--sp];
@@ -1238,7 +1253,7 @@ static __device__ __noinline__ int eval_material(const PathVertex &v,
     bool is_internal = !f.as_leaf && (has_right || has_left);
     if (!is_internal) {
       // Emit as leaf — evaluate this node's own lobe params.
-      slots[n] = eval_material_one(v, node, min_alpha);
+      slots[n] = eval_material_one(v, node, cache, min_alpha);
       weights[n] = f.weight;
       ++n;
       continue;
@@ -1253,7 +1268,7 @@ static __device__ __noinline__ int eval_material(const PathVertex &v,
       // Overflow safeguard: collapse remaining sub-tree into one leaf
       // using own params, weighted by the unspent weight. Should not
       // trigger with a sane exporter cap.
-      slots[n] = eval_material_one(v, node, min_alpha);
+      slots[n] = eval_material_one(v, node, cache, min_alpha);
       weights[n] = f.weight;
       ++n;
       continue;
@@ -2838,8 +2853,8 @@ extern "C" __global__ void __anyhit__ah() {
   // every NEE call site). With the pure full-pass-through approximation
   // the camera-side window mix worked but rooms ended up ~5% too bright
   // because shadow rays through windows weren't attenuated.
-  float shadow_alpha=m->alpha_blend;
-  if(is_shadow_ray && ((m->shader_outputs&(1u<<7))||m->secondary||m->left_subtree)) {
+  float shadow_alpha=m->shader_has_alpha?m->alpha_blend:1.0f;
+  if(is_shadow_ray && m->shader_has_alpha && ((m->shader_outputs&(1u<<7))||m->secondary||m->left_subtree)) {
     PathVertex v;fill_path_vertex(&v);shadow_alpha=emission_alpha(v,false).w;
   }
   if (is_shadow_ray && shadow_alpha < 1.0f) {
@@ -3579,7 +3594,8 @@ extern "C" __global__ void __raygen__rg() {
       MaterialEval e_aov_slots[1];
       float e_aov_weights[1];
       int n = eval_material(v, e_aov_slots, e_aov_weights, 1);
-      MaterialEval e = (n > 0) ? e_aov_slots[0] : eval_material_one(v, v.mat);
+      ShaderEvalCache cache;cache.nodes=0;
+      MaterialEval e = (n > 0) ? e_aov_slots[0] : eval_material_one(v, v.mat, cache);
       if (dot3(e.Ns, -dir0) < 0.0f)
         e.Ns = -e.Ns;
       alb = e.base_color;

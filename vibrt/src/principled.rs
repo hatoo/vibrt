@@ -6,6 +6,7 @@ use crate::scene_loader::LoadedTexture;
 use crate::CudaResultExt;
 use anyhow::{anyhow, Result};
 use cudarc::driver::{CudaSlice, CudaStream, DevicePtr};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 fn dptr(slice: &CudaSlice<f32>, stream: &CudaStream) -> optix_sys::CUdeviceptr {
@@ -16,6 +17,28 @@ fn dptr(slice: &CudaSlice<f32>, stream: &CudaStream) -> optix_sys::CUdeviceptr {
 fn dptr_u32(slice: &CudaSlice<u32>, stream: &CudaStream) -> optix_sys::CUdeviceptr {
     let (ptr, _sync) = slice.device_ptr(stream);
     ptr as optix_sys::CUdeviceptr
+}
+
+/// An opaque Mix/Add tree stays opaque regardless of its spatial mix factors.
+/// A missing child refers to the current node's own BSDF, as on the device.
+fn shader_has_alpha(mat: &PrincipledMaterial) -> bool {
+    let leaf_alpha = || {
+        mat.alpha_blend < 1.0
+            || mat
+                .shader_graph
+                .as_ref()
+                .is_some_and(|g| g.outputs.contains_key("alpha"))
+    };
+    if mat.left_subtree.is_none() && mat.secondary.is_none() {
+        return leaf_alpha();
+    }
+    mat.left_subtree
+        .as_deref()
+        .map_or_else(leaf_alpha, shader_has_alpha)
+        || mat
+            .secondary
+            .as_deref()
+            .map_or_else(leaf_alpha, shader_has_alpha)
 }
 
 /// Upload all textures once; returns parallel vector of device slices + dims.
@@ -43,14 +66,35 @@ pub struct ColorGraphGpu {
     pub output: i32,
 }
 
+#[derive(Clone, Copy)]
+pub struct ShaderGraphGpu {
+    pub nodes: u64,
+    pub len: i32,
+    pub outputs: u32,
+    pub contexts: u32,
+}
+
+/// Render-owned graph buffers. Shared bindings cannot outlive their allocations.
+#[derive(Default)]
+pub struct GraphStorage {
+    pub nodes: Vec<CudaSlice<u32>>,
+    pub tables: Vec<CudaSlice<f32>>,
+    shaders: HashMap<Vec<u8>, ShaderGraphGpu>,
+}
+
 pub fn upload_shader_graph(
     graph: &vibrt_nodes::shader::ShaderGraph,
     textures: &[(u64, i32, i32)],
     stream: &Arc<CudaStream>,
-    buffers: &mut Vec<CudaSlice<u32>>,
-    tables: &mut Vec<CudaSlice<f32>>,
-) -> Result<(u64, i32, u32, u32)> {
+    storage: &mut GraphStorage,
+) -> Result<ShaderGraphGpu> {
     graph.validate()?;
+    // A cache belongs to one render and therefore one set of texture bindings.
+    // Exact serialized keys include outputs, image IDs, modes, parameters and LUTs.
+    let key = serde_json::to_vec(graph)?;
+    if let Some(&binding) = storage.shaders.get(&key) {
+        return Ok(binding);
+    }
     let mut pointers = Vec::with_capacity(graph.nodes.len());
     for node in &graph.nodes {
         if node.table.is_empty() {
@@ -58,7 +102,7 @@ pub fn upload_shader_graph(
         } else {
             let data = stream.clone_htod(&node.table).cuda()?;
             pointers.push(dptr(&data, stream));
-            tables.push(data);
+            storage.tables.push(data);
         }
     }
     let packed = graph.pack(textures, &pointers)?;
@@ -67,7 +111,7 @@ pub fn upload_shader_graph(
         unsafe { std::slice::from_raw_parts(packed.as_ptr().cast::<u32>(), packed.len() * 26) };
     let data = stream.clone_htod(words).cuda()?;
     let ptr = dptr_u32(&data, stream);
-    buffers.push(data);
+    storage.nodes.push(data);
     let mut mask = 0;
     for name in graph.outputs.keys() {
         mask |= 1
@@ -76,7 +120,14 @@ pub fn upload_shader_graph(
                 .position(|n| n == name)
                 .unwrap();
     }
-    Ok((ptr, packed.len() as i32, mask, graph.required_contexts()?))
+    let binding = ShaderGraphGpu {
+        nodes: ptr,
+        len: packed.len() as i32,
+        outputs: mask,
+        contexts: graph.required_contexts()?,
+    };
+    storage.shaders.insert(key, binding);
+    Ok(binding)
 }
 
 /// Flatten a `ColorGraph` into the on-device `ColorGraphNode` layout and
@@ -310,6 +361,7 @@ pub fn make_material_data(
         shader_len: 0,
         shader_outputs: 0,
         shader_contexts: 0,
+        shader_has_alpha: i32::from(shader_has_alpha(mat)),
         volume: volume_ptr,
         volume_only: if mat.volume_only { 1 } else { 0 },
         pure_glossy: if mat.pure_glossy { 1 } else { 0 },
@@ -330,5 +382,50 @@ pub fn make_material_data(
         mix_fac_tex_w: mf_w,
         mix_fac_tex_h: mf_h,
         mix_fac_tex_channels: mf_c,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn opaque_trees_ignore_unused_internal_leaf_parameters() {
+        for add in [false, true] {
+            let mat = serde_json::from_value(json!({
+                "base_color":[1,1,1], "alpha_blend":0.0, "add_shader":add,
+                "shader_graph":{"nodes":[{"op":"constant","params":[0.3,0,0,0]}],
+                                "outputs":{"mix_fac":0,"alpha":0}},
+                "left_subtree":{"base_color":[1,1,1]},
+                "secondary":{"base_color":[1,1,1],
+                    "secondary":{"base_color":[1,1,1]}}
+            }))
+            .unwrap();
+            assert!(!shader_has_alpha(&mat));
+        }
+    }
+
+    #[test]
+    fn opacity_follows_dynamic_leaves_and_missing_child_fallbacks() {
+        for child in ["left_subtree", "secondary"] {
+            let mut value = json!({"base_color":[1,1,1],"alpha_blend":0.25});
+            value[child] = json!({"base_color":[1,1,1]});
+            assert!(shader_has_alpha(&serde_json::from_value(value).unwrap()));
+        }
+        let mut value = json!({"base_color":[1,1,1],
+            "left_subtree":{"base_color":[1,1,1]},
+            "secondary":{"base_color":[1,1,1]}});
+        value["secondary"]["shader_graph"] = json!({
+            "nodes":[{"op":"context","modes":[8,0,0,0]}],"outputs":{"alpha":0}});
+        assert!(shader_has_alpha(
+            &serde_json::from_value(value.clone()).unwrap()
+        ));
+        value["secondary"]["shader_graph"]["outputs"] = json!({"base_color":0});
+        assert!(!shader_has_alpha(
+            &serde_json::from_value(value.clone()).unwrap()
+        ));
+        value["secondary"]["alpha_blend"] = json!(0.5);
+        assert!(shader_has_alpha(&serde_json::from_value(value).unwrap()));
     }
 }
