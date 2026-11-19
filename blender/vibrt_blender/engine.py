@@ -15,6 +15,7 @@ import time
 import bpy
 
 from . import _log, exporter, runner, sky_bake, native_scene
+from .progressive import RenderResultDisplay
 
 
 class VibrtRenderEngine(bpy.types.RenderEngine):
@@ -169,35 +170,38 @@ class VibrtRenderEngine(bpy.types.RenderEngine):
 
             self.update_stats("vibrt", "Rendering...")
             t_render = time.perf_counter()
-            pixels, depth = runner.run_render_inproc(
-                scene_data,
-                mesh_blobs,
-                self.report,
-                self.test_break,
-                denoise=denoise,
-                texture_arrays=texture_arrays,
-            )
-            self.report(
-                {"INFO"},
-                f"vibrt: render returned {pixels.shape} in "
-                f"{time.perf_counter() - t_render:.2f}s",
-            )
+            self.update_progress(0.0)
+            with RenderResultDisplay(self, width, height) as display:
+                def preview(pixels, samples, total):
+                    display.update(pixels)
+                    self.update_progress(samples / total)
+                    status = f"Sample {samples} / {total}"
+                    if samples == total and denoise:
+                        status += " | Denoising..."
+                    self.update_stats("vibrt", status)
 
-            # `pixels` is float32 (h, w, 4), `depth` is float32 (h, w).
-            self.update_stats("vibrt", "Loading result...")
-            t_blit = time.perf_counter()
-            _push_pixels_into_render_result(
-                self,
-                pixels,
-                depth,
-                width,
-                height,
-                depsgraph.scene_eval,
-            )
-            self.report(
-                {"INFO"},
-                f"vibrt: blit to passes {time.perf_counter() - t_blit:.2f}s",
-            )
+                pixels, depth = runner.run_render_inproc(
+                    scene_data,
+                    mesh_blobs,
+                    self.report,
+                    self.test_break,
+                    denoise=denoise,
+                    texture_arrays=texture_arrays,
+                    preview_cb=preview,
+                )
+                self.report(
+                    {"INFO"},
+                    f"vibrt: render returned {pixels.shape} in "
+                    f"{time.perf_counter() - t_render:.2f}s",
+                )
+                self.update_stats("vibrt", "Loading result...")
+                t_blit = time.perf_counter()
+                display.finish(pixels, depth, lambda d: _compute_mist(d, depsgraph.scene_eval))
+                self.update_progress(1.0)
+                self.report(
+                    {"INFO"},
+                    f"vibrt: blit to passes {time.perf_counter() - t_blit:.2f}s",
+                )
 
 
 _SUPPORTED_RENDER_LAYER_OUTPUTS = frozenset({
@@ -241,72 +245,6 @@ def _unsupported_compositor_passes(scene) -> set:
                 continue
             unsupported.add(sock.name)
     return unsupported
-
-
-def _push_pixels_into_render_result(engine, pixels, depth, width, height, scene):
-    """Copy `pixels` (h, w, 4) and `depth` (h, w) into the available passes.
-
-    Populates Combined unconditionally; Mist / Z / Noisy Image are written
-    only when the corresponding view-layer flag (or denoising-data
-    request) made Blender register the pass. Mist comes from
-    `world.mist_settings` applied to the per-pixel hit distance; Noisy
-    Image is the same buffer as Combined so the lone_monk-style
-    `Mix(Image, Noisy Image)` compositor idiom is a no-op.
-    """
-    if (pixels.shape[0] != height or pixels.shape[1] != width
-            or pixels.shape[2] != 4):
-        engine.report(
-            {"ERROR"},
-            f"native render returned pixels shape {pixels.shape}, "
-            f"expected ({height}, {width}, 4)",
-        )
-        return
-    if depth.shape[0] != height or depth.shape[1] != width:
-        engine.report(
-            {"ERROR"},
-            f"native render returned depth shape {depth.shape}, "
-            f"expected ({height}, {width})",
-        )
-        return
-
-    result = engine.begin_result(0, 0, width, height)
-    try:
-        render_layer = result.layers[0]
-        passes = {p.name: p for p in render_layer.passes}
-
-        flat_rgba = pixels.ravel()
-
-        combined = passes.get("Combined")
-        if combined is None:
-            engine.report({"ERROR"}, "Combined pass not found in render result")
-            return
-        _set_pass(combined, flat_rgba)
-
-        # Cycles' compositor idiom for denoising mixes Image↔Noisy Image;
-        # writing the same buffer to both makes the mix produce Combined
-        # regardless of factor, which is what we want here.
-        noisy = passes.get("Noisy Image")
-        if noisy is not None:
-            _set_pass(noisy, flat_rgba)
-
-        z_pass = passes.get("Z")
-        if z_pass is not None:
-            _set_pass(z_pass, depth.ravel())
-
-        mist_pass = passes.get("Mist")
-        if mist_pass is not None:
-            mist = _compute_mist(depth, scene)
-            _set_pass(mist_pass, mist.ravel())
-    finally:
-        engine.end_result(result)
-
-
-def _set_pass(rpass, flat) -> None:
-    if hasattr(rpass.rect, "foreach_set"):
-        rpass.rect.foreach_set(flat)
-    else:
-        ch = rpass.channels
-        rpass.rect = [tuple(flat[i:i + ch]) for i in range(0, len(flat), ch)]
 
 
 def _compute_mist(depth, scene):

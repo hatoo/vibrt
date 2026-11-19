@@ -31,6 +31,9 @@ pub struct RenderOptions {
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub denoise: bool,
+    /// Preview readback cadence; first and last samples are always published.
+    /// None uses 100 ms. Zero publishes every completed sample.
+    pub preview_interval_ms: Option<u64>,
 }
 
 /// Final rendered RGBA buffer plus the dimensions the caller can save / hand
@@ -48,15 +51,24 @@ pub struct RenderOutput {
     pub height: u32,
 }
 
-/// Lets the caller redirect progress messages and (later) cancel mid-render.
-/// `log` is called for the same lines that today print to stdout from the CLI
-/// (`Scene: ...`, `Rendering...`, `Render: ...`, etc.). `cancelled` is
-/// reserved for Step 3 when the Python wrapper polls Blender's break flag —
-/// the CLI's `StdoutProgress` always returns false.
+/// Progress, cooperative cancellation, and optional progressive image updates.
 pub trait Progress {
     fn log(&mut self, msg: &str);
     fn cancelled(&mut self) -> bool {
         false
+    }
+    fn wants_preview(&self) -> bool {
+        false
+    }
+    fn preview(
+        &mut self,
+        _pixels: Vec<f32>,
+        _width: u32,
+        _height: u32,
+        _samples: u32,
+        _total: u32,
+    ) -> Result<()> {
+        Ok(())
     }
 }
 
@@ -243,6 +255,12 @@ pub fn render_to_pixels(
         render_settings.height = v;
     }
     render_settings.max_depth = render_settings.max_depth.min(31);
+    anyhow::ensure!(render_settings.spp > 0, "samples must be positive");
+    anyhow::ensure!(
+        render_settings.width > 0 && render_settings.height > 0,
+        "image dimensions must be positive"
+    );
+    anyhow::ensure!(!progress.cancelled(), "render cancelled");
 
     progress.log(&format!(
         "Scene: {}x{} @ {} spp, {} objects, {} meshes, {} mats, {} textures, lights(p/s/spot/rect/mesh): {}/{}/{}/{}/{}",
@@ -906,6 +924,12 @@ pub fn render_to_pixels(
     // --- Image buffer (float4 per pixel) ---
     let pixel_count = (render_settings.width * render_settings.height) as usize;
     let d_image: CudaSlice<f32> = stream.alloc_zeros(pixel_count * 4).cuda()?;
+    let progressive = progress.wants_preview();
+    let d_accumulation: Option<CudaSlice<f32>> = if progressive && render_settings.spp > 1 {
+        Some(stream.alloc_zeros(pixel_count * 3).cuda()?)
+    } else {
+        None
+    };
 
     // Denoiser guide AOVs: allocated (float3 per pixel) only when --denoise.
     let d_albedo: Option<CudaSlice<f32>> = if opts.denoise {
@@ -933,11 +957,14 @@ pub fn render_to_pixels(
     let d_back_face_warn: CudaSlice<u32> = stream.alloc_zeros(1).cuda()?;
     let primary_back_face_skip_exhausted = dptr_u32(&d_back_face_warn, &stream);
 
-    let lp = LaunchParams {
+    let mut lp = LaunchParams {
         image: dptr_f32(&d_image, &stream),
+        accumulation: d_accumulation.as_ref().map_or(0, |s| dptr_f32(s, &stream)),
         width: render_settings.width,
         height: render_settings.height,
         samples_per_pixel: render_settings.spp,
+        sample_start: 0,
+        sample_count: if progressive { 1 } else { render_settings.spp },
         max_depth: render_settings.max_depth,
         max_diffuse_bounces: render_settings.max_diffuse_bounces,
         max_glossy_bounces: render_settings.max_glossy_bounces,
@@ -1000,22 +1027,46 @@ pub fn render_to_pixels(
         world_volume: world_volume_ptr,
         primary_back_face_skip_exhausted,
     };
-    let d_params = alloc_and_copy(&stream, &lp)?;
+    let mut d_params = stream.clone_htod(&[lp]).cuda()?;
 
     progress.log("Rendering...");
     let t0 = std::time::Instant::now();
-    pipeline
-        .launch(
-            cu_stream,
-            d_params,
-            mem::size_of::<LaunchParams>(),
-            &sbt,
-            render_settings.width,
-            render_settings.height,
-            1,
-        )
-        .context("launch")?;
-    stream.synchronize().cuda()?;
+    let interval = std::time::Duration::from_millis(opts.preview_interval_ms.unwrap_or(100));
+    let mut last_preview = None;
+    while lp.sample_start < render_settings.spp {
+        anyhow::ensure!(!progress.cancelled(), "render cancelled");
+        stream.memcpy_htod(&[lp], &mut d_params).cuda()?;
+        let (params_ptr, _record_params) = d_params.device_ptr(&stream);
+        pipeline
+            .launch(
+                cu_stream,
+                params_ptr,
+                mem::size_of::<LaunchParams>(),
+                &sbt,
+                render_settings.width,
+                render_settings.height,
+                1,
+            )
+            .context("launch")?;
+        stream.synchronize().cuda()?;
+        let completed = lp.sample_start + lp.sample_count;
+        if progressive
+            && (completed == render_settings.spp
+                || last_preview.is_none_or(|t: std::time::Instant| t.elapsed() >= interval))
+        {
+            let pixels = stream.clone_dtoh(&d_image).cuda()?;
+            progress.preview(
+                pixels,
+                render_settings.width,
+                render_settings.height,
+                completed,
+                render_settings.spp,
+            )?;
+            last_preview = Some(std::time::Instant::now());
+        }
+        lp.sample_start = completed;
+    }
+    anyhow::ensure!(!progress.cancelled(), "render cancelled");
     progress.log(&format!("Render: {:.2?}", t0.elapsed()));
 
     // Read back the camera-ray back-face skip counter. Non-zero means the
@@ -1040,6 +1091,7 @@ pub fn render_to_pixels(
 
     // --- Optional OptiX denoiser (AOV model, HDR float4, no guides) ---
     let d_final = if opts.denoise {
+        progress.log("Denoising...");
         let t_dn = std::time::Instant::now();
         let w = render_settings.width;
         let h = render_settings.height;

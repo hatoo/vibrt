@@ -48,6 +48,12 @@ for shipping the source layout.
    process and copies the resulting RGBA float buffer
    into Blender's Combined pass.
 
+The first completed sample is displayed immediately. Further samples
+accumulate on the GPU, and Render Result and the sample counter update up to
+10 times per second. The final sample is always displayed. Esc stops between
+samples and keeps the latest preview; optional denoising runs once at the end.
+Scene export, compilation, and GPU setup still finish before sampling starts.
+
 Procedural skies and daylight-portal lighting are prepared separately in a
 background Blender process. Only their world/material inputs are snapshotted,
 including unsaved node edits; the main scene still renders in-process. This
@@ -58,13 +64,19 @@ For regression checks, run `make test` with a POSIX shell, then:
 
 ```
 blender -b --factory-startup --python-exit-code 1 --python scripts/test_sky_bake.py
-blender scene.blend --python scripts/test_render_job.py -- --expect-sky
+blender -b --factory-startup --python-exit-code 1 --python scripts/test_progressive_render.py
+blender scene.blend --python scripts/test_render_job.py -- --expect-sky --expect-progress
 ```
 
 The second command tests two asynchronous F12-style renders and exits Blender;
 use a separate process. It writes previews under `target/render-job-test/`
 without saving the scene or preferences. Omit `--expect-sky` for scenes without
 procedural sky or portal lighting.
+
+The progressive GPU test checks identical results to a single launch,
+normalization of the first sample, final denoising, snapshot lifetime,
+cancellation, and callback errors. The render-job test inspects actual Blender
+passes while F12 is still running.
 
 ## Supported features
 

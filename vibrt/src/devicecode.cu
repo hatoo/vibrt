@@ -3678,8 +3678,9 @@ extern "C" __global__ void __raygen__rg() {
   // cheap (one trace/pixel). The depth_aov drives the addon's Mist pass so
   // Cycles-authored compositors (mist haze, depth-based masks) work on top
   // of vibrt's output; misses store `cam_clip_end` so Mist saturates to 1.
-  if (params.albedo_aov != nullptr || params.normal_aov != nullptr ||
-      params.depth_aov != nullptr) {
+  if (params.sample_start == 0 &&
+      (params.albedo_aov != nullptr || params.normal_aov != nullptr ||
+       params.depth_aov != nullptr)) {
     float px0 = (2.0f * ((float)idx.x + 0.5f) / (float)dim.x) - 1.0f
                 + 2.0f * params.cam_shift_x;
     float py0 = (2.0f * ((float)idx.y + 0.5f) / (float)dim.y) - 1.0f
@@ -3759,7 +3760,11 @@ extern "C" __global__ void __raygen__rg() {
   }
 
   float3 accum = make_float3(0, 0, 0);
-  for (unsigned int s = 0; s < params.samples_per_pixel; s++) {
+  if (params.sample_start != 0 && params.accumulation != nullptr) {
+    accum = make_f3(&params.accumulation[pixel * 3]);
+  }
+  const unsigned int sample_end = params.sample_start + params.sample_count;
+  for (unsigned int s = params.sample_start; s < sample_end; s++) {
     RNG rng(pixel, s, 0u);
     float jx = rng.next();
     float jy = rng.next();
@@ -3797,7 +3802,13 @@ extern "C" __global__ void __raygen__rg() {
 
     accum = accum + trace_path(origin, dir, rng, params.cam_clip_start);
   }
-  float inv = 1.0f / (float)params.samples_per_pixel;
+  if (params.accumulation != nullptr) {
+    float *sum = &params.accumulation[pixel * 3];
+    sum[0] = accum.x;
+    sum[1] = accum.y;
+    sum[2] = accum.z;
+  }
+  float inv = 1.0f / (float)sample_end;
   accum = accum * inv;
 
   // y is 0 at top of image; we'll flip on CPU side for EXR.

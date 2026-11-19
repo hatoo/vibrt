@@ -28,6 +28,7 @@ def run_render_inproc(
     is_break,
     denoise: bool = False,
     texture_arrays=None,
+    preview_cb=None,
 ):
     """Render a live scene dict (or legacy JSON) and borrowed pixel/mesh buffers.
 
@@ -44,6 +45,8 @@ def run_render_inproc(
     color / colour-graph LUT data). Each entry is a numpy array; the Rust
     side picks them by `MeshDesc.array_index` references in the JSON.
     `texture_arrays` is the parallel list for `TextureDesc.array_index`.
+    `preview_cb(pixels, samples, total)` receives normalized, owned RGBA
+    snapshots while sampling. Omitting it keeps the single-launch path.
     """
     import numpy as np
     native = find_native_module()
@@ -70,7 +73,10 @@ def run_render_inproc(
     blobs_u8 = [b if b.dtype == np.uint8 else b.view(np.uint8) for b in mesh_blobs]
 
     opts = {"denoise": bool(denoise)}
+    kwargs = {"texture_arrays": texture_arrays}
+    if preview_cb is not None:
+        kwargs["preview_cb"] = preview_cb
     return native.render(
         scene_json, blobs_u8, opts, log_cb, cancel_cb,
-        texture_arrays=texture_arrays,
+        **kwargs,
     )

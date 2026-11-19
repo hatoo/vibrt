@@ -256,9 +256,12 @@ struct MeshLight {
 
 struct LaunchParams {
   float *image; // float4 per pixel
+  float *accumulation; // unnormalized float3 sums, optional for a single launch
   unsigned int width;
   unsigned int height;
   unsigned int samples_per_pixel;
+  unsigned int sample_start;
+  unsigned int sample_count;
   unsigned int max_depth;
   // Per-lobe bounce caps mirroring Cycles' diffuse/glossy/transmission
   // limits. Once a path has consumed its quota of one lobe type the

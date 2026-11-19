@@ -26,12 +26,42 @@ use pyo3::types::{PyDict, PyString};
 struct PyProgress {
     log_cb: Option<PyObject>,
     cancel_cb: Option<PyObject>,
+    preview_cb: Option<PyObject>,
+    callback_error: Option<PyErr>,
     /// Sticky once Python has signalled cancel — avoids re-polling after the
     /// caller has already asked us to stop.
     cancelled: bool,
 }
 
 impl Progress for PyProgress {
+    fn wants_preview(&self) -> bool {
+        self.preview_cb.is_some()
+    }
+
+    fn preview(
+        &mut self,
+        pixels: Vec<f32>,
+        width: u32,
+        height: u32,
+        samples: u32,
+        total: u32,
+    ) -> anyhow::Result<()> {
+        let Some(cb) = &self.preview_cb else {
+            return Ok(());
+        };
+        let result = Python::with_gil(|py| -> PyResult<()> {
+            let pixels = Array::from_shape_vec((height as usize, width as usize, 4), pixels)
+                .map_err(|e| PyRuntimeError::new_err(format!("preview reshape failed: {e}")))?;
+            cb.call1(py, (pixels.into_pyarray_bound(py), samples, total))?;
+            Ok(())
+        });
+        if let Err(error) = result {
+            self.callback_error = Some(error);
+            anyhow::bail!("preview callback failed");
+        }
+        Ok(())
+    }
+
     fn log(&mut self, msg: &str) {
         match &self.log_cb {
             Some(cb) => Python::with_gil(|py| {
@@ -88,6 +118,7 @@ fn parse_options(opts: &Bound<'_, PyDict>) -> PyResult<RenderOptions> {
         width: get_opt(opts, "width")?,
         height: get_opt(opts, "height")?,
         denoise,
+        preview_interval_ms: get_opt(opts, "preview_interval_ms")?,
     })
 }
 
@@ -110,7 +141,7 @@ fn parse_options(opts: &Bound<'_, PyDict>) -> PyResult<RenderOptions> {
 #[pyfunction]
 #[pyo3(signature = (
     scene_json, mesh_blobs, opts, log_cb = None, cancel_cb = None,
-    texture_arrays = None,
+    texture_arrays = None, preview_cb = None,
 ))]
 fn render<'py>(
     py: Python<'py>,
@@ -120,6 +151,7 @@ fn render<'py>(
     log_cb: Option<PyObject>,
     cancel_cb: Option<PyObject>,
     texture_arrays: Option<Vec<PyBuffer<f32>>>,
+    preview_cb: Option<PyObject>,
 ) -> PyResult<(Bound<'py, PyArray3<f32>>, Bound<'py, PyArray2<f32>>)> {
     let ro = parse_options(opts)?;
     let t_scene = std::time::Instant::now();
@@ -133,6 +165,8 @@ fn render<'py>(
     let mut progress = PyProgress {
         log_cb,
         cancel_cb,
+        preview_cb,
+        callback_error: None,
         cancelled: false,
     };
 
@@ -183,6 +217,9 @@ fn render<'py>(
 
     // Surface cooperative cancellation as KeyboardInterrupt so Blender's
     // operator machinery picks it up like Ctrl-C / Esc on any other engine.
+    if let Some(error) = progress.callback_error {
+        return Err(error);
+    }
     if progress.cancelled {
         return Err(PyKeyboardInterrupt::new_err("render cancelled"));
     }

@@ -355,9 +355,14 @@ pub struct MeshLight {
 pub struct LaunchParams {
     /// float4 image buffer (linear RGB + weight)
     pub image: optix_sys::CUdeviceptr,
+    /// Unnormalized float3 sums retained across progressive launches; 0 for
+    /// a single full render. Never accumulate previously normalized pixels.
+    pub accumulation: optix_sys::CUdeviceptr,
     pub width: u32,
     pub height: u32,
     pub samples_per_pixel: u32,
+    pub sample_start: u32,
+    pub sample_count: u32,
     pub max_depth: u32,
     /// Per-lobe bounce caps (Cycles `diffuse_bounces` / `glossy_bounces` /
     /// `transmission_bounces`). Tracked separately by the path tracer so
@@ -485,6 +490,10 @@ pub struct LaunchParams {
     /// fallback shading doesn't go unnoticed.
     pub primary_back_face_skip_exhausted: optix_sys::CUdeviceptr,
 }
+
+// SAFETY: repr(C), Copy, and only scalar/array/device-address fields. CUDA's
+// matching declaration is verified by scripts/check_struct_layouts.py.
+unsafe impl cudarc::driver::DeviceRepr for LaunchParams {}
 
 #[repr(C)]
 #[derive(Copy, Clone)]

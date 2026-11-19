@@ -16,6 +16,9 @@ import addon_utils
 import bpy
 import numpy as np
 
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
+
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--output", type=Path, default=Path("target/render-job-test"))
@@ -23,6 +26,7 @@ parser.add_argument("--percentage", type=int, default=25)
 parser.add_argument("--spp", type=int, default=4)
 parser.add_argument("--repeat", type=int, default=2)
 parser.add_argument("--expect-sky", action="store_true")
+parser.add_argument("--expect-progress", action="store_true")
 args = parser.parse_args(sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else [])
 assert not bpy.app.background, "Use a normal Blender process to test the render job thread"
 assert args.repeat > 0
@@ -30,6 +34,7 @@ args.output.mkdir(parents=True, exist_ok=True)
 if not addon_utils.check("vibrt_blender")[1]:
     addon_utils.enable("vibrt_blender")
 from vibrt_blender import exporter
+from vibrt_blender.progressive import RenderResultDisplay
 
 scene = bpy.context.scene
 scene.render.engine = "VIBRT"
@@ -40,6 +45,30 @@ scene.vibrt_denoise = False
 bpy.context.preferences.use_preferences_save = False
 bpy.context.preferences.view.render_display_type = "NONE"
 state = {"count": 0, "finished": False, "cancelled": False, "started": 0.0}
+previews = []
+original_display_update = RenderResultDisplay.update
+
+
+def observe_preview(display, pixels):
+    original_display_update(display, pixels)
+    assert not state["finished"], "Preview arrived after the render completed"
+    # Inspect the actual Blender pass after update_result(), not just the
+    # callback argument. This runs on the same F12 job thread as the addon.
+    # Iterating rect with np.asarray() repeatedly invokes RNA's full-array
+    # getter and becomes quadratic in pixel count. Read it once in bulk.
+    actual = np.empty(pixels.size, dtype=np.float32)
+    display.passes["Combined"].rect.foreach_get(actual)
+    actual = actual.reshape(pixels.shape)
+    np.testing.assert_array_equal(actual, pixels)
+    assert np.isfinite(actual).all()
+    # Retain small fingerprints, not a full-resolution copy of every frame.
+    previews.append(actual[::max(1, actual.shape[0] // 32),
+                           ::max(1, actual.shape[1] // 32), :3].copy())
+    print("[render-job-test] preview", len(previews), flush=True)
+
+
+if args.expect_progress:
+    RenderResultDisplay.update = observe_preview
 
 
 def scene_ids():
@@ -59,6 +88,7 @@ def cancelled(*_args):
 
 
 def begin_render():
+    previews.clear()
     state["finished"] = False
     state["started"] = time.monotonic()
     scene.render.filepath = str((args.output / f"render-{state['count'] + 1}.png").resolve())
@@ -85,6 +115,10 @@ def watch():
         assert scene_ids() == original_ids, "Render changed the user's scene datablocks"
         if args.expect_sky:
             assert exporter._SKY_BAKE_CACHE, "Sky bake was skipped"
+        if args.expect_progress:
+            assert len(previews) >= (2 if args.spp > 1 else 1), "No progressive frames"
+            if args.spp > 1:
+                assert not np.array_equal(previews[0], previews[-1]), "Preview did not converge"
         state["count"] += 1
         print("[render-job-test] PASS", state["count"], str(output), flush=True)
         if state["count"] < args.repeat:
