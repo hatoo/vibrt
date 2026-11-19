@@ -296,21 +296,22 @@ pub fn render_to_pixels(
     fn validate_shader_tree(
         material: &scene_format::PrincipledMaterial,
         depth: usize,
+        shader_stack_size: &mut usize,
     ) -> Result<usize> {
         anyhow::ensure!(depth <= 8, "Material shader tree exceeds 8 levels");
         if let Some(graph) = &material.shader_graph {
-            graph.validate()?;
+            *shader_stack_size = (*shader_stack_size).max(graph.required_stack_size()?);
         }
         let leaves = match (&material.left_subtree, &material.secondary) {
             (None, None) => 1,
             (left, right) => {
                 let l = if let Some(c) = left {
-                    validate_shader_tree(c, depth + 1)?
+                    validate_shader_tree(c, depth + 1, shader_stack_size)?
                 } else {
                     1
                 };
                 let r = if let Some(c) = right {
-                    validate_shader_tree(c, depth + 1)?
+                    validate_shader_tree(c, depth + 1, shader_stack_size)?
                 } else {
                     1
                 };
@@ -321,8 +322,9 @@ pub fn render_to_pixels(
         Ok(leaves)
     }
     let mut max_closures = 1;
+    let mut shader_stack_size = 1;
     for material in &scene.file.materials {
-        max_closures = max_closures.max(validate_shader_tree(material, 0)?);
+        max_closures = max_closures.max(validate_shader_tree(material, 0, &mut shader_stack_size)?);
     }
     fn shader_operations(material: &scene_format::PrincipledMaterial) -> u64 {
         let mut flags = 0;
@@ -349,7 +351,12 @@ pub fn render_to_pixels(
         .materials
         .iter()
         .fold(0, |mask, m| mask | shader_operations(m));
-    let ptx_src = pipeline::compile_ptx(shader_ops, max_closures)?;
+    // Bucket capacities to keep a small set of cached kernels across scene edits.
+    let ptx_src = pipeline::compile_ptx(
+        shader_ops,
+        max_closures,
+        shader_stack_size.max(4).next_power_of_two(),
+    )?;
     let ptx_time = t_ptx.elapsed();
     let t_pipeline = std::time::Instant::now();
 
@@ -495,14 +502,18 @@ pub fn render_to_pixels(
             left_subtree_ptr,
         );
         if let Some(graph) = &mat.shader_graph {
-            (gpu.shader_nodes, gpu.shader_len, gpu.shader_outputs) =
-                principled::upload_shader_graph(
-                    graph,
-                    tex_slots,
-                    stream,
-                    color_graph_buffers,
-                    color_graph_lut_buffers,
-                )?;
+            (
+                gpu.shader_nodes,
+                gpu.shader_len,
+                gpu.shader_outputs,
+                gpu.shader_contexts,
+            ) = principled::upload_shader_graph(
+                graph,
+                tex_slots,
+                stream,
+                color_graph_buffers,
+                color_graph_lut_buffers,
+            )?;
         }
         Ok(alloc_and_copy(stream, &gpu)?)
     }

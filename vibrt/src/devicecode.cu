@@ -815,40 +815,67 @@ static __device__ __noinline__ float3 shadow_transmittance(float3 P, float3 dir,
 #include "vibrt_nodes_core.h"
 #include "vibrt_shader.h"
 
-static __device__ void shader_context(const PathVertex &v, vibrt_cycles::float4 *ctx) {
+static __device__ void shader_context(const PathVertex &v, vibrt_cycles::float4 *ctx,
+                                      unsigned int mask) {
   using vibrt_cycles::make_float4;
-  for(int i=0;i<32;i++)ctx[i]=make_float4(0);
-  ctx[0]=make_float4(v.uv.x,v.uv.y,0,1);
-#define CTX_VEC(I,V) ctx[I]=make_float4((V).x,(V).y,(V).z,1)
+#define NEED(I) (mask & (1u << (I)))
+#define CTX_VEC(I,V) if(NEED(I))ctx[I]=make_float4((V).x,(V).y,(V).z,1)
+  if(NEED(0))ctx[0]=make_float4(v.uv.x,v.uv.y,0,1);
   CTX_VEC(1,v.generated);CTX_VEC(2,v.P_object);CTX_VEC(3,v.P);
   CTX_VEC(4,v.Ns);CTX_VEC(5,v.Ng);CTX_VEC(6,v.incoming);
-  float3 T=v.dPdu,B;if(dot3(T,T)<1e-8f)build_frame(v.Ns,T,B);else T=normalize3(T-v.Ns*dot3(T,v.Ns));
-  CTX_VEC(7,T);CTX_VEC(8,v.vc);
-  ctx[8].w=v.vertex_alpha;
-  ctx[17]=make_float4(dot3(cross3(v.Ns,T),v.dPdv)<0?-1.0f:1.0f,0,0,0);
-  ctx[9]=make_float4(v.object_random,v.geometry?(float)v.geometry->object_index:0,0,v.geometry?v.geometry->object_color[3]:1);
-  CTX_VEC(10,v.object_location);ctx[11]=v.geometry?make_float4(v.geometry->object_color[0],v.geometry->object_color[1],v.geometry->object_color[2],v.geometry->object_color[3]):make_float4(1);
-  float3 cp=v.P-make_f3(params.cam_eye);
-  float3 cr=make_float3(dot3(cp,normalize3(make_f3(params.cam_u))),dot3(cp,normalize3(make_f3(params.cam_v))),dot3(cp,normalize3(make_f3(params.cam_w))));
-  CTX_VEC(12,cr);CTX_VEC(13,v.N_object);
-  float z=dot3(cp,normalize3(make_f3(params.cam_w)));
-  ctx[14]=make_float4(0.5f+0.5f*dot3(cp,make_f3(params.cam_u))/fmaxf(z*dot3(make_f3(params.cam_u),make_f3(params.cam_u)),1e-8f),0.5f+0.5f*dot3(cp,make_f3(params.cam_v))/fmaxf(z*dot3(make_f3(params.cam_v),make_f3(params.cam_v)),1e-8f),0,1);
-  float3 refl=2.0f*dot3(v.Ns,v.incoming)*v.Ns-v.incoming;
-  CTX_VEC(15,refl);ctx[16]=vibrt_shader::scalar(dot3(v.Ng,v.incoming)<0?1.0f:0.0f);
-  ctx[18]=make_float4(v.ray_length,(float)v.path_depth,(float)v.diffuse_depth,(float)v.glossy_depth);
-  ctx[19]=make_float4((float)v.transmission_depth,0,0,0);
-  for(int i=0;i<4;i++){ctx[20][i]=(v.path_flags&(1u<<i))?1.0f:0.0f;ctx[21][i]=(v.path_flags&(1u<<(i+4)))?1.0f:0.0f;}
-  if(v.geometry)for(int i=0;i<3;i++) {
-    const float *a=v.geometry->object_to_world+4*i,*b=v.geometry->world_to_object+4*i;
-    ctx[22+i]=make_float4(a[0],a[1],a[2],a[3]);ctx[25+i]=make_float4(b[0],b[1],b[2],b[3]);
+  if(NEED(7)||NEED(17)) {
+    float3 T=v.dPdu,B;
+    if(dot3(T,T)<1e-8f)build_frame(v.Ns,T,B);
+    else T=normalize3(T-v.Ns*dot3(T,v.Ns));
+    CTX_VEC(7,T);
+    if(NEED(17))ctx[17]=make_float4(dot3(cross3(v.Ns,T),v.dPdv)<0?-1.0f:1.0f,0,0,0);
   }
-  float3 axes[3]={normalize3(make_f3(params.cam_u)),normalize3(make_f3(params.cam_v)),normalize3(make_f3(params.cam_w))};
-  for(int i=0;i<3;i++)ctx[28+i]=make_float4(axes[i].x,axes[i].y,axes[i].z,-dot3(axes[i],make_f3(params.cam_eye)));
+  if(NEED(8))ctx[8]=make_float4(v.vc.x,v.vc.y,v.vc.z,v.vertex_alpha);
+  if(NEED(9))ctx[9]=make_float4(v.object_random,v.geometry?(float)v.geometry->object_index:0,0,v.geometry?v.geometry->object_color[3]:1);
+  CTX_VEC(10,v.object_location);
+  if(NEED(11))ctx[11]=v.geometry?make_float4(v.geometry->object_color[0],v.geometry->object_color[1],v.geometry->object_color[2],v.geometry->object_color[3]):make_float4(1);
+  if(NEED(12)||NEED(14)) {
+    float3 cp=v.P-make_f3(params.cam_eye);
+    if(NEED(12)) {
+      float3 cr=make_float3(dot3(cp,normalize3(make_f3(params.cam_u))),dot3(cp,normalize3(make_f3(params.cam_v))),dot3(cp,normalize3(make_f3(params.cam_w))));
+      CTX_VEC(12,cr);
+    }
+    if(NEED(14)) {
+      float z=dot3(cp,normalize3(make_f3(params.cam_w)));
+      ctx[14]=make_float4(0.5f+0.5f*dot3(cp,make_f3(params.cam_u))/fmaxf(z*dot3(make_f3(params.cam_u),make_f3(params.cam_u)),1e-8f),0.5f+0.5f*dot3(cp,make_f3(params.cam_v))/fmaxf(z*dot3(make_f3(params.cam_v),make_f3(params.cam_v)),1e-8f),0,1);
+    }
+  }
+  CTX_VEC(13,v.N_object);
+  if(NEED(15)) {
+    float3 refl=2.0f*dot3(v.Ns,v.incoming)*v.Ns-v.incoming;
+    CTX_VEC(15,refl);
+  }
+  if(NEED(16))ctx[16]=vibrt_shader::scalar(dot3(v.Ng,v.incoming)<0?1.0f:0.0f);
+  if(NEED(18))ctx[18]=make_float4(v.ray_length,(float)v.path_depth,(float)v.diffuse_depth,(float)v.glossy_depth);
+  if(NEED(19))ctx[19]=make_float4((float)v.transmission_depth,0,0,0);
+  if(NEED(20))for(int i=0;i<4;i++)ctx[20][i]=(v.path_flags&(1u<<i))?1.0f:0.0f;
+  if(NEED(21))for(int i=0;i<4;i++)ctx[21][i]=(v.path_flags&(1u<<(i+4)))?1.0f:0.0f;
+  if(mask&(0x3fu<<22))for(int i=0;i<3;i++) {
+    if(NEED(22+i)) {
+      const float *a=v.geometry?v.geometry->object_to_world+4*i:nullptr;
+      ctx[22+i]=a?make_float4(a[0],a[1],a[2],a[3]):make_float4(0);
+    }
+    if(NEED(25+i)) {
+      const float *b=v.geometry?v.geometry->world_to_object+4*i:nullptr;
+      ctx[25+i]=b?make_float4(b[0],b[1],b[2],b[3]):make_float4(0);
+    }
+  }
+  if(mask&(7u<<28)) {
+    float3 axes[3]={normalize3(make_f3(params.cam_u)),normalize3(make_f3(params.cam_v)),normalize3(make_f3(params.cam_w))};
+    for(int i=0;i<3;i++)if(NEED(28+i))ctx[28+i]=make_float4(axes[i].x,axes[i].y,axes[i].z,-dot3(axes[i],make_f3(params.cam_eye)));
+  }
+  if(NEED(31))ctx[31]=make_float4(0);
 #undef CTX_VEC
+#undef NEED
 }
-static __device__ __noinline__ void evaluate_shader(PrincipledGpu *m,const PathVertex &v,vibrt_cycles::float4 *out) {
-  vibrt_cycles::float4 ctx[32];shader_context(v,ctx);
-  vibrt_shader::evaluate((const ShaderInstruction*)m->shader_nodes,m->shader_len,ctx,out);
+static __device__ __noinline__ void evaluate_shader(PrincipledGpu *m,const PathVertex &v,vibrt_cycles::float4 *out,unsigned int requested=vibrt_shader::EVAL_ALL) {
+  vibrt_cycles::float4 ctx[32];shader_context(v,ctx,m->shader_contexts);
+  vibrt_shader::evaluate((const ShaderInstruction*)m->shader_nodes,m->shader_len,ctx,out,requested);
 }
 static __device__ float3 eval_color_graph(
     ColorGraphNode *nodes, int n, int output, float2 uv, float3 vc, float random) {
@@ -999,7 +1026,7 @@ static __device__ __noinline__ MaterialEval eval_material_one(const PathVertex &
       du.P=du.P+v.dPdu*delta;dv.P=dv.P+v.dPdv*delta;
       du.P_object=du.P_object+v.dOdu*delta;dv.P_object=dv.P_object+v.dOdv*delta;
       du.generated=du.generated+v.dGdu*delta;dv.generated=dv.generated+v.dGdv*delta;
-      vibrt_cycles::float4 out_u[32],out_v[32];evaluate_shader(m,du,out_u);evaluate_shader(m,dv,out_v);
+      vibrt_cycles::float4 out_u[32],out_v[32];evaluate_shader(m,du,out_u,vibrt_shader::EVAL_BUMP);evaluate_shader(m,dv,out_v,vibrt_shader::EVAL_BUMP);
       float dhdu=(out_u[26].x-out[26].x)/delta,dhdv=(out_v[26].x-out[26].x)/delta;
       float3 r1=cross3(v.dPdv,graph_normal),r2=cross3(graph_normal,v.dPdu);
       float det=dot3(v.dPdu,r1);
@@ -1137,7 +1164,7 @@ static __device__ __noinline__ MaterialEval eval_material_one(const PathVertex &
 // things like edge-wear blends or multi-material decals.
 static __device__ float compute_level_mix_fac(PrincipledGpu *m, const PathVertex &v,
                                               float NoV) {
-  if(m->shader_outputs&(1u<<23)){vibrt_cycles::float4 out[32];evaluate_shader(m,v,out);return fminf(fmaxf(out[23].x,0.0f),1.0f);}
+  if(m->shader_outputs&(1u<<23)){vibrt_cycles::float4 out[32];evaluate_shader(m,v,out,vibrt_shader::EVAL_MIX);return fminf(fmaxf(out[23].x,0.0f),1.0f);}
   float2 uv_raw=v.uv;
   // View-dependent Fresnel mix factor: the exporter encodes a Fresnel /
   // Layer-Weight MixShader factor as a NEGATIVE mix_fac whose magnitude is
@@ -1203,6 +1230,8 @@ static __device__ __noinline__ int eval_material(const PathVertex &v,
   int n = 0;
   while (sp > 0 && n < max_leaves) {
     Frame f = stack[--sp];
+    if (f.weight == 0.0f)
+      continue;
     PrincipledGpu *node = f.node;
     bool has_right = (node->secondary != nullptr);
     bool has_left = (node->left_subtree != nullptr);
@@ -1921,11 +1950,11 @@ static __device__ BsdfSample sample_bsdf(const MaterialEvalGroup &g,
 
 static __device__ __noinline__ void fill_surface_vertex(PathVertex*,HitGroupData*,unsigned int,float2,float3,float,unsigned int);
 
-static __device__ __noinline__ float4 emission_alpha(const PathVertex &v) {
+static __device__ __noinline__ float4 emission_alpha(const PathVertex &v,bool include_emission=true) {
   struct Entry {PrincipledGpu *m;float w;bool leaf;};
   Entry stack[32];int sp=0;stack[sp++]={v.mat,1,false};
   float3 emission=make_float3(0,0,0);float transparent=0;
-  while(sp){Entry e=stack[--sp];PrincipledGpu *m=e.m;
+  while(sp){Entry e=stack[--sp];if(e.w==0.0f)continue;PrincipledGpu *m=e.m;
     if(!e.leaf&&(m->left_subtree||m->secondary)){
       float fac=compute_level_mix_fac(m,v,fabsf(dot3(v.Ns,v.incoming)));
       stack[sp++]={m->secondary?m->secondary:m,e.w*(m->add_shader?1:fac),!m->secondary};
@@ -1933,10 +1962,11 @@ static __device__ __noinline__ float4 emission_alpha(const PathVertex &v) {
       continue;
     }
     float3 em=make_f3(m->emission);float alpha=m->alpha_blend;
-    if(m->emission_tex){const float *M=m->uv_transform;float2 uv=make_float2(M[0]*v.uv.x+M[1]*v.uv.y+M[2],M[3]*v.uv.x+M[4]*v.uv.y+M[5]);em=em*sample_rgba(m->emission_tex,m->emission_tex_w,m->emission_tex_h,m->emission_tex_channels,uv);}
-    if(m->shader_len){vibrt_cycles::float4 out[32];evaluate_shader(m,v,out);
-      if(m->shader_outputs&(1u<<5))em=make_float3(out[5].x,out[5].y,out[5].z);
-      if(m->shader_outputs&(1u<<6))em=em*out[6].x;
+    if(include_emission&&m->emission_tex){const float *M=m->uv_transform;float2 uv=make_float2(M[0]*v.uv.x+M[1]*v.uv.y+M[2],M[3]*v.uv.x+M[4]*v.uv.y+M[5]);em=em*sample_rgba(m->emission_tex,m->emission_tex_w,m->emission_tex_h,m->emission_tex_channels,uv);}
+    unsigned int outputs=(1u<<7)|(include_emission?((1u<<5)|(1u<<6)):0);
+    if(m->shader_outputs&outputs){vibrt_cycles::float4 out[32];evaluate_shader(m,v,out,vibrt_shader::EVAL_ALPHA|(include_emission?vibrt_shader::EVAL_EMISSION:0));
+      if(include_emission&&(m->shader_outputs&(1u<<5)))em=make_float3(out[5].x,out[5].y,out[5].z);
+      if(include_emission&&(m->shader_outputs&(1u<<6)))em=em*out[6].x;
       if(m->shader_outputs&(1u<<7))alpha=fminf(fmaxf(out[7].x,0.0f),1.0f);
     }
     emission=emission+em*(e.w*alpha);transparent+=e.w*(1-alpha);
@@ -2809,8 +2839,8 @@ extern "C" __global__ void __anyhit__ah() {
   // the camera-side window mix worked but rooms ended up ~5% too bright
   // because shadow rays through windows weren't attenuated.
   float shadow_alpha=m->alpha_blend;
-  if(is_shadow_ray && (m->shader_len||m->secondary||m->left_subtree)) {
-    PathVertex v;fill_path_vertex(&v);shadow_alpha=emission_alpha(v).w;
+  if(is_shadow_ray && ((m->shader_outputs&(1u<<7))||m->secondary||m->left_subtree)) {
+    PathVertex v;fill_path_vertex(&v);shadow_alpha=emission_alpha(v,false).w;
   }
   if (is_shadow_ray && shadow_alpha < 1.0f) {
     float3 ray_o = optixGetWorldRayOrigin();

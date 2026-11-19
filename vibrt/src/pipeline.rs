@@ -23,7 +23,11 @@ pub fn find_optix_include() -> String {
     panic!("OptiX SDK not found. Set OPTIX_ROOT.");
 }
 
-pub fn compile_ptx(shader_ops: u64, max_closures: usize) -> Result<String> {
+pub fn compile_ptx(
+    shader_ops: u64,
+    max_closures: usize,
+    shader_stack_size: usize,
+) -> Result<String> {
     let cu_src = include_str!("devicecode.cu");
     let header_src = include_str!("devicecode.h");
     let opts = cudarc::nvrtc::CompileOptions {
@@ -32,7 +36,7 @@ pub fn compile_ptx(shader_ops: u64, max_closures: usize) -> Result<String> {
         ..Default::default()
     };
     let full_src = format!(
-        "#define VIBRT_SHADER_OPS {shader_ops}ull\n#define VIBRT_MAX_CLOSURES {max_closures}\n// -- inlined devicecode.h --\n{}\n// -- devicecode.cu --\n{}",
+        "#define VIBRT_SHADER_OPS {shader_ops}ull\n#define VIBRT_MAX_CLOSURES {max_closures}\n#define VIBRT_SHADER_STACK_SIZE {shader_stack_size}\n// -- inlined devicecode.h --\n{}\n// -- devicecode.cu --\n{}",
         header_src.replace(
             "#include \"vibrt_nodes_types.h\"",
             vibrt_nodes::DEVICE_TYPES

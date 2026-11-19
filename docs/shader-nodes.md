@@ -17,8 +17,13 @@ Mix/Add support up to 16 closure leaves and 8 levels. GPU stack sizes are
 queried from OptiX. Only used operations enter the per-scene compiled module.
 PTX is cached in the system temporary directory and OptiX maintains its own
 compiled-module cache. New operation/closure combinations still incur a cold
-compile: the tested Classroom scene reached its first preview in about 29 s
-with compilation and 1.4 s on the next render (RTX 5080, 25%, 4 samples).
+compile; measure that separately from per-sample rendering time.
+
+Packing removes unreachable nodes and reuses temporary slots after their last
+read. The per-scene kernel reserves only the required slot capacity, rounded
+to a power of two. Bump derivatives evaluate height dependencies; shadow rays
+evaluate opacity; light samples evaluate emission and opacity. Coordinate and
+matrix preparation is limited to contexts actually read by each graph.
 
 Math implements 41 operations; Vector Math 30; color Mix 19. Noise supports
 1D–4D and all five fractal modes; Voronoi supports all five features, four
@@ -161,3 +166,21 @@ Native: **45**, Partial: **24**, Legacy: **8**, Unsupported: **17**, Outside Cyc
 Test artifacts are under `target/shader-nodes` and `target/shader-graphs`.
 Pinned source, hashes, adaptations and licenses are documented in
 [`vibrt-nodes/third_party/cycles`](../vibrt-nodes/third_party/cycles/README.md).
+
+## Rendering performance
+
+Run the same scene, resolution, samples and preview mode for each revision:
+
+```sh
+blender -b --factory-startup test_scenes/classroom/classroom/classroom.blend \
+  --python-exit-code 1 --python scripts/benchmark_render.py -- \
+  --output target/render-bench/current --percentage 25 --spp 32
+```
+
+The script exports once and renders twice without denoising. `results.json`
+separates export/preparation from render time and records every sample callback
+without Blender display work. `--repo` selects another checkout with its own
+staged native extension; `--batch` measures rendering without preview readback.
+`--without-graphs` and `--without-bump` are diagnostic ablations that change
+materials. Likewise, versions predating graph support can omit material detail;
+their timings do not represent equivalent rendering quality.

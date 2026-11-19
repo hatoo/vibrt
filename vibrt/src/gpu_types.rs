@@ -81,6 +81,7 @@ pub struct PrincipledGpu {
     pub shader_nodes: optix_sys::CUdeviceptr,
     pub shader_len: i32,
     pub shader_outputs: u32,
+    pub shader_contexts: u32,
     /// Optional pointer to a `VolumeGpu`. Non-null means the bounded mesh is
     /// a volume container (junk_shop's `Smoke` is the canonical case).
     pub volume: optix_sys::CUdeviceptr,

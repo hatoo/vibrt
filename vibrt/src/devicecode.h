@@ -83,6 +83,7 @@ struct PrincipledGpu {
   unsigned long long shader_nodes;
   int shader_len;
   unsigned int shader_outputs;
+  unsigned int shader_contexts;
   Volume *volume;       // nullptr if the material has no volume
   int volume_only;      // 1 if Surface socket is unlinked (boundary is invisible)
   // 1 = Cycles' ShaderNodeBsdfAnisotropic / Glossy semantics on the

@@ -196,18 +196,24 @@ template <typename T> VN_DEVICE float4 voronoi(const VoronoiParams &params, T p,
 
 // Context ABI: 32 float4 values. Outputs are 32 float4 socket values.
 // Host validation guarantees topological order, arity, mode and table bounds.
+#ifndef VIBRT_SHADER_STACK_SIZE
+#define VIBRT_SHADER_STACK_SIZE 256
+#endif
+enum EvalGroup { EVAL_ALL = 1, EVAL_BUMP = 2, EVAL_ALPHA = 4, EVAL_EMISSION = 8, EVAL_MIX = 16 };
 VN_DEVICE void evaluate(const ShaderInstruction *nodes, int count, const float4 *ctx,
-                        float4 *outputs) {
-  float4 slots[256];
+                        float4 *outputs, unsigned int requested = EVAL_ALL) {
+  float4 slots[VIBRT_SHADER_STACK_SIZE];
   for (int i = 0; i < count; i++) {
     const ShaderInstruction &n = nodes[i];
+    if (!((n.op >> 8) & requested))
+      continue;
     const unsigned int *m = n.modes;
     const float *p = n.params;
 #define A(k) slots[n.inputs[k]]
 #define S(k) (A(k).x)
 #define V(k) xyz(A(k))
     float4 r = make_float4(0, 0, 0, 1);
-    switch (n.op) {
+    switch (n.op & 255) {
 #if (VIBRT_SHADER_OPS & (1ull << 0))
     case 0:
       r = make_float4(p[0], p[1], p[2], p[3]);
@@ -688,7 +694,7 @@ VN_DEVICE void evaluate(const ShaderInstruction *nodes, int count, const float4 
     for (int ch = 0; ch < 4; ch++)
       if (!(fabsf(r[ch]) <= FLT_MAX))
         r[ch] = 0;
-    slots[i] = r;
+    slots[n.op >> 16] = r;
 #undef A
 #undef S
 #undef V

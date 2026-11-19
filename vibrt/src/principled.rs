@@ -49,7 +49,7 @@ pub fn upload_shader_graph(
     stream: &Arc<CudaStream>,
     buffers: &mut Vec<CudaSlice<u32>>,
     tables: &mut Vec<CudaSlice<f32>>,
-) -> Result<(u64, i32, u32)> {
+) -> Result<(u64, i32, u32, u32)> {
     graph.validate()?;
     let mut pointers = Vec::with_capacity(graph.nodes.len());
     for node in &graph.nodes {
@@ -76,7 +76,7 @@ pub fn upload_shader_graph(
                 .position(|n| n == name)
                 .unwrap();
     }
-    Ok((ptr, packed.len() as i32, mask))
+    Ok((ptr, packed.len() as i32, mask, graph.required_contexts()?))
 }
 
 /// Flatten a `ColorGraph` into the on-device `ColorGraphNode` layout and
@@ -309,6 +309,7 @@ pub fn make_material_data(
         shader_nodes: 0,
         shader_len: 0,
         shader_outputs: 0,
+        shader_contexts: 0,
         volume: volume_ptr,
         volume_only: if mat.volume_only { 1 } else { 0 },
         pure_glossy: if mat.pure_glossy { 1 } else { 0 },
