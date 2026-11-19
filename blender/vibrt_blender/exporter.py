@@ -1037,6 +1037,19 @@ def _export_light(obj, writer, textures: list) -> dict | None:
         mw_flipz[6] = -mw_flipz[6]
         mw_flipz[10] = -mw_flipz[10]
         mw_flipz[14] = -mw_flipz[14]
+        # Cycles "Portal" area lights (Light Properties → Portal) do NOT emit —
+        # they importance-sample the world HDRI through the opening (window)
+        # they cover. Export as a `portal` rect so the kernel samples the HDRI
+        # through them, rather than an emitting area light (which double-adds
+        # light Cycles never contributes). flat_archiviz's "PRTL LGT" panels.
+        cyl = getattr(light, "cycles", None)
+        if cyl is not None and getattr(cyl, "is_portal", False):
+            _emit(
+                f"[vibrt] area light {obj.name!r} is a Cycles portal — "
+                f"exporting as an HDRI portal (samples the world through the "
+                f"opening; does not emit)"
+            )
+            return {"type": "portal", "transform": mw_flipz, "size": size}
         out = {
             "type": "area_rect",
             "transform": mw_flipz,
@@ -2830,6 +2843,9 @@ def _export_into(
 
     cam_obj = None
     lights_json: list[dict] = []
+    # Cycles world PORTALS (is_portal area lights): rects the kernel samples
+    # the HDRI through, not emitters. See `_export_light`.
+    portals_json: list[dict] = []
     # Mesh lights: emissive meshes registered for true triangle-mesh NEE.
     # Each entry is `{"object_idx": N}` referencing an object that's already
     # in `objects[]`; the loader walks that object's mesh + material slots,
@@ -3165,7 +3181,10 @@ def _export_into(
                 elif obj_eval.type == "LIGHT":
                     light = _export_light(obj_eval, writer, textures)
                     if light is not None:
-                        lights_json.append(light)
+                        if light.get("type") == "portal":
+                            portals_json.append(light)
+                        else:
+                            lights_json.append(light)
                 elif obj_eval.type == "CAMERA" and obj_eval == scene.camera.evaluated_get(
                     depsgraph
                 ):
@@ -3259,6 +3278,7 @@ def _export_into(
         "textures": textures,
         "objects": objects,
         "lights": lights_json,
+        "portals": portals_json,
         "mesh_lights": mesh_lights_json,
         "world": world,
     }
