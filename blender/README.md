@@ -44,9 +44,27 @@ for shipping the source layout.
 5. In the Sampling panel, set **Samples** (`vibrt_spp`) and **Clamp Indirect** (`vibrt_clamp_indirect`).
 
 6. Press `F12` (or `Render > Render Image`). The addon hands the
-   evaluated scene directly to `vibrt_native.render(...)` — no temp
-   files, no subprocess — and copies the resulting RGBA float buffer
+   evaluated scene directly to `vibrt_native.render(...)` in the same
+   process and copies the resulting RGBA float buffer
    into Blender's Combined pass.
+
+Procedural skies and daylight-portal lighting are prepared separately in a
+background Blender process. Only their world/material inputs are snapshotted,
+including unsaved node edits; the main scene still renders in-process. This
+avoids creating temporary scenes inside F12's render thread. Esc cancels the
+preparation worker as well as the render.
+
+For regression checks, run `make test` with a POSIX shell, then:
+
+```
+blender -b --factory-startup --python-exit-code 1 --python scripts/test_sky_bake.py
+blender scene.blend --python scripts/test_render_job.py -- --expect-sky
+```
+
+The second command tests two asynchronous F12-style renders and exits Blender;
+use a separate process. It writes previews under `target/render-job-test/`
+without saving the scene or preferences. Omit `--expect-sky` for scenes without
+procedural sky or portal lighting.
 
 ## Supported features
 

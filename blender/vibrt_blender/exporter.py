@@ -1563,10 +1563,9 @@ def prebake_sky_envmaps_for_world(world, w: int = 2048, h: int = 1024) -> None:
        hit this path because their surface is a MixShader of two
        Backgrounds, not a single Background.
 
-    Safe to call repeatedly: returns early on cache hit. Must be called
-    from `RenderEngine.update()` (or other non-render context) — Blender
-    silently produces an all-zero image for nested renders started from
-    inside `render()`.
+    Safe to call repeatedly: returns early on cache hit. Run only outside
+    an active render, on the background bake worker's main thread. Render
+    callbacks must use sky_bake.prepare_scene instead.
     """
     sky = _world_sky_node(world)
     if sky is not None:
@@ -2099,21 +2098,14 @@ def _prebake_portal_emission(scene, mat, emission_node, w: int, h: int) -> None:
     bpy.data.worlds.remove(tmp_world, do_unlink=True)
 
 
-def prebake_portal_emissions_for_scene(scene, w: int = 1024, h: int = 512) -> None:
-    """Pre-bake every daylight-portal Emission(TexSky) chain in the
-    scene's materials into `_SKY_BAKE_CACHE`. Called from
-    `RenderEngine.update()` alongside `prebake_sky_envmaps_for_world`.
-
-    Skipped when the scene's World already has its own non-trivial
-    background — the existing world bake covers the sky lighting in
-    that case and a portal envmap would just duplicate it.
-    """
+def _portal_emissions_to_bake(scene):
+    """Find portal skies only when the world has no lighting of its own."""
     world = scene.world
     if world is not None and world.use_nodes:
         # World has its own Background-driven envmap (TexSky / TexEnvironment)
         # → existing bake handles it; the portal route would only confuse.
         if _world_sky_node(world) is not None:
-            return
+            return []
         out = world.node_tree.nodes.get("World Output") if world.node_tree else None
         if out is None and world.node_tree:
             out = next(
@@ -2139,8 +2131,13 @@ def prebake_portal_emissions_for_scene(scene, w: int = 1024, h: int = 512) -> No
                     is_black = (not has_color_link
                                 and (max(color_default) < 1e-6 or strength == 0.0))
                     if not is_black:
-                        return
-    portals = _walk_scene_for_portal_emissions(scene)
+                        return []
+    return _walk_scene_for_portal_emissions(scene)
+
+
+def prebake_portal_emissions_for_scene(scene, w: int = 1024, h: int = 512) -> None:
+    """Bake a portal sky outside an active render, in the bake worker."""
+    portals = _portal_emissions_to_bake(scene)
     if not portals:
         return
     if len(portals) > 1:
@@ -2422,12 +2419,9 @@ def _bake_sky_world_to_pixels(world, w: int = 1024, h: int = 512):
     rgb = None
     try:
         # Pass the scene name explicitly so the operator targets our temp
-        # scene instead of bpy.context.scene (we don't switch the window
-        # context, so this is the only way to direct the render). Note:
-        # Blender silently produces an all-zero image when this runs from
-        # inside `RenderEngine.render()` — the bake MUST be called from
-        # `RenderEngine.update()` (or another non-rendering context). The
-        # caller (engine.py) drives that.
+        # scene instead of bpy.context.scene. This must run outside any
+        # active render: nested renders are unsafe even in engine.update().
+        # sky_bake.py calls this on a separate Blender process's main thread.
         bpy.ops.render.render(scene=tmp.name, write_still=True)
         img_loaded = bpy.data.images.load(exr_path)
         # Mark linear so colourspace conversion is skipped on read.

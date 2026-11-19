@@ -14,7 +14,7 @@ import time
 
 import bpy
 
-from . import _log, exporter, runner
+from . import _log, exporter, runner, sky_bake
 
 
 class VibrtRenderEngine(bpy.types.RenderEngine):
@@ -37,33 +37,23 @@ class VibrtRenderEngine(bpy.types.RenderEngine):
     bl_use_postprocess = False
 
     def update(self, data=None, depsgraph=None):
-        # `update()` is Blender's "prepare-to-render" hook. We use it to
-        # pre-bake any procedural Sky Texture (Nishita / Hosek-Wilkie /
-        # Preetham) the user has on their World — that involves running a
-        # nested `bpy.ops.render.render` against a temp scene, which
-        # Blender silently turns into an all-zero render if invoked from
-        # `render()` but works fine here. Pixels land in the
-        # `_SKY_BAKE_CACHE` keyed by the Sky Texture's controls; the
-        # exporter (which runs inside render()) reads from the cache.
-        scene = bpy.context.scene if data is None else (
-            getattr(data, "scene", None) or bpy.context.scene
-        )
+        # F12 calls update() on Blender's render job thread. Creating a
+        # temporary scene/camera here races the UI's depsgraph and can crash
+        # Blender before vibrt starts. Bake in an isolated background process.
+        scene = depsgraph.scene if depsgraph is not None else bpy.context.scene
+        self._sky_bake_error = None
         try:
             exporter.clear_sky_bake_cache()
-            exporter.prebake_sky_envmaps_for_world(scene.world)
-            # Daylight portals carry an artist-tagged Sky Texture chain
-            # in their MixShader's Emission branch. Cycles uses this for
-            # importance-sampled sky lighting; we bake it as a fallback
-            # world envmap when the actual World output is constant
-            # black (classroom is the canonical case).
-            exporter.prebake_portal_emissions_for_scene(scene)
-        except Exception as ex:
-            # Don't take down the whole render if the bake fails — emit a
-            # visible warning and let _export_world fall back to constant.
-            self.report(
-                {"WARNING"},
-                f"vibrt: sky pre-bake in update() failed: {ex}",
+            sky_bake.prepare_scene(
+                scene, cancel=self.test_break,
+                log=lambda msg: self.report({"INFO"}, msg),
             )
+        except KeyboardInterrupt:
+            self._sky_bake_error = "Sky preparation cancelled"
+            self.report({"INFO"}, self._sky_bake_error)
+        except Exception as ex:
+            self._sky_bake_error = f"vibrt: sky preparation failed: {ex}"
+            self.report({"ERROR"}, self._sky_bake_error)
 
     def update_render_passes(self, scene=None, renderlayer=None):
         """Tell Blender which passes we'll write so they exist on the
@@ -95,6 +85,8 @@ class VibrtRenderEngine(bpy.types.RenderEngine):
         )
 
     def render(self, depsgraph: bpy.types.Depsgraph):
+        if getattr(self, "_sky_bake_error", None):
+            return
         scene = depsgraph.scene_eval
         rd = scene.render
         width = int(rd.resolution_x * rd.resolution_percentage / 100.0)
