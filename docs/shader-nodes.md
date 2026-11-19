@@ -181,10 +181,15 @@ Native: **45**, Partial: **24**, Legacy: **8**, Unsupported: **17**, Outside Cyc
   tangents, group instance defaults and Mix/Add.
 - `scripts/test_shader_lighting.py`: procedural emission illuminating a diffuse
   receiver, compared with a 512-sample Cycles render.
+- `scripts/test_bsdf_mixtures.py`: nine Mix/Add energy checks against separately
+  rendered components, including tilted normals, coat, glass, alpha, hair,
+  translucency, nested mixtures and zero/full weights. Run through Blender
+  with the same headless command above.
 - `scripts/inventory_shader_nodes.py -- target/node-inventory.json`: regenerate
   the installed Blender node inventory (run through Blender).
 
-Test artifacts are under `target/shader-nodes` and `target/shader-graphs`.
+Test artifacts are under `target/shader-nodes`, `target/shader-graphs`,
+`target/shader-lighting` and `target/bsdf-mixtures`.
 Pinned source, hashes, adaptations and licenses are documented in
 [`vibrt-nodes/third_party/cycles`](../vibrt-nodes/third_party/cycles/README.md).
 
@@ -201,7 +206,8 @@ blender -b --factory-startup test_scenes/classroom/classroom/classroom.blend \
 The script exports once and renders twice without denoising. `results.json`
 separates export/preparation from render time and records every sample callback
 without Blender display work. `--repo` selects another checkout with its own
-staged native extension; `--batch` measures rendering without preview readback.
+staged native extension; `--batch` renders all samples in one launch without
+preview readback, so its timing difference does not isolate display overhead.
 `--without-graphs` and `--without-bump` are diagnostic ablations that change
 materials. Likewise, versions predating graph support can omit material detail;
 their timings do not represent equivalent rendering quality.

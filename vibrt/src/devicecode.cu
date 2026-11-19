@@ -1746,17 +1746,21 @@ struct BsdfSample {
   int lobe;      // LOBE_DIFFUSE / LOBE_GLOSSY / LOBE_TRANSMISSION
 };
 
-// Single-closure sampler. The outer `sample_bsdf` wrapper below picks
-// between primary and secondary by `mix_fac` and delegates here. The
-// inner `eval_bsdf(e, wo, s.wi)` call near the end of this function is
-// rewritten to `eval_bsdf_one` so it sees only this closure — the
-// wrapper recomputes the combined f / pdf for MIS afterwards.
-static __device__ __noinline__ BsdfSample sample_bsdf_one(const MaterialEval &e, float3 wo,
+struct BsdfDirectionSample {
+  float3 wi;
+  bool valid;
+  bool specular;
+  bool transparent;
+  int lobe;
+};
+
+// Keep direction sampling separate from evaluation so the large sampler's
+// call frame is no longer live while eval_bsdf_one runs.
+static __device__ __noinline__ BsdfDirectionSample sample_bsdf_direction(const MaterialEval &e, float3 wo,
                                               RNG &rng) {
-  BsdfSample s;
+  BsdfDirectionSample s;
   s.wi = make_float3(0, 0, 1);
-  s.f = make_float3(0, 0, 0);
-  s.pdf = 0.0f;
+  s.valid = false;
   s.specular = false;
   s.lobe = LOBE_DIFFUSE;
   s.transparent = false;
@@ -1776,8 +1780,7 @@ static __device__ __noinline__ BsdfSample sample_bsdf_one(const MaterialEval &e,
   if (ab < 1.0f && rng.next() >= ab) {
     s.wi = -1.0f * wo;
     s.transparent = true;
-    s.f = make_float3(1.0f, 1.0f, 1.0f);
-    s.pdf = 1.0f;
+    s.valid = true;
     s.specular = true;
     s.lobe = LOBE_TRANSMISSION;
     return s;
@@ -1793,9 +1796,7 @@ static __device__ __noinline__ BsdfSample sample_bsdf_one(const MaterialEval &e,
     float3 local = make_float3(r * cosf(phi), r * sinf(phi),
                                sqrtf(fmaxf(0.0f, 1.0f - u1)));
     s.wi = normalize3(e.T * local.x + e.B * local.y + e.Ns * local.z);
-    BsdfEval ev = eval_hair(e, wo, s.wi);
-    s.f = ev.f;
-    s.pdf = ev.pdf;
+    s.valid = true;
     // Hair-Kajiya is mostly a forward-cone lobe + a diffuse base; bucket
     // it as glossy because the dominant contribution shouldn't deplete
     // the diffuse-bounces budget that thinks of brick / paint walls.
@@ -1918,11 +1919,7 @@ static __device__ __noinline__ BsdfSample sample_bsdf_one(const MaterialEval &e,
     s.lobe = LOBE_GLOSSY;
   }
 
-  // Single-closure eval — the outer wrapper recomputes the combined
-  // f / pdf via `eval_bsdf` (which folds in the secondary) when needed.
-  BsdfEval ev = eval_bsdf_one(e, wo, s.wi);
-  s.f = ev.f;
-  s.pdf = ev.pdf;
+  s.valid = true;
   return s;
 }
 
@@ -1932,13 +1929,21 @@ static __device__ __noinline__ BsdfSample sample_bsdf_one(const MaterialEval &e,
 // against light pdfs (and what `sample_bsdf` below produces). When
 // `g.n == 1` this is just `eval_bsdf_one(g.slots[0], wo, wi)`.
 static __device__ BsdfEval eval_bsdf(const MaterialEvalGroup &g,
-                                     float3 wo, float3 wi) {
+                                     float3 wo, float3 wi,
+                                     int sampled_index = -1) {
   BsdfEval r;
   r.f = make_float3(0.0f, 0.0f, 0.0f);
   r.pdf = 0.0f;
   float total_weight=0.0f;
   for (int i = 0; i < g.n; ++i) {
     BsdfEval ev = eval_bsdf_one(g.slots[i], wo, wi);
+    // Preserve rejection of a direction with zero density in the sampled
+    // leaf, even when other leaves would give that direction a nonzero PDF.
+    if (i == sampled_index && ev.pdf <= 0.0f) {
+      r.f = make_float3(0, 0, 0);
+      r.pdf = 0.0f;
+      return r;
+    }
     float w = g.weights[i];
     r.f = r.f + ev.f * w;
     r.pdf += ev.pdf * w;
@@ -1949,40 +1954,55 @@ static __device__ BsdfEval eval_bsdf(const MaterialEvalGroup &g,
 }
 
 // Multi-closure sampler. Picks one leaf by its weight, samples within
-// it, then recomputes the combined f / pdf via the `eval_bsdf` wrapper
+// it, then evaluates the combined f / pdf via the `eval_bsdf` wrapper
 // so MIS weights against light samplers see the real mixture density.
 // `lobe` and `specular` come from the inner sample — they describe
 // which closure produced wi for the per-lobe bounce-cap accounting in
 // trace_path.
 static __device__ BsdfSample sample_bsdf(const MaterialEvalGroup &g,
                                          float3 wo, RNG &rng) {
-  if (g.n == 1) {
-    // sample_bsdf_one already sets s.f via eval_bsdf_one, so the
-    // shadow-terminator is applied there — no second application here.
-    return sample_bsdf_one(g.slots[0], wo, rng);
-  }
-  float total_weight=0.0f;for(int i=0;i<g.n;i++)total_weight+=g.weights[i];
-  float u = rng.next()*total_weight;
-  int picked = g.n - 1; // last leaf catches residual mass
-  float acc = 0.0f;
-  for (int i = 0; i < g.n - 1; ++i) {
-    acc += g.weights[i];
-    if (u < acc) {
-      picked = i;
-      break;
+  int picked = 0;
+  float total_weight = 1.0f;
+  if (g.n > 1) {
+    total_weight=0.0f;for(int i=0;i<g.n;i++)total_weight+=g.weights[i];
+    float u = rng.next()*total_weight;
+    picked = g.n - 1; // last leaf catches residual mass
+    float acc = 0.0f;
+    for (int i = 0; i < g.n - 1; ++i) {
+      acc += g.weights[i];
+      if (u < acc) {
+        picked = i;
+        break;
+      }
     }
   }
-  BsdfSample s = sample_bsdf_one(g.slots[picked], wo, rng);
-  if (s.pdf <= 0.0f)
+  BsdfDirectionSample direction = sample_bsdf_direction(g.slots[picked], wo, rng);
+  BsdfSample s;
+  s.wi = direction.wi;
+  s.f = make_float3(0, 0, 0);
+  s.pdf = 0.0f;
+  s.specular = direction.specular;
+  s.transparent = direction.transparent;
+  s.lobe = direction.lobe;
+  if (!direction.valid)
     return s;
   if (s.transparent) {
+    if (g.n == 1) {
+      s.f = make_float3(1, 1, 1);
+      s.pdf = 1.0f;
+      return s;
+    }
     float opacity=0.0f;
     for(int i=0;i<g.n;i++)opacity+=g.weights[i]*(1.0f-g.slots[i].alpha_blend);
     s.f=make_float3(opacity,opacity,opacity);
     s.pdf=opacity/fmaxf(total_weight,1e-20f);
     return s;
   }
-  BsdfEval comb = eval_bsdf(g, wo, s.wi);
+  // Evaluate every leaf once, in the original accumulation order. Deferring
+  // evaluation avoids both a redundant call and per-lane skips of sampled
+  // leaves, which would still run the evaluator for other lanes in the warp.
+  BsdfEval comb = g.n == 1 ? eval_bsdf_one(g.slots[0], wo, s.wi)
+                          : eval_bsdf(g, wo, s.wi, picked);
   s.f = comb.f;
   s.pdf = comb.pdf;
   return s;
