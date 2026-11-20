@@ -4159,6 +4159,14 @@ static __device__ __noinline__ float3 trace_path(float3 origin, float3 dir,
       continue;
     }
 
+#if VIBRT_SHADER_OPS
+    // Regroup divergent paths by material before interpreting node graphs.
+    // Hint collisions only reduce coherence; they cannot change shading.
+    // OptiX treats this as a no-op on devices without reordering support.
+    unsigned long long material_key = (unsigned long long)v.mat;
+    optixReorder((unsigned int)((material_key >> 8) ^ (material_key >> 16)), 8);
+#endif
+
     // Stack-allocated leaves of the material's binary Mix tree. Lifetime
     // covers every direct_light / sample_bsdf call that reads `e_group`.
     MaterialEval e_slots[MAX_LEAVES];
@@ -4464,7 +4472,9 @@ extern "C" __global__ void __raygen__rg() {
     }
     float3 alb = make_float3(0, 0, 0);
     float3 nrm = make_float3(0, 0, 0);
-    if (v.hit != 0) {
+    // Depth alone only needs the intersection; evaluating material nodes and
+    // bump derivatives here is useful only when denoiser guides are requested.
+    if (v.hit != 0 && (params.albedo_aov != nullptr || params.normal_aov != nullptr)) {
       // AOV pass only reads albedo / normal — the secondary's color is
       // not blended in here (would smear the denoiser's albedo guide on
       // multi-lobe materials). Ask eval_material for just the leftmost

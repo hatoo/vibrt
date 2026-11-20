@@ -31,7 +31,7 @@ def render(options=None, **callbacks):
 
 reference, reference_depth = render()
 denoised, denoised_depth = render(dict(opts, denoise=True))
-many_opts = dict(opts, spp=130, preview_interval_ms=100)
+many_opts = dict(opts, spp=257, preview_interval_ms=100)
 many, many_depth = render(many_opts)
 if "--save-baseline" in sys.argv:
     np.savez(output / "baseline.npz", pixels=reference, depth=reference_depth,
@@ -83,7 +83,7 @@ pixels, _ = render(dict(opts, preview_interval_ms=60000), preview_cb=preview)
 assert [sample for sample, _ in frames] == [1, 8]
 np.testing.assert_array_equal(pixels, reference)
 
-# Cross the bounded parameter-buffer capacity, including a partial last batch.
+# Reuse full batches, then finish a partial batch.
 # Retained snapshots must stay unchanged while the next batch runs on the GPU.
 batched_frames = []
 
@@ -149,6 +149,25 @@ for interval in (0, 100):
         assert str(error) == "preview failed"
     else:
         raise AssertionError("callback error was swallowed")
+
+# Reach steady full batches before cancelling/failing a display callback. A
+# large sample budget guarantees another batch is in flight at that point.
+for callback_error in (False, True):
+    late_samples = []
+
+    def stop_late(pixels, samples, total):
+        late_samples.append(samples)
+        if callback_error and samples > 1:
+            raise CallbackFailure("late preview failed")
+
+    try:
+        render(dict(many_opts, spp=1000000), preview_cb=stop_late,
+               cancel_cb=lambda: len(late_samples) > 1)
+    except (KeyboardInterrupt, CallbackFailure) as error:
+        assert isinstance(error, CallbackFailure if callback_error else KeyboardInterrupt)
+    else:
+        raise AssertionError("queued batch cancellation/error was ignored")
+    assert late_samples[0] == 1 and 1 < late_samples[-1] < 1000000
 
 # Error/cancel paths must drain pending work and leave subsequent renders usable.
 pixels, depth = render(many_opts)

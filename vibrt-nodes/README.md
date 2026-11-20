@@ -31,8 +31,10 @@ General graphs use Blender socket conversion rules and evaluate each connected
 material parameter at the hit point. Mix/Add Shader retain separate closures.
 Shader closure physics and scene traversal remain renderer responsibilities.
 `ShaderGraph::optimized()` folds pure constant subgraphs through the C++ VM,
-prunes unused nodes and shares bit-identical constants. Scene/context-dependent
-operations and image sampling remain dynamic. Rendering and shader precompile
+prunes unused nodes and shares identical expressions, including repeated image,
+noise and coordinate calculations. Keys include all float bits, resource IDs,
+attributes and derivative offsets. Values still update at every shading point;
+traced scene queries remain separate. Rendering and shader precompile
 apply it before choosing kernels and uploading graphs; CPU graph evaluation
 also uses it.
 See the [complete support matrix](../docs/shader-nodes.md) for supported modes

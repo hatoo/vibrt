@@ -1,9 +1,9 @@
-//! Context-independent constant propagation using the shared C++ shader VM.
+//! Constant propagation and common expressions using the shared C++ shader VM.
 use super::{
     vibrt_shader_eval, ShaderGraph, ShaderInstruction, ShaderNode, EVAL_ALL, OPS, OUTPUTS,
 };
 use anyhow::Result;
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 
 // An explicit allowlist is intentional: some nodes read shading context or
 // renderer services even when every socket is constant. New operations must
@@ -42,6 +42,61 @@ fn is_pure(op: &str) -> bool {
             | "squeeze"
             | "radial_tiling"
     )
+}
+
+// These operations read immutable inputs/resources for one shading point.
+// Sharing an expression does not make it constant: context and derivative
+// offsets are still evaluated on every invocation. Keep traced scene queries
+// separate so their sampling/evaluation order is unchanged.
+fn is_shareable(op: &str) -> bool {
+    is_pure(op)
+        || matches!(
+            op,
+            "constant"
+                | "context"
+                | "shifted_context"
+                | "image"
+                | "attribute"
+                | "fresnel"
+                | "layer_weight"
+                | "normal_map"
+                | "normal_map_named"
+                | "vector_transform"
+                | "camera"
+                | "light_falloff"
+                | "tangent"
+                | "hair_tangent"
+                | "bump"
+                | "vector_bump"
+                | "displacement"
+                | "vector_displacement"
+        )
+}
+
+#[derive(PartialEq, Eq, Hash)]
+struct ExpressionKey {
+    op: String,
+    inputs: Vec<u32>,
+    modes: [u32; 4],
+    params: [u32; 4],
+    texture: Option<u32>,
+    table: Vec<u32>,
+    attribute: String,
+}
+
+impl From<&ShaderNode> for ExpressionKey {
+    fn from(node: &ShaderNode) -> Self {
+        Self {
+            op: node.op.clone(),
+            inputs: node.inputs.clone(),
+            modes: node.modes,
+            // Bit keys preserve signed zero and alpha, including LUT entries.
+            params: node.params.map(f32::to_bits),
+            texture: node.texture,
+            table: node.table.iter().map(|v| v.to_bits()).collect(),
+            attribute: node.attribute.clone(),
+        }
+    }
 }
 
 fn constant_value(node: &ShaderNode, values: &[Option<[f32; 4]>]) -> Option<[f32; 4]> {
@@ -95,7 +150,7 @@ fn constant_value(node: &ShaderNode, values: &[Option<[f32; 4]>]) -> Option<[f32
 
 impl ShaderGraph {
     /// Fold pure constant subgraphs, remove unreachable nodes, and share equal
-    /// constants. Validate the original graph first, including unused nodes.
+    /// expressions. Validate the original graph first, including unused nodes.
     /// Images, scene queries and implicit context reads remain dynamic.
     pub fn optimized(&self) -> Result<Self> {
         self.validate()?;
@@ -132,23 +187,22 @@ impl ShaderGraph {
             }
         }
         let mut remap = vec![0; nodes.len()];
-        let mut constants = BTreeMap::new();
+        let mut expressions = HashMap::new();
         let mut compact = Vec::new();
         for (i, mut node) in nodes.into_iter().enumerate() {
             if !live[i] {
                 continue;
             }
-            if node.op == "constant" {
-                // Bit keys preserve signed zero and include alpha.
-                let key = node.params.map(f32::to_bits);
-                if let Some(&id) = constants.get(&key) {
+            for input in &mut node.inputs {
+                *input = remap[*input as usize];
+            }
+            if is_shareable(&node.op) {
+                let key = ExpressionKey::from(&node);
+                if let Some(&id) = expressions.get(&key) {
                     remap[i] = id;
                     continue;
                 }
-                constants.insert(key, compact.len() as u32);
-            }
-            for input in &mut node.inputs {
-                *input = remap[*input as usize];
+                expressions.insert(key, compact.len() as u32);
             }
             remap[i] = compact.len() as u32;
             compact.push(node);
@@ -198,6 +252,93 @@ mod tests {
             a.map(|v| v.map(f32::to_bits)),
             b.map(|v| v.map(f32::to_bits))
         );
+    }
+
+    #[test]
+    fn shares_dynamic_expressions_across_outputs_and_evaluation_groups() {
+        let g = graph(json!({"nodes":[
+            {"op":"context","modes":[0,0,0,0]},
+            {"op":"context","modes":[0,0,0,0]},
+            {"op":"math","inputs":[0,0,0],"modes":[2,0,0,0]},
+            {"op":"math","inputs":[1,1,1],"modes":[2,0,0,0]},
+            {"op":"mix","inputs":[0,2,3],"modes":[0,1,0,0]}
+        ],"outputs":{"base_color":4,"emission":2,"bump_height":3,"mix_fac":3}}));
+        let shared = g.optimized().unwrap();
+        assert_eq!(shared.nodes.len(), 3);
+        assert_eq!(shared.outputs["emission"], shared.outputs["bump_height"]);
+        for x in [-1.5, 0.0, 0.25, 3.0] {
+            let mut context = [0.0; 128];
+            context[0] = x;
+            context[3] = 0.37;
+            for group in [
+                EVAL_ALL,
+                super::super::EVAL_MIX,
+                super::super::EVAL_BUMP,
+                super::super::EVAL_EMISSION,
+                super::super::EVAL_ALPHA,
+            ] {
+                assert_bits_equal(
+                    raw_eval(&g, &context, group),
+                    raw_eval(&shared, &context, group),
+                );
+            }
+        }
+        assert_eq!(
+            serde_json::to_value(shared.optimized().unwrap()).unwrap(),
+            serde_json::to_value(shared).unwrap()
+        );
+    }
+
+    #[test]
+    fn expression_keys_preserve_resources_modes_derivatives_and_float_bits() {
+        for (a, b) in [
+            (
+                json!({"op":"image","inputs":[0],"texture":0}),
+                json!({"op":"image","inputs":[0],"texture":1}),
+            ),
+            (
+                json!({"op":"image","inputs":[0],"texture":0}),
+                json!({"op":"image","inputs":[0],"texture":0,"modes":[1,0,0,0]}),
+            ),
+            (
+                json!({"op":"shifted_context","params":[0.001,0.0,0.0,0.0]}),
+                json!({"op":"shifted_context","params":[0.0,0.001,0.0,0.0]}),
+            ),
+            (
+                json!({"op":"attribute","attribute":"UVMap"}),
+                json!({"op":"attribute","attribute":"UVMap.001"}),
+            ),
+            (
+                json!({"op":"ramp","inputs":[0],"table":[0.0,0.2,0.4,0.0,1.0,0.7,0.8,1.0]}),
+                json!({"op":"ramp","inputs":[0],"table":[0.0,0.2,0.4,-0.0,1.0,0.7,0.8,1.0]}),
+            ),
+            (
+                json!({"op":"ramp","inputs":[0],"params":[0.0,0.0,0.0,0.0],"table":[0.0,0.2,0.4,0.0,1.0,0.7,0.8,1.0]}),
+                json!({"op":"ramp","inputs":[0],"params":[-0.0,0.0,0.0,0.0],"table":[0.0,0.2,0.4,0.0,1.0,0.7,0.8,1.0]}),
+            ),
+        ] {
+            let g = graph(json!({"nodes":[{"op":"context"}, a, b],
+                                "outputs":{"base_color":1,"emission":2}}));
+            let shared = g.optimized().unwrap();
+            assert_ne!(shared.outputs["base_color"], shared.outputs["emission"]);
+            assert_eq!(
+                g.required_contexts().unwrap(),
+                shared.required_contexts().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn leaves_traced_queries_separate() {
+        for op in ["ambient_occlusion", "bevel", "raycast"] {
+            let arity = OPS.iter().find(|(name, _)| *name == op).unwrap().1;
+            let node = json!({"op":op,"inputs":vec![0;arity]});
+            let g = graph(json!({"nodes":[{"op":"context"}, node, node],
+                                "outputs":{"base_color":1,"emission":2}}));
+            let shared = g.optimized().unwrap();
+            assert_eq!(shared.nodes.len(), 3);
+            assert_ne!(shared.outputs["base_color"], shared.outputs["emission"]);
+        }
     }
 
     fn pure_graph(op: &str, modes: [u32; 4]) -> ShaderGraph {

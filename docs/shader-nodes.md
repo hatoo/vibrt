@@ -46,10 +46,12 @@ Projected images and more complex graphs retain the general evaluator.
 Before render setup or shader precompilation, pure subgraphs with constant
 inputs are evaluated once by the shared C++ CPU implementation. This includes
 math, color/vector operations, curves/ramps and procedurals with constant
-coordinates. Unreachable nodes are removed and bit-identical float4 constants
-are shared before kernel requirements and LUT uploads are computed. Image,
-shading-context and scene-query dependencies remain dynamic. The CPU evaluator
-used for displacement applies the same optimization; alpha, HDR values and
+coordinates. Unreachable nodes are removed and identical expressions are shared
+before kernel requirements and LUT uploads are computed. This also avoids
+repeating dynamic image, noise and coordinate calculations at a shading point;
+keys preserve float bits, texture/attribute identity and derivative offsets.
+Scene queries remain separate, and context-dependent values stay dynamic. The CPU
+evaluator used for displacement applies the same optimization; alpha, HDR values and
 per-operation non-finite cleanup follow the shader VM.
 
 Math implements 41 operations; Vector Math 30; color Mix 19. Noise supports
