@@ -51,7 +51,7 @@ class RenderResultDisplay:
         self._write_color(pixels)
         self.engine.update_result(self.result)
 
-    def finish(self, pixels, depth, mist):
+    def finish(self, pixels, depth, mist, aovs=None):
         expected = (self.height, self.width)
         if depth.shape != expected:
             raise ValueError(f"native depth shape {depth.shape}, expected {expected}")
@@ -62,4 +62,12 @@ class RenderResultDisplay:
         mist_pass = self.passes.get("Mist")
         if mist_pass is not None:
             _set_pass(mist_pass, mist(depth).ravel())
+        for name, values in (aovs or {}).items():
+            rpass = self.passes.get(name)
+            if rpass is not None:
+                if values.shape != (self.height, self.width, 4):
+                    raise ValueError(f"Invalid AOV shape for {name}: {values.shape}")
+                _set_pass(
+                    rpass, (values if rpass.channels == 4 else values[:, :, :1]).ravel()
+                )
         self.engine.update_result(self.result)

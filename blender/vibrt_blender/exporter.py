@@ -388,8 +388,12 @@ def _const_f(sock, default):
 
 
 def _export_mesh(
-    obj_eval, writer, textures: list, vc_attr_name: str | None = None,
+    obj_eval,
+    writer,
+    textures: list,
+    vc_attr_name: str | None = None,
     uv_map_name: str | None = None,
+    shader_attributes=(),
 ) -> dict | None:
     """Export a mesh + per-triangle material indices.
 
@@ -424,18 +428,215 @@ def _export_mesh(
         arrays = native.read_mesh(mesh, num_slots, vc_attr_name, uv_map_name) if native else None
         if arrays is None:
             arrays = _mesh_arrays_python(mesh, num_slots, vc_attr_name, uv_map_name)
+        from . import displacement
+
+        displaced = displacement.apply(
+            mesh, obj_eval, arrays, writer, textures, _export_mesh_attributes
+        )
+        if displaced:
+            arrays = _mesh_arrays_python(mesh, num_slots, vc_attr_name, uv_map_name)
         desc = {}
         for name, values in arrays.items():
             write = writer.write_u32 if name in {"indices", "material_indices"} else writer.write_f32
             desc[name] = write(values)
         desc.setdefault("uvs", None)
-        disp_tex, disp_strength = _find_displacement(obj_eval, writer, textures)
+        desc["attributes"] = _export_mesh_attributes(mesh, shader_attributes, writer)
+        disp_tex, disp_strength = (
+            (None, 0.0) if displaced else _find_displacement(obj_eval, writer, textures)
+        )
         if disp_tex is not None and disp_strength != 0.0:
             desc["displacement_tex"] = disp_tex
             desc["displacement_strength"] = disp_strength
         return desc
     finally:
         obj_eval.to_mesh_clear()
+
+
+def _mesh_tangent_values(mesh, uv_name):
+    """Use Blender's MikkTSpace, triangulating n-gons on a disposable copy."""
+    import numpy as np
+
+    sizes = np.empty(len(mesh.polygons), np.int32)
+    mesh.polygons.foreach_get("loop_total", sizes)
+    temporary = None
+    source = mesh
+    try:
+        if len(sizes) and sizes.max() > 4:
+            import bmesh
+
+            temporary = mesh.copy()
+            source = temporary
+            ids = source.attributes.new("_vibrt_tangent_corner", "INT", "CORNER")
+            id_name = ids.name
+            ids.data.foreach_set("value", np.arange(len(source.loops), dtype=np.int32))
+            bm = bmesh.new()
+            try:
+                bm.from_mesh(source)
+                bmesh.ops.triangulate(
+                    bm, faces=[face for face in bm.faces if len(face.verts) > 4]
+                )
+                bm.to_mesh(source)
+            finally:
+                bm.free()
+            source.update()
+        source.calc_tangents(uvmap=uv_name)
+        values = np.empty((len(source.loops), 4), np.float32)
+        tangent = np.empty(len(source.loops) * 3, np.float32)
+        sign = np.empty(len(source.loops), np.float32)
+        source.loops.foreach_get("tangent", tangent)
+        source.loops.foreach_get("bitangent_sign", sign)
+        values[:, :3] = tangent.reshape(-1, 3)
+        values[:, 3] = sign
+        if temporary is None:
+            return values
+        indices = np.empty(len(source.loops), np.int32)
+        source.attributes[id_name].data.foreach_get("value", indices)
+        mapped = np.zeros((len(mesh.loops), 4), np.float32)
+        np.add.at(mapped, indices, values)
+        mapped[:, :3] /= np.maximum(
+            np.linalg.norm(mapped[:, :3], axis=1, keepdims=True), 1e-20
+        )
+        mapped[:, 3] = np.sign(mapped[:, 3])
+        return mapped
+    finally:
+        if temporary is not None:
+            bpy.data.meshes.remove(temporary)
+
+
+def _export_mesh_attributes(mesh, requested, writer):
+    """Bulk-read only requested layers in the native mesh's triangle-corner order."""
+    import numpy as np
+
+    result = {}
+    if not requested:
+        return result
+    vi = np.empty(len(mesh.loop_triangles) * 3, np.int32)
+    li = np.empty_like(vi)
+    fi = np.empty(len(mesh.loop_triangles), np.int32)
+    mesh.loop_triangles.foreach_get("vertices", vi)
+    mesh.loop_triangles.foreach_get("loops", li)
+    mesh.loop_triangles.foreach_get("polygon_index", fi)
+    for key in sorted(requested):
+        prefix, name = key.split(":", 1)
+        if prefix == "tangent":
+            layer = mesh.uv_layers.get(name) if name else mesh.uv_layers.active
+            if layer is None:
+                continue
+            values = _mesh_tangent_values(mesh, layer.name)[li]
+        elif prefix == "uv":
+            layer = mesh.uv_layers.get(name) if name else mesh.uv_layers.active
+            if layer is None:
+                continue
+            raw = np.empty(len(layer.data) * 2, np.float32)
+            layer.data.foreach_get("uv", raw)
+            values = np.zeros((len(li), 4), np.float32)
+            values[:, :2] = raw.reshape(-1, 2)[li]
+            values[:, 3] = 1
+        elif prefix in {"attr", "color"}:
+            layer = (
+                mesh.attributes.get(name)
+                if name
+                else mesh.color_attributes.active_color
+            )
+            if layer is None:
+                continue
+            fields = {
+                "FLOAT": ("value", 1),
+                "INT": ("value", 1),
+                "BOOLEAN": ("value", 1),
+                "FLOAT_VECTOR": ("vector", 3),
+                "FLOAT_COLOR": ("color", 4),
+                "BYTE_COLOR": ("color", 4),
+                "FLOAT2": ("vector", 2),
+            }
+            if layer.data_type not in fields or layer.domain not in {
+                "POINT",
+                "CORNER",
+                "FACE",
+            }:
+                raise ValueError(
+                    f"Unsupported attribute {name!r}: {layer.data_type}/{layer.domain}"
+                )
+            field, width = fields[layer.data_type]
+            dtype = (
+                np.int32
+                if layer.data_type == "INT"
+                else np.bool_ if layer.data_type == "BOOLEAN" else np.float32
+            )
+            raw = np.empty(len(layer.data) * width, dtype)
+            layer.data.foreach_get(field, raw)
+            indices = (
+                vi
+                if layer.domain == "POINT"
+                else li if layer.domain == "CORNER" else np.repeat(fi, 3)
+            )
+            raw = raw.reshape(-1, width)[indices]
+            values = np.ones((len(indices), 4), np.float32)
+            values[:, :3] = raw if width == 1 else 0
+            if width > 1:
+                values[:, :width] = raw
+        else:
+            continue
+        result[key] = writer.write_f32(np.ascontiguousarray(values.reshape(-1)))
+    return result
+
+
+def _export_object_attributes(obj, instance, requested, scene):
+    """Instance attributes remain separate from shared geometry buffers."""
+
+    def rgba(value):
+        if isinstance(value, (float, int, bool)):
+            return [float(value)] * 3 + [1.0]
+        try:
+            values = [float(v) for v in value]
+            return (
+                (values + [0.0] * (3 - len(values)) + [1.0])
+                if len(values) < 3
+                else (values + [1.0])[:4]
+            )
+        except (TypeError, ValueError):
+            return None
+
+    result = {}
+    psys = getattr(instance, "particle_system", None)
+    particle = None
+    index = int(instance.persistent_id[0]) if instance.is_instance else -1
+    if psys is not None and 0 <= index < len(psys.particles):
+        particle = psys.particles[index]
+    for key in requested:
+        prefix, name = key.split(":", 1)
+        value = None
+        if prefix in {"object", "instancer", "layer"}:
+            source = (
+                obj
+                if prefix == "object"
+                else (
+                    instance.parent if prefix == "instancer" else bpy.context.view_layer
+                )
+            )
+            if source is not None:
+                value = source.get(name)
+                if value is None and name in {"color", "pass_index"}:
+                    value = getattr(source, name, None)
+        elif prefix == "particle" and particle is not None:
+            value = {
+                "Index": index,
+                "Age": scene.frame_current - particle.birth_time,
+                "Lifetime": particle.lifetime,
+                "Location": particle.location,
+                "Size": particle.size,
+                "Velocity": particle.velocity,
+                "Angular Velocity": particle.angular_velocity,
+            }.get(name)
+            if name == "Random":
+                # Use the shared Cycles hash evaluator in the shader (Index is
+                # exported here; Random's compiler reads this same key).
+                value = index
+        if value is not None:
+            converted = rgba(value)
+            if converted is not None:
+                result[key] = converted
+    return result
 
 
 def _mesh_arrays_python(mesh, num_slots, vc_attr_name=None, uv_map_name=None):
@@ -2840,6 +3041,7 @@ def _export_into(
     # that reference the material can emit the matching vertex-colour blob.
     material_vc_attr: dict[str, str] = {}
     material_uv_map: dict[str, str] = {}
+    material_attributes: dict[str, set] = {}
     # Material indices flagged as Cycles daylight portals — `MixShader(Emission,
     # Transparent)` with TexSky driving the emission. These aren't real
     # emitters; treating them as such double-counts the sky once via the world
@@ -2935,6 +3137,16 @@ def _export_into(
                     return next(iter(found), None)
                 vc_attr = attributes("_vertex_color_attr")
                 uv_attr = attributes("_uv_map")
+                requested = set()
+
+                def collect_attributes(m):
+                    requested.update(m.pop("_shader_attributes", ()))
+                    for key in ("secondary", "left_subtree"):
+                        if m.get(key):
+                            collect_attributes(m[key])
+
+                collect_attributes(exported)
+                material_attributes[mat.name] = requested
                 is_portal = bool(exported.pop("_is_daylight_portal", False))
                 lampout_ies = exported.pop("_lampout_ies", None)
                 if lampout_ies is not None:
@@ -3134,11 +3346,25 @@ def _export_into(
                             and not getattr(obj, "show_instancer_for_render", True)):
                         continue
 
-                    mkey = f"{obj_eval.data.name}#{obj_eval.name}#vc={vc_attr_name}#uv={uv_map_name}"
+                    requested = set().union(
+                        *(
+                            material_attributes.get(s.material.name, set())
+                            for s in obj_eval.material_slots
+                            if s.material
+                        )
+                    )
+                    mkey = f"{obj_eval.data.name}#{obj_eval.name}#vc={vc_attr_name}#uv={uv_map_name}#attrs={sorted(requested)}"
                     mesh_id = mesh_cache.get(mkey)
                     if mesh_id is None:
                         t_mesh = time.perf_counter()
-                        mesh = _export_mesh(obj_eval, writer, textures, vc_attr_name, uv_map_name)
+                        mesh = _export_mesh(
+                            obj_eval,
+                            writer,
+                            textures,
+                            vc_attr_name,
+                            uv_map_name,
+                            requested,
+                        )
                         dt_mesh = time.perf_counter() - t_mesh
                         mesh_s += dt_mesh
                         if mesh is None:
@@ -3157,6 +3383,9 @@ def _export_into(
                         "transform": _matrix_to_row_major(inst.matrix_world),
                         "object_color": list(obj.color),
                         "object_index": int(obj.pass_index),
+                        "attributes": _export_object_attributes(
+                            obj, inst, requested, scene
+                        ),
                     }
                     if len(slot_mat_ids) > 1:
                         obj_desc["materials"] = slot_mat_ids
@@ -3222,6 +3451,7 @@ def _export_into(
                             writer,
                             resolve_material,
                             obj_eval.name,
+                            material_attributes,
                         )
                         hair_s += time.perf_counter() - t_hair
                         if hair_pair is not None:
@@ -3316,6 +3546,7 @@ def _export_into(
     )
     scene_json = {
         "version": 1,
+        "aov_names": [a.name for a in bpy.context.view_layer.aovs if a.is_valid],
         "render": {
             "width": width,
             "height": height,
@@ -3327,6 +3558,7 @@ def _export_into(
             "clamp_indirect": clamp_indirect,
             "clamp_direct": cy_clamp_direct,
             "filter_glossy": cy_filter_glossy,
+            "film_transparent": bool(scene.render.film_transparent),
         },
         "camera": _export_camera(scene, cam_obj, aspect),
         "meshes": meshes,

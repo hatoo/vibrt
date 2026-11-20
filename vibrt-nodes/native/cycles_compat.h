@@ -34,6 +34,10 @@
 #define M_1_PI_F 0.31830988618379067154f
 #endif
 #define M_SQRT2_F 1.41421356237309504880f
+#define M_CBRT2_F 1.2599210498948731648f
+#define M_4PI_F 12.5663706143591729538f
+#define M_1_4PI_F 0.0795774715459476679f
+#define M_1_2PI_F 0.1591549430918953358f
 #ifndef FLT_EPSILON
 #define FLT_EPSILON 1.192092896e-7f
 #define FLT_MAX 3.402823466e+38f
@@ -331,5 +335,24 @@ VN_INLINE float3 hsl_to_rgb(float3 h) {
   float chroma = (1 - fabsf(2 * h.z - 1)) * h.y;
   float3 c = hsv_to_rgb(make_float3(h.x, 1, 1));
   return c * chroma + (h.z - chroma * 0.5f);
+}
+VN_INLINE float fast_inv_cbrtf(float x) { return 1 / cbrtf(x); }
+VN_INLINE float fast_sinf(float x) { return sinf(x); }
+VN_INLINE float fast_cosf(float x) { return cosf(x); }
+VN_INLINE float fast_tanf(float x) { return tanf(x); }
+VN_INLINE float fast_logf(float x) { return logf(x); }
+VN_INLINE float fast_expf(float x) { return expf(x); }
+VN_INLINE float3 spherical_cos_to_direction(float c, float phi) {
+  float s = safe_sqrtf(1 - c * c);
+  return make_float3(s * cosf(phi), s * sinf(phi), c);
+}
+VN_INLINE void make_orthonormals(float3 N, float3 *T, float3 *B) {
+  *T = safe_normalize(cross(fabsf(N.x) > fabsf(N.z) ? make_float3(0, 0, 1)
+                                                    : make_float3(1, 0, 0),
+                            N));
+  *B = cross(N, *T);
+}
+VN_INLINE float3 to_global(float3 d, float3 X, float3 Y, float3 Z) {
+  return d.x * X + d.y * Y + d.z * Z;
 }
 } // namespace vibrt_cycles

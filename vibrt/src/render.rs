@@ -39,6 +39,7 @@ pub struct RenderOptions {
 /// Final rendered RGBA buffer plus the dimensions the caller can save / hand
 /// to numpy.
 pub struct RenderOutput {
+    pub aovs: std::collections::BTreeMap<String, Vec<f32>>,
     /// width × height × 4 floats, top-left origin (Blender convention; vibrt
     /// has always written its PNGs / EXRs assuming this layout).
     pub pixels: Vec<f32>,
@@ -93,35 +94,27 @@ fn dptr_f32(s: &CudaSlice<f32>, stream: &CudaStream) -> optix_sys::CUdeviceptr {
     p as optix_sys::CUdeviceptr
 }
 
-fn alloc_and_copy<T>(stream: &Arc<CudaStream>, v: &T) -> Result<optix_sys::CUdeviceptr> {
-    let size = mem::size_of_val(v);
-    let cu = stream.cu_stream();
-    unsafe {
-        let d = cudarc::driver::result::malloc_async(cu, size).cuda()?;
-        cudarc::driver::result::memcpy_htod_async(
-            d,
-            std::slice::from_raw_parts(v as *const T as *const u8, size),
-            cu,
-        )
-        .cuda()?;
-        Ok(d as optix_sys::CUdeviceptr)
-    }
+/// Own every raw ABI upload until the render ends, including error/cancel paths.
+/// Keeping just its integer device address leaks memory across Blender renders.
+struct UploadArena {
+    stream: Arc<CudaStream>,
+    buffers: std::cell::RefCell<Vec<CudaSlice<u8>>>,
 }
-fn alloc_and_copy_slice<T>(stream: &Arc<CudaStream>, data: &[T]) -> Result<optix_sys::CUdeviceptr> {
-    let size = mem::size_of_val(data);
-    if size == 0 {
-        return Ok(0);
+impl UploadArena {
+    fn copy<T>(&self, value: &T) -> Result<optix_sys::CUdeviceptr> {
+        self.copy_slice(std::slice::from_ref(value))
     }
-    let cu = stream.cu_stream();
-    unsafe {
-        let d = cudarc::driver::result::malloc_async(cu, size).cuda()?;
-        cudarc::driver::result::memcpy_htod_async(
-            d,
-            std::slice::from_raw_parts(data.as_ptr() as *const u8, size),
-            cu,
-        )
-        .cuda()?;
-        Ok(d as optix_sys::CUdeviceptr)
+    fn copy_slice<T>(&self, data: &[T]) -> Result<optix_sys::CUdeviceptr> {
+        let size = mem::size_of_val(data);
+        if size == 0 {
+            return Ok(0);
+        }
+        // Callers supply repr(C) GPU structs or primitive arrays.
+        let bytes = unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), size) };
+        let buffer = self.stream.clone_htod(bytes).cuda()?;
+        let pointer = dptr_u8(&buffer, &self.stream);
+        self.buffers.borrow_mut().push(buffer);
+        Ok(pointer)
     }
 }
 
@@ -163,7 +156,7 @@ impl HasIes for crate::gpu_types::AreaRectLight {
 /// The packing is what `ies_lookup` in devicecode.cu reads; keep the
 /// two in sync.
 fn upload_ies_buffers<L: HasIes>(
-    stream: &Arc<CudaStream>,
+    uploads: &UploadArena,
     lights: &mut [L],
     profiles: &[Option<scene_format::IesProfile>],
 ) -> Result<Vec<optix_sys::CUdeviceptr>> {
@@ -194,7 +187,7 @@ fn upload_ies_buffers<L: HasIes>(
         for c in &p.candelas {
             buf.push(c / peak);
         }
-        let d = alloc_and_copy_slice(stream, &buf)?;
+        let d = uploads.copy_slice(&buf)?;
         lights[i].set_ies(d, n_v as u32, n_h as u32);
         out.push(d);
     }
@@ -281,6 +274,10 @@ pub fn render_to_pixels(
     let t_prepare = std::time::Instant::now();
     let cuda_ctx = CudaContext::new(0).cuda().context("CUDA context")?;
     let stream = cuda_ctx.default_stream();
+    let uploads = UploadArena {
+        stream: stream.clone(),
+        buffers: Default::default(),
+    };
     let cu_stream = stream.cu_stream() as optix_sys::CUstream;
 
     let optix_handle = optix::init().context("OptiX init")?;
@@ -297,21 +294,39 @@ pub fn render_to_pixels(
         material: &scene_format::PrincipledMaterial,
         depth: usize,
         shader_stack_size: &mut usize,
+        aov_count: usize,
     ) -> Result<usize> {
         anyhow::ensure!(depth <= 8, "Material shader tree exceeds 8 levels");
         if let Some(graph) = &material.shader_graph {
             *shader_stack_size = (*shader_stack_size).max(graph.required_stack_size()?);
         }
+        for aov in &material.aov_graphs {
+            anyhow::ensure!(
+                (aov.index as usize) < aov_count,
+                "AOV index is out of range"
+            );
+            anyhow::ensure!(
+                aov.graph.outputs.contains_key("base_color"),
+                "AOV graph requires a base_color output"
+            );
+            *shader_stack_size = (*shader_stack_size).max(aov.graph.required_stack_size()?);
+        }
+        if let Some(volume) = &material.volume {
+            anyhow::ensure!(
+                volume.phase <= 4 && volume.phase_params.iter().all(|v| v.is_finite()),
+                "Invalid volume phase parameters"
+            );
+        }
         let leaves = match (&material.left_subtree, &material.secondary) {
             (None, None) => 1,
             (left, right) => {
                 let l = if let Some(c) = left {
-                    validate_shader_tree(c, depth + 1, shader_stack_size)?
+                    validate_shader_tree(c, depth + 1, shader_stack_size, aov_count)?
                 } else {
                     1
                 };
                 let r = if let Some(c) = right {
-                    validate_shader_tree(c, depth + 1, shader_stack_size)?
+                    validate_shader_tree(c, depth + 1, shader_stack_size, aov_count)?
                 } else {
                     1
                 };
@@ -324,11 +339,26 @@ pub fn render_to_pixels(
     let mut max_closures = 1;
     let mut shader_stack_size = 1;
     for material in &scene.file.materials {
-        max_closures = max_closures.max(validate_shader_tree(material, 0, &mut shader_stack_size)?);
+        max_closures = max_closures.max(validate_shader_tree(
+            material,
+            0,
+            &mut shader_stack_size,
+            scene.file.aov_names.len(),
+        )?);
+    }
+    if let Some(volume) = &scene.file.world_volume {
+        anyhow::ensure!(
+            volume.phase <= 4 && volume.phase_params.iter().all(|v| v.is_finite()),
+            "Invalid world volume phase parameters"
+        );
     }
     fn shader_operations(material: &scene_format::PrincipledMaterial) -> u64 {
         let mut flags = 0;
-        if let Some(graph) = &material.shader_graph {
+        for graph in material
+            .shader_graph
+            .iter()
+            .chain(material.aov_graphs.iter().map(|a| &a.graph))
+        {
             for node in &graph.nodes {
                 if let Some(index) = vibrt_nodes::shader::OPS
                     .iter()
@@ -351,11 +381,67 @@ pub fn render_to_pixels(
         .materials
         .iter()
         .fold(0, |mask, m| mask | shader_operations(m));
+    fn extended_requirements(m: &scene_format::PrincipledMaterial) -> Result<(u32, usize)> {
+        anyhow::ensure!(
+            m.closure_type <= 7 && m.closure_type != 6,
+            "Unsupported closure type {}",
+            m.closure_type
+        );
+        let mut kinds = if m.closure_type == 0 {
+            0
+        } else {
+            1 << m.closure_type
+        };
+        let mut outputs = 32;
+        for graph in m
+            .shader_graph
+            .iter()
+            .chain(m.aov_graphs.iter().map(|a| &a.graph))
+        {
+            if graph
+                .outputs
+                .keys()
+                .any(|name| vibrt_nodes::shader::OUTPUTS[32..].contains(&name.as_str()))
+            {
+                outputs = 64;
+            }
+        }
+        for child in [&m.left_subtree, &m.secondary].into_iter().flatten() {
+            let (child_kinds, child_outputs) = extended_requirements(child)?;
+            kinds |= child_kinds;
+            outputs = outputs.max(child_outputs);
+        }
+        Ok((kinds, outputs))
+    }
+    let (mut closure_types, mut shader_output_count) = (0, 32);
+    for m in &scene.file.materials {
+        let (kinds, outputs) = extended_requirements(m)?;
+        closure_types |= kinds;
+        shader_output_count = shader_output_count.max(outputs);
+    }
     // Bucket capacities to keep a small set of cached kernels across scene edits.
+    let scene_queries = shader_ops & (7u64 << 41) != 0 || closure_types & (1 << 7) != 0;
+    fn extended_volume(m: &scene_format::PrincipledMaterial) -> bool {
+        m.volume.as_ref().is_some_and(|v| v.phase != 0)
+            || [&m.left_subtree, &m.secondary]
+                .into_iter()
+                .flatten()
+                .any(|m| extended_volume(m))
+    }
+    let extended_phases = scene
+        .file
+        .world_volume
+        .as_ref()
+        .is_some_and(|v| v.phase != 0)
+        || scene.file.materials.iter().any(extended_volume);
     let ptx_src = pipeline::compile_ptx(
         shader_ops,
         max_closures,
         shader_stack_size.max(4).next_power_of_two(),
+        closure_types,
+        shader_output_count,
+        !scene.file.aov_names.is_empty(),
+        extended_phases,
     )?;
     let ptx_time = t_ptx.elapsed();
     let t_pipeline = std::time::Instant::now();
@@ -393,7 +479,6 @@ pub fn render_to_pixels(
         .build()
         .context("hitgroup shadow")?
         .value;
-
     let all_pgs: Vec<&ProgramGroup> = vec![
         &raygen_pg,
         &miss_rg_pg,
@@ -426,7 +511,6 @@ pub fn render_to_pixels(
     // Volume parameter blocks live alongside materials. Each material that
     // has a Volume slot gets one allocation; the device-side `PrincipledGpu`
     // holds a pointer back to it (or null when absent).
-    let mut _volume_storage: Vec<optix_sys::CUdeviceptr> = Vec::new();
     let mut mat_device_ptrs: Vec<optix_sys::CUdeviceptr> = Vec::new();
     // Recursively upload one material node (and its left/right binary-tree
     // children, when present) to the device, returning the device pointer
@@ -439,7 +523,7 @@ pub fn render_to_pixels(
         tex_slots: &[(optix_sys::CUdeviceptr, i32, i32)],
         stream: &Arc<CudaStream>,
         graph_storage: &mut principled::GraphStorage,
-        volume_storage: &mut Vec<optix_sys::CUdeviceptr>,
+        uploads: &UploadArena,
         depth: u32,
     ) -> Result<optix_sys::CUdeviceptr> {
         if depth > 8 {
@@ -461,32 +545,16 @@ pub fn render_to_pixels(
         let volume_ptr = match &mat.volume {
             Some(v) => {
                 let vg = principled::make_volume_gpu(v);
-                let p = alloc_and_copy(stream, &vg)?;
-                volume_storage.push(p);
-                p
+                uploads.copy(&vg)?
             }
             None => 0,
         };
         let secondary_ptr = match &mat.secondary {
-            Some(sec) => upload_one_mat(
-                sec,
-                tex_slots,
-                stream,
-                graph_storage,
-                volume_storage,
-                depth + 1,
-            )?,
+            Some(sec) => upload_one_mat(sec, tex_slots, stream, graph_storage, uploads, depth + 1)?,
             None => 0,
         };
         let left_subtree_ptr = match &mat.left_subtree {
-            Some(lhs) => upload_one_mat(
-                lhs,
-                tex_slots,
-                stream,
-                graph_storage,
-                volume_storage,
-                depth + 1,
-            )?,
+            Some(lhs) => upload_one_mat(lhs, tex_slots, stream, graph_storage, uploads, depth + 1)?,
             None => 0,
         };
         let mut gpu = principled::make_material_data(
@@ -504,26 +572,38 @@ pub fn render_to_pixels(
             gpu.shader_outputs = binding.outputs;
             gpu.shader_contexts = binding.contexts;
         }
+        let mut aov_shaders = Vec::new();
+        for aov in &mat.aov_graphs {
+            let binding =
+                principled::upload_shader_graph(&aov.graph, tex_slots, stream, graph_storage)?;
+            let mut aov_gpu = gpu;
+            aov_gpu.shader_nodes = binding.nodes;
+            aov_gpu.shader_len = binding.len;
+            aov_gpu.shader_outputs = binding.outputs;
+            aov_gpu.shader_contexts = binding.contexts;
+            aov_shaders.push(AovShader {
+                material: uploads.copy(&aov_gpu)?,
+                index: aov.index,
+                _pad: 0,
+            });
+        }
+        if !aov_shaders.is_empty() {
+            gpu.aov_shaders = uploads.copy_slice(&aov_shaders)?;
+            gpu.num_aov_shaders = aov_shaders.len() as u32;
+        }
         let (contexts, bump) = principled::surface_requirements(mat)?;
         gpu.surface_contexts = contexts;
         gpu.surface_bump = i32::from(bump);
-        Ok(alloc_and_copy(stream, &gpu)?)
+        uploads.copy(&gpu)
     }
     for mat in &scene.file.materials {
-        let p = upload_one_mat(
-            mat,
-            &tex_slots,
-            &stream,
-            &mut graph_storage,
-            &mut _volume_storage,
-            0,
-        )?;
+        let p = upload_one_mat(mat, &tex_slots, &stream, &mut graph_storage, &uploads, 0)?;
         mat_device_ptrs.push(p);
     }
     // World volume sits in LaunchParams and is shared by every ray that
     // doesn't enter a tighter mesh-bounded volume. Allocated once.
     let world_volume_ptr: optix_sys::CUdeviceptr = match &scene.file.world_volume {
-        Some(v) => alloc_and_copy(&stream, &principled::make_volume_gpu(v))?,
+        Some(v) => uploads.copy(&principled::make_volume_gpu(v))?,
         None => 0,
     };
 
@@ -534,6 +614,9 @@ pub fn render_to_pixels(
     };
 
     struct MeshGpu {
+        query_nodes: u64,
+        query_indices: u64,
+        attributes: Vec<crate::gpu_types::ShaderAttribute>,
         handle: optix_sys::OptixTraversableHandle,
         d_verts: optix_sys::CUdeviceptr,
         d_normals: optix_sys::CUdeviceptr,
@@ -642,7 +725,44 @@ pub fn render_to_pixels(
             0
         };
 
+        let mut attributes = Vec::new();
+        for (key, values) in &m.attributes {
+            let data = stream.clone_htod(&values[..]).cuda()?;
+            attributes.push(crate::gpu_types::ShaderAttribute {
+                key: *key,
+                data: dptr_f32(&data, &stream),
+                count: (values.len() / 4) as u32,
+                _pad: 0,
+            });
+            _f32_buffers.push(data);
+        }
+        let (query_nodes, query_indices) = if scene_queries {
+            let boxes: Vec<_> = m
+                .indices
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .map(|triangle| {
+                    let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+                    for &index in triangle {
+                        for a in 0..3 {
+                            let v = m.vertices[index as usize * 3 + a];
+                            lo[a] = lo[a].min(v);
+                            hi[a] = hi[a].max(v);
+                        }
+                    }
+                    (lo, hi)
+                })
+                .collect();
+            let (nodes, indices) = crate::query_bvh::build(&boxes);
+            (uploads.copy_slice(&nodes)?, uploads.copy_slice(&indices)?)
+        } else {
+            (0, 0)
+        };
         meshes_gpu.push(MeshGpu {
+            query_nodes,
+            query_indices,
+            attributes,
             handle,
             d_verts: verts_ptr,
             d_normals,
@@ -677,8 +797,10 @@ pub fn render_to_pixels(
         m
     };
 
-    // --- Build per-object SBT records (2 per object: radiance + shadow) ---
+    // --- Per-object SBT records: radiance and shadow ---
     let mut tri_hg_records: Vec<SbtRecord<HitGroupData>> = Vec::new();
+    let mut query_objects = Vec::new();
+    let mut query_bounds = Vec::new();
     let mut gas_entries: Vec<GasEntry> = Vec::new();
     let mut _mat_table_bufs: Vec<CudaSlice<u64>> = Vec::new();
     let mesh_bounds: Vec<_> = scene
@@ -687,7 +809,7 @@ pub fn render_to_pixels(
         .map(|mesh| {
             let mut lo = [f32::MAX; 3];
             let mut hi = [f32::MIN; 3];
-            for vertex in mesh.vertices.chunks_exact(3) {
+            for vertex in mesh.vertices.as_chunks::<3>().0 {
                 for axis in 0..3 {
                     lo[axis] = lo[axis].min(vertex[axis]);
                     hi[axis] = hi[axis].max(vertex[axis]);
@@ -729,7 +851,27 @@ pub fn render_to_pixels(
             (0, 0)
         };
 
+        let mut attributes = m.attributes.clone();
+        for (name, value) in &scene.file.objects[obj_idx].attributes {
+            let key = vibrt_nodes::shader::attribute_key(name);
+            anyhow::ensure!(
+                !attributes.iter().any(|a| a.key == key),
+                "Duplicate object/mesh attribute {name:?}"
+            );
+            attributes.push(crate::gpu_types::ShaderAttribute {
+                key,
+                data: uploads.copy_slice(value)?,
+                count: 1,
+                _pad: 0,
+            });
+        }
         let hg = HitGroupData {
+            attributes: if attributes.is_empty() {
+                0
+            } else {
+                uploads.copy_slice(&attributes)?
+            },
+            num_attributes: attributes.len() as u32,
             mat: mat_ptr,
             vertices: m.d_verts,
             normals: m.d_normals,
@@ -767,12 +909,41 @@ pub fn render_to_pixels(
                         densities[tri.primitive as usize] =
                             tri.sampling_luminance / total.max(1e-30);
                     }
-                    alloc_and_copy_slice(&stream, &densities)?
+                    uploads.copy_slice(&densities)?
                 } else {
                     0
                 }
             },
         };
+        if scene_queries {
+            let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+            for corner in 0..8 {
+                let p = std::array::from_fn(|a| {
+                    if corner & (1 << a) == 0 {
+                        hg.bounds_min[a]
+                    } else {
+                        hg.bounds_max[a]
+                    }
+                });
+                let p = crate::transform::transform_point(&obj.transform, p);
+                for a in 0..3 {
+                    lo[a] = lo[a].min(p[a]);
+                    hi[a] = hi[a].max(p[a]);
+                }
+            }
+            query_bounds.push((lo, hi));
+            query_objects.push(QueryObject {
+                geometry: 0,
+                nodes: m.query_nodes,
+                indices: m.query_indices,
+                mask: if scene.file.objects[obj_idx].cast_shadow {
+                    7
+                } else {
+                    5
+                },
+                _pad: 0,
+            });
+        }
         tri_hg_records.push(SbtRecord::new(&hit_rg_pg, hg)?);
         tri_hg_records.push(SbtRecord::new(&hit_shadow_pg, hg)?);
         gas_entries.push(GasEntry {
@@ -818,7 +989,7 @@ pub fn render_to_pixels(
             }
         })
         .collect();
-    let d_instances = alloc_and_copy_slice(&stream, &instances)?;
+    let d_instances = uploads.copy_slice(&instances)?;
     let ias_input = [BuildInput::Instances(accel::InstanceArrayInput {
         instances: d_instances,
         num_instances: instances.len() as u32,
@@ -845,7 +1016,7 @@ pub fn render_to_pixels(
     let miss_rg_record = SbtRecord::new(&miss_rg_pg, MissData { _unused: 0 })?;
     let miss_shadow_record = SbtRecord::new(&miss_shadow_pg, MissData { _unused: 0 })?;
 
-    let d_rg = alloc_and_copy(&stream, &raygen_record)?;
+    let d_rg = uploads.copy(&raygen_record)?;
     let mut miss_bytes: Vec<u8> = Vec::new();
     let miss_stride = mem::size_of_val(&miss_rg_record);
     miss_bytes.extend_from_slice(unsafe {
@@ -854,7 +1025,7 @@ pub fn render_to_pixels(
     miss_bytes.extend_from_slice(unsafe {
         std::slice::from_raw_parts(&miss_shadow_record as *const _ as *const u8, miss_stride)
     });
-    let d_miss = alloc_and_copy_slice(&stream, &miss_bytes)?;
+    let d_miss = uploads.copy_slice(&miss_bytes)?;
 
     let hg_stride = mem::size_of::<SbtRecord<HitGroupData>>();
     let mut hg_bytes: Vec<u8> = Vec::new();
@@ -863,12 +1034,28 @@ pub fn render_to_pixels(
             std::slice::from_raw_parts(rec as *const _ as *const u8, hg_stride)
         });
     }
-    let d_hg = alloc_and_copy_slice(&stream, &hg_bytes)?;
+    let d_hg = uploads.copy_slice(&hg_bytes)?;
+    let (query_nodes, query_indices, query_objects_ptr) = if scene_queries
+        && !query_objects.is_empty()
+    {
+        for (i, obj) in query_objects.iter_mut().enumerate() {
+            obj.geometry = d_hg
+                + (i * 2 * hg_stride + std::mem::offset_of!(SbtRecord<HitGroupData>, data)) as u64;
+        }
+        let (nodes, indices) = crate::query_bvh::build(&query_bounds);
+        (
+            uploads.copy_slice(&nodes)?,
+            uploads.copy_slice(&indices)?,
+            uploads.copy_slice(&query_objects)?,
+        )
+    } else {
+        (0, 0, 0)
+    };
 
-    let sbt = ShaderBindingTableBuilder::new(d_rg)
+    let sbt_builder = ShaderBindingTableBuilder::new(d_rg)
         .miss_records(d_miss, miss_stride as u32, 2)
-        .hitgroup_records(d_hg, hg_stride as u32, tri_hg_records.len() as u32)
-        .build()?;
+        .hitgroup_records(d_hg, hg_stride as u32, tri_hg_records.len() as u32);
+    let sbt = sbt_builder.build()?;
 
     // --- Camera ---
     let aspect = render_settings.width as f32 / render_settings.height as f32;
@@ -888,15 +1075,15 @@ pub fn render_to_pixels(
     let mut point_lights = scene.point_lights.clone();
     let mut spot_lights = scene.spot_lights.clone();
     let mut rect_lights = scene.rect_lights.clone();
-    let _d_ies_point = upload_ies_buffers(&stream, &mut point_lights, &scene.point_ies)?;
-    let _d_ies_spot = upload_ies_buffers(&stream, &mut spot_lights, &scene.spot_ies)?;
-    let _d_ies_rect = upload_ies_buffers(&stream, &mut rect_lights, &scene.rect_ies)?;
-    let d_points = alloc_and_copy_slice(&stream, &point_lights)?;
-    let d_suns = alloc_and_copy_slice(&stream, &scene.sun_lights)?;
-    let d_spots = alloc_and_copy_slice(&stream, &spot_lights)?;
-    let d_rects = alloc_and_copy_slice(&stream, &rect_lights)?;
+    let _d_ies_point = upload_ies_buffers(&uploads, &mut point_lights, &scene.point_ies)?;
+    let _d_ies_spot = upload_ies_buffers(&uploads, &mut spot_lights, &scene.spot_ies)?;
+    let _d_ies_rect = upload_ies_buffers(&uploads, &mut rect_lights, &scene.rect_ies)?;
+    let d_points = uploads.copy_slice(&point_lights)?;
+    let d_suns = uploads.copy_slice(&scene.sun_lights)?;
+    let d_spots = uploads.copy_slice(&spot_lights)?;
+    let d_rects = uploads.copy_slice(&rect_lights)?;
     let rect_cdf = build_rect_light_cdf(&rect_lights);
-    let d_rect_cdf = alloc_and_copy_slice(&stream, &rect_cdf)?;
+    let d_rect_cdf = uploads.copy_slice(&rect_cdf)?;
 
     // Mesh lights: convert each host triangle into the GPU `MeshLightTri`
     // POD, resolving `emission_tex_idx` to the device-side texture
@@ -948,8 +1135,8 @@ pub fn render_to_pixels(
                 }
             })
             .collect();
-        let d_tris = alloc_and_copy_slice(&stream, &gpu_tris)?;
-        let d_cdf = alloc_and_copy_slice(&stream, &ml.cdf)?;
+        let d_tris = uploads.copy_slice(&gpu_tris)?;
+        let d_cdf = uploads.copy_slice(&ml.cdf)?;
         mesh_lights_gpu.push(MeshLight {
             triangles: d_tris,
             cdf: d_cdf,
@@ -970,12 +1157,12 @@ pub fn render_to_pixels(
     let d_mesh_lights = if mesh_lights_gpu.is_empty() {
         0
     } else {
-        alloc_and_copy_slice(&stream, &mesh_lights_gpu)?
+        uploads.copy_slice(&mesh_lights_gpu)?
     };
     let d_mesh_light_cdf = if mesh_lights_gpu.is_empty() {
         0
     } else {
-        alloc_and_copy_slice(&stream, &mesh_light_outer_cdf)?
+        uploads.copy_slice(&mesh_light_outer_cdf)?
     };
 
     // --- World / envmap ---
@@ -994,23 +1181,23 @@ pub fn render_to_pixels(
     };
     let (d_envmap, env_w, env_h, d_mcdf, d_ccdf, env_integral) =
         if let Some((rgb, w, h)) = &scene.envmap_rgb {
-            let d_env = alloc_and_copy_slice(&stream, rgb)?;
+            let d_env = uploads.copy_slice(rgb)?;
             let (m, c, total) = pipeline::build_envmap_cdf(rgb, *w, *h);
-            let d_m = alloc_and_copy_slice(&stream, &m)?;
-            let d_c = alloc_and_copy_slice(&stream, &c)?;
+            let d_m = uploads.copy_slice(&m)?;
+            let d_c = uploads.copy_slice(&c)?;
             (d_env, *w as i32, *h as i32, d_m, d_c, total)
         } else {
             (0, 0, 0, 0, 0, 0.0)
         };
     // Mixed-envmap layers (uploaded only when WorldDesc::Mixed).
     let (d_envmap_a, env_w_a, env_h_a) = if let Some((rgb, w, h)) = &scene.envmap_layer_a_rgb {
-        let d = alloc_and_copy_slice(&stream, rgb)?;
+        let d = uploads.copy_slice(rgb)?;
         (d, *w as i32, *h as i32)
     } else {
         (0, 0, 0)
     };
     let (d_envmap_b, env_w_b, env_h_b) = if let Some((rgb, w, h)) = &scene.envmap_layer_b_rgb {
-        let d = alloc_and_copy_slice(&stream, rgb)?;
+        let d = uploads.copy_slice(rgb)?;
         (d, *w as i32, *h as i32)
     } else {
         (0, 0, 0)
@@ -1043,16 +1230,25 @@ pub fn render_to_pixels(
     // --- GGX LUTs ---
     let scene_upload_time = t_scene_upload.elapsed();
     let t_buffers = std::time::Instant::now();
-    let d_ggx_e = alloc_and_copy_slice(&stream, &pipeline::GGX_ENERGY_LUT)?;
-    let d_ggx_e_avg = alloc_and_copy_slice(&stream, &pipeline::GGX_ENERGY_AVG_LUT)?;
-    let d_ggx_b = alloc_and_copy_slice(&stream, &pipeline::GGX_FRESNEL_LUT)?;
+    let d_ggx_e = uploads.copy_slice(&pipeline::GGX_ENERGY_LUT)?;
+    let d_ggx_e_avg = uploads.copy_slice(&pipeline::GGX_ENERGY_AVG_LUT)?;
+    let d_ggx_b = uploads.copy_slice(&pipeline::GGX_FRESNEL_LUT)?;
 
     // --- Image buffer (float4 per pixel) ---
     let pixel_count = (render_settings.width * render_settings.height) as usize;
     let d_image: CudaSlice<f32> = stream.alloc_zeros(pixel_count * 4).cuda()?;
+    let d_aovs = if scene.file.aov_names.is_empty() {
+        None
+    } else {
+        Some(
+            stream
+                .alloc_zeros::<f32>(pixel_count * 4 * scene.file.aov_names.len())
+                .cuda()?,
+        )
+    };
     let progressive = progress.wants_preview();
     let d_accumulation: Option<CudaSlice<f32>> = if progressive && render_settings.spp > 1 {
-        Some(stream.alloc_zeros(pixel_count * 3).cuda()?)
+        Some(stream.alloc_zeros(pixel_count * 4).cuda()?)
     } else {
         None
     };
@@ -1084,6 +1280,11 @@ pub fn render_to_pixels(
     let primary_back_face_skip_exhausted = dptr_u32(&d_back_face_warn, &stream);
 
     let mut lp = LaunchParams {
+        query_nodes,
+        query_indices,
+        query_objects: query_objects_ptr,
+        aov_data: d_aovs.as_ref().map_or(0, |s| dptr_f32(s, &stream)),
+        num_aovs: scene.file.aov_names.len() as u32,
         image: dptr_f32(&d_image, &stream),
         accumulation: d_accumulation.as_ref().map_or(0, |s| dptr_f32(s, &stream)),
         width: render_settings.width,
@@ -1091,6 +1292,7 @@ pub fn render_to_pixels(
         samples_per_pixel: render_settings.spp,
         sample_start: 0,
         sample_count: if progressive { 1 } else { render_settings.spp },
+        film_transparent: render_settings.film_transparent as u32,
         max_depth: render_settings.max_depth,
         max_diffuse_bounces: render_settings.max_diffuse_bounces,
         max_glossy_bounces: render_settings.max_glossy_bounces,
@@ -1348,7 +1550,26 @@ pub fn render_to_pixels(
     // --- Readback ---
     let pixels: Vec<f32> = stream.clone_dtoh(&d_final).cuda()?;
     let depth: Vec<f32> = stream.clone_dtoh(&d_depth).cuda()?;
+    let mut aovs = std::collections::BTreeMap::new();
+    if let Some(data) = &d_aovs {
+        let values: Vec<f32> = stream.clone_dtoh(data).cuda()?;
+        for (name, pixels) in scene
+            .file
+            .aov_names
+            .iter()
+            .zip(values.chunks_exact(pixel_count * 4))
+        {
+            aovs.insert(
+                name.clone(),
+                pixels
+                    .iter()
+                    .map(|v| v / render_settings.spp as f32)
+                    .collect(),
+            );
+        }
+    }
     Ok(RenderOutput {
+        aovs,
         pixels,
         depth,
         width: render_settings.width,

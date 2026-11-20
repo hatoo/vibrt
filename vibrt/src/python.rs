@@ -141,7 +141,7 @@ fn parse_options(opts: &Bound<'_, PyDict>) -> PyResult<RenderOptions> {
 #[pyfunction]
 #[pyo3(signature = (
     scene_json, mesh_blobs, opts, log_cb = None, cancel_cb = None,
-    texture_arrays = None, preview_cb = None,
+    texture_arrays = None, preview_cb = None, aov_outputs = None,
 ))]
 fn render<'py>(
     py: Python<'py>,
@@ -152,6 +152,7 @@ fn render<'py>(
     cancel_cb: Option<PyObject>,
     texture_arrays: Option<Vec<PyBuffer<f32>>>,
     preview_cb: Option<PyObject>,
+    aov_outputs: Option<Bound<'py, PyDict>>,
 ) -> PyResult<(Bound<'py, PyArray3<f32>>, Bound<'py, PyArray2<f32>>)> {
     let ro = parse_options(opts)?;
     let t_scene = std::time::Instant::now();
@@ -227,6 +228,13 @@ fn render<'py>(
     let out = render_result.map_err(|e| PyRuntimeError::new_err(format!("vibrt: {e:#}")))?;
     let h = out.height as usize;
     let w = out.width as usize;
+    if let Some(outputs) = aov_outputs {
+        for (name, values) in out.aovs {
+            let array = Array::from_shape_vec((h, w, 4), values)
+                .map_err(|e| PyRuntimeError::new_err(format!("AOV reshape: {e}")))?;
+            outputs.set_item(name, array.into_pyarray_bound(py))?;
+        }
+    }
     let arr = Array::from_shape_vec((h, w, 4), out.pixels)
         .map_err(|e| PyRuntimeError::new_err(format!("pixel buffer reshape failed: {e}")))?;
     let depth = Array::from_shape_vec((h, w), out.depth)

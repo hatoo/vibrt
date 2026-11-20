@@ -154,6 +154,58 @@ for i, value in enumerate((0.17, 0.31)):
     tree.links.new(instance.outputs[0], add.inputs[i])
 tree.links.new(add.outputs[0], emit.inputs["Color"])
 
+for kind in ("ShaderNodeDisplacement", "ShaderNodeVectorDisplacement"):
+    for space in (
+        ("OBJECT", "WORLD")
+        if kind == "ShaderNodeDisplacement"
+        else ("TANGENT", "OBJECT", "WORLD")
+    ):
+        tree, emit, _ = material(f"{kind}-{space}")
+        node = tree.nodes.new(kind)
+        node.space = space
+        node.inputs["Scale"].default_value = 0.4
+        if kind == "ShaderNodeDisplacement":
+            node.inputs["Height"].default_value = 0.9
+        else:
+            node.inputs["Vector"].default_value = (0.7, 0.2, 0.4, 1)
+        tree.links.new(node.outputs[0], emit.inputs["Color"])
+
+for map_name in ("UVMap", "Alternate"):
+    for kind in ("ShaderNodeNormalMap", "ShaderNodeTangent"):
+        tree, emit, _ = material(f"named-{kind}-{map_name}")
+        node = tree.nodes.new(kind)
+        node.uv_map = map_name
+        if kind == "ShaderNodeNormalMap":
+            node.inputs["Color"].default_value = (0.7, 0.7, 0.9, 1)
+        tree.links.new(node.outputs[0], emit.inputs["Color"])
+
+for attribute in ("Scalar", "Integer", "Boolean", "Vector", "Tint"):
+    tree, emit, _ = material(f"attribute-{attribute}")
+    node = tree.nodes.new("ShaderNodeAttribute")
+    node.attribute_name = attribute
+    tree.links.new(node.outputs["Color"], emit.inputs["Color"])
+
+for kind in ("OBJECT", "VIEW_LAYER"):
+    tree, emit, _ = material(f"attribute-{kind}")
+    node = tree.nodes.new("ShaderNodeAttribute")
+    node.attribute_type = kind
+    node.attribute_name = "Fixture"
+    tree.links.new(node.outputs["Color"], emit.inputs["Color"])
+bpy.context.view_layer["Fixture"] = (0.2, 0.4, 0.7)
+
+tree, emit, _ = material("nested-bump")
+uv = tree.nodes.new("ShaderNodeTexCoord")
+sep = tree.nodes.new("ShaderNodeSeparateXYZ")
+tree.links.new(uv.outputs["UV"], sep.inputs[0])
+first = tree.nodes.new("ShaderNodeBump")
+second = tree.nodes.new("ShaderNodeBump")
+first.inputs["Distance"].default_value = 0.1
+second.inputs["Distance"].default_value = 0.15
+tree.links.new(sep.outputs["X"], first.inputs["Height"])
+tree.links.new(sep.outputs["Y"], second.inputs["Height"])
+tree.links.new(first.outputs[0], second.inputs["Normal"])
+tree.links.new(second.outputs[0], emit.inputs["Color"])
+
 size = math.ceil(math.sqrt(len(cases)))
 tile = 32
 resolution = size * tile
@@ -178,12 +230,25 @@ for i, (name, mat) in enumerate(cases):
     mesh.uv_layers.active_index = 0
     color = mesh.color_attributes.new(name="Tint", type="FLOAT_COLOR", domain="CORNER")
     color.data.foreach_set("color", (0.2, 0.4, 0.7, 0.35) * 4)
+    for attr_name, kind, domain, value in (
+        ("Scalar", "FLOAT", "POINT", 0.37),
+        ("Integer", "INT", "FACE", 2),
+        ("Boolean", "BOOLEAN", "POINT", True),
+        ("Vector", "FLOAT_VECTOR", "CORNER", (0.2, 0.4, 0.7)),
+    ):
+        attr = mesh.attributes.new(attr_name, kind, domain)
+        for element in attr.data:
+            if kind == "FLOAT_VECTOR":
+                element.vector = value
+            else:
+                element.value = value
     mesh.materials.append(mat)
     mat.pass_index = 3
     obj = bpy.data.objects.new(name, mesh)
     obj.location = (i % size - size / 2 + 0.5, i // size - size / 2 + 0.5, 0)
     obj.color = (0.13, 0.27, 0.53, 0.71)
     obj.pass_index = 2
+    obj["Fixture"] = (0.2, 0.4, 0.7)
     scene.collection.objects.link(obj)
 
 directory = ROOT / "target/shader-graphs"

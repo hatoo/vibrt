@@ -53,54 +53,77 @@ Transmission Weight, Emission Color/Strength, Alpha, Specular IOR Level,
 Anisotropy/Rotation, Coat Weight/Roughness/IOR, Sheen Weight/Roughness/Tint,
 Subsurface Weight/Radius, Normal and Tangent. Extra Principled inputs such as
 coat/specular tint, coat normal, thin film and detailed SSS controls remain
-unsupported. Diffuse roughness, exact sheen/hair/SSS models, refraction-only
-closure behavior and colored transparency are not Cycles-equivalent.
+unsupported. Diffuse roughness, exact sheen, the legacy Hair BSDF, Principled SSS,
+refraction-only closure behavior and colored transparency are not Cycles-equivalent.
+Standalone Chiang Hair and Burley SSS use the additional closures described below.
 
 Image textures are sampled at hits and graph-driven emission also participates
-in mesh-light importance sampling. A shader tree and all materials on one mesh
-must agree on one UV and one color layer. Missing attributes and animated image
-users are not a general-purpose Blender attribute/texture system.
+in mesh-light importance sampling. Named UV/color/scalar/vector attributes are exported only when requested, and
+several layers can coexist. Animated image users and UDIM tiles still require a
+texture manager. Default UV images reuse the existing coordinate buffer.
+
+## Scene-dependent additions
+
+AO, Bevel, Raycast and Burley SSS use compact per-mesh/instance software BVHs;
+ordinary path tracing continues to use OptiX. These extra BVHs are allocated only
+when needed. AOV and extended volume-phase kernels are also compiled only for
+scenes using them. Device uploads are owned by each render and released on
+success, cancellation or errors.
+
+Geometric displacement runs the shared C++ evaluator on the CPU before upload,
+borrowing image buffers. It edits only evaluated mesh copies, averages corner
+samples at shared vertices and uses the available tessellation. Ray-dependent,
+scene-query, derivative and instance-property displacement inputs are rejected.
+Displacement is evaluated on source objects before instancing. BOTH uses geometric
+displacement without a second fine-detail bump pass. BUMP updates the closure
+normal; Geometry Normal read elsewhere in the graph is still undisplaced.
+
+The remaining unsupported node types are **Point Info, Volume Info and Script
+(OSL)**. They need point-cloud geometry, a volume-grid backend and an OSL runtime,
+respectively. Huang Hair and random-walk SSS remain unsupported modes; Huang's
+prototype failed roughness-dependent Cycles comparisons and is not enabled.
+Warnings/fallbacks do not count as implementation of these features.
 
 ## Complete inventory
 
-Native: **45**, Partial: **24**, Legacy: **8**, Unsupported: **17**, Outside Cycles surface scope: **5**.
+Native: **52**, Partial: **32**, Legacy: **7**, Unsupported: **3**, Outside Cycles surface scope: **5**.
 
 | Blender node | Status | Scope |
 |---|---|---|
 | `ShaderNodeAddShader` | Native | Separate weighted closures, including dynamic factors; 16 leaves / 8 levels maximum. |
-| `ShaderNodeAmbientOcclusion` | Unsupported | Requires additional closure, attribute, traversal, volume or output integration. Export diagnostics/fallback do not constitute native support. |
-| `ShaderNodeAttribute` | Partial | One mesh color attribute: Color/Vector, average Fac, Alpha. Arbitrary scalar/vector, object, instancer and volume attributes are unsupported. |
+| `ShaderNodeAmbientOcclusion` | Native | Color/AO outputs, distance, samples, inside and local-only queries against evaluated mesh geometry. |
+| `ShaderNodeAttribute` | Partial | Named POINT/CORNER/FACE scalar, integer, boolean, vector and color attributes; object/instancer/view-layer custom properties. Volume grids remain unsupported. |
 | `ShaderNodeBackground` | Legacy | World export and native sky / bake fallback; not the surface interpreter. |
-| `ShaderNodeBevel` | Unsupported | Requires additional closure, attribute, traversal, volume or output integration. Export diagnostics/fallback do not constitute native support. |
+| `ShaderNodeBevel` | Partial | Cycles cubic profile and three-axis sampling on triangle geometry; at most 64 intersections per sample. |
 | `ShaderNodeBlackbody` | Native | Shared C++ CPU/CUDA evaluator; socket conversions are explicit. |
 | `ShaderNodeBrightContrast` | Native | Shared C++ CPU/CUDA evaluator; socket conversions are explicit. |
 | `ShaderNodeBsdfAnisotropic` | Partial | Existing vibrt closure with dynamic supported color/value/normal sockets. See closure limitations below. |
 | `ShaderNodeBsdfDiffuse` | Partial | Existing vibrt closure with dynamic supported color/value/normal sockets. See closure limitations below. |
 | `ShaderNodeBsdfGlass` | Partial | Existing vibrt closure with dynamic supported color/value/normal sockets. See closure limitations below. |
 | `ShaderNodeBsdfHair` | Partial | Existing vibrt closure with dynamic supported color/value/normal sockets. See closure limitations below. |
-| `ShaderNodeBsdfHairPrincipled` | Unsupported | Requires additional closure, attribute, traversal, volume or output integration. Export diagnostics/fallback do not constitute native support. |
+| `ShaderNodeBsdfHairPrincipled` | Partial | Unmodified Cycles Chiang closure with Color/Melanin/Absorption parametrizations and strand randomization. Huang is rejected pending agreement with Cycles. |
 | `ShaderNodeBsdfMetallic` | Partial | F82 base color, roughness and anisotropy mapped to vibrt metal. Physical conductor, edge tint and thin film are unsupported. |
 | `ShaderNodeBsdfPrincipled` | Partial | Dynamic base/roughness/metallic/IOR/transmission/alpha/emission/specular/anisotropy/coat/sheen/SSS inputs listed below. Renderer closure physics are not identical to Cycles. |
-| `ShaderNodeBsdfRayPortal` | Unsupported | Requires additional closure, attribute, traversal, volume or output integration. Export diagnostics/fallback do not constitute native support. |
+| `ShaderNodeBsdfRayPortal` | Native | Dynamic color, position and direction; ray relocation also works inside Mix/Add trees. |
 | `ShaderNodeBsdfRefraction` | Partial | Existing vibrt closure with dynamic supported color/value/normal sockets. See closure limitations below. |
 | `ShaderNodeBsdfSheen` | Partial | Existing vibrt closure with dynamic supported color/value/normal sockets. See closure limitations below. |
-| `ShaderNodeBsdfToon` | Unsupported | Requires additional closure, attribute, traversal, volume or output integration. Export diagnostics/fallback do not constitute native support. |
+| `ShaderNodeBsdfToon` | Native | Diffuse and glossy components with dynamic Color, Size, Smooth and Normal. |
 | `ShaderNodeBsdfTranslucent` | Partial | Existing vibrt closure with dynamic supported color/value/normal sockets. See closure limitations below. |
 | `ShaderNodeBsdfTransparent` | Partial | Existing vibrt closure with dynamic supported color/value/normal sockets. See closure limitations below. |
-| `ShaderNodeBump` | Partial | A Bump connected directly to a material Normal uses finite spatial differences. Nested Bump and displacement-aware derivatives are unsupported. |
+| `ShaderNodeBump` | Partial | Nested Bump graphs and normal chains use finite spatial differences. Ray differentials and displacement-aware Geometry Normal are incomplete. |
 | `ShaderNodeCameraData` | Native | Shared C++ CPU/CUDA evaluator; socket conversions are explicit. |
 | `ShaderNodeClamp` | Native | Shared C++ CPU/CUDA evaluator; socket conversions are explicit. |
 | `ShaderNodeCombineColor` | Native | Shared C++ CPU/CUDA evaluator; socket conversions are explicit. |
 | `ShaderNodeCombineXYZ` | Native | Shared C++ CPU/CUDA evaluator; socket conversions are explicit. |
-| `ShaderNodeDisplacement` | Legacy | Existing mesh texture displacement path; no general shader displacement evaluation. |
+| `ShaderNodeDisplacement` | Partial | Shared C++ evaluator for geometric DISPLACEMENT/BOTH on evaluated mesh vertices and BUMP shading. No adaptive subdivision; see limits below. |
 | `ShaderNodeEeveeSpecular` | Outside Cycles surface scope | EEVEE, Freestyle or legacy node; not claimed as Cycles-compatible. |
 | `ShaderNodeEmission` | Native | Dynamic color and strength on hits and mesh-light samples. |
 | `ShaderNodeFloatCurve` | Native | Shared C++ CPU/CUDA evaluator; socket conversions are explicit. |
 | `ShaderNodeFresnel` | Native | Shared C++ CPU/CUDA evaluator; socket conversions are explicit. |
 | `ShaderNodeGamma` | Native | Shared C++ CPU/CUDA evaluator; socket conversions are explicit. |
 | `ShaderNodeGroup` | Native | Nested groups and instance defaults; reroutes and muted value nodes are followed. |
-| `ShaderNodeHairInfo` | Unsupported | Requires additional closure, attribute, traversal, volume or output integration. Export diagnostics/fallback do not constitute native support. |
-| `ShaderNodeHoldout` | Unsupported | Requires additional closure, attribute, traversal, volume or output integration. Export diagnostics/fallback do not constitute native support. |
+| `ShaderNodeHairInfo` | Partial | Is Strand, Intercept, Length, Thickness, Random and Tangent Normal on exported legacy particle-hair ribbons. Modern Curves geometry is not exported. |
+| `ShaderNodeHoldout` | Native | Black contribution and holdout alpha with transparent film; weighted Mix/Add support. |
 | `ShaderNodeHueSaturation` | Native | Shared C++ CPU/CUDA evaluator; socket conversions are explicit. |
 | `ShaderNodeInvert` | Native | Shared C++ CPU/CUDA evaluator; socket conversions are explicit. |
 | `ShaderNodeLayerWeight` | Native | Shared C++ CPU/CUDA evaluator; socket conversions are explicit. |
@@ -114,27 +137,27 @@ Native: **45**, Partial: **24**, Legacy: **8**, Unsupported: **17**, Outside Cyc
 | `ShaderNodeMixShader` | Native | Separate weighted closures, including dynamic factors; 16 leaves / 8 levels maximum. |
 | `ShaderNodeNewGeometry` | Partial | Position, shading/geometric normal, incoming, tangent, backfacing. No pointiness or random-per-island attributes. |
 | `ShaderNodeNormal` | Native | Shared C++ CPU/CUDA evaluator; socket conversions are explicit. |
-| `ShaderNodeNormalMap` | Partial | Tangent/object/world and legacy Blender spaces; OpenGL/DirectX. Uses triangle UV derivatives, not a full exported MikkTSpace frame; displaced-base selection is not available. |
+| `ShaderNodeNormalMap` | Partial | Multiple explicitly named UV maps use exported MikkTSpace tangents. The default unnamed UV retains triangle-derivative tangents; object/world and OpenGL/DirectX are supported. |
 | `ShaderNodeObjectInfo` | Partial | Location, color, alpha, object/material pass indices; Random uses vibrt instance hashing, not Cycles hash identity. |
-| `ShaderNodeOutputAOV` | Unsupported | Requires additional closure, attribute, traversal, volume or output integration. Export diagnostics/fallback do not constitute native support. |
+| `ShaderNodeOutputAOV` | Native | Color/Value roots, including nested groups, written to registered Blender view-layer passes on render completion. |
 | `ShaderNodeOutputLight` | Legacy | Existing light/IES exporter and photometric sampling; no general light shader DAG. |
 | `ShaderNodeOutputLineStyle` | Outside Cycles surface scope | EEVEE, Freestyle or legacy node; not claimed as Cycles-compatible. |
-| `ShaderNodeOutputMaterial` | Native | Surface dispatch; Volume and Displacement retain their documented legacy paths. |
+| `ShaderNodeOutputMaterial` | Native | Surface and AOV dispatch; Volume and Displacement follow the limitations documented for those nodes. |
 | `ShaderNodeOutputWorld` | Legacy | World export and native sky / bake fallback; not the surface interpreter. |
-| `ShaderNodeParticleInfo` | Unsupported | Requires additional closure, attribute, traversal, volume or output integration. Export diagnostics/fallback do not constitute native support. |
-| `ShaderNodePointInfo` | Unsupported | Requires additional closure, attribute, traversal, volume or output integration. Export diagnostics/fallback do not constitute native support. |
+| `ShaderNodeParticleInfo` | Partial | Index, age, lifetime, location, size, velocity, angular velocity and random on legacy particle object instances. Missing particle data returns zero. |
+| `ShaderNodePointInfo` | Unsupported | Requires native point-cloud geometry export and intersection data; rejected explicitly. |
 | `ShaderNodeRGB` | Native | Shared C++ CPU/CUDA evaluator; socket conversions are explicit. |
 | `ShaderNodeRGBCurve` | Native | Shared C++ CPU/CUDA evaluator; socket conversions are explicit. |
 | `ShaderNodeRGBToBW` | Native | Shared C++ CPU/CUDA evaluator; socket conversions are explicit. |
 | `ShaderNodeRadialTiling` | Native | Shared C++ CPU/CUDA evaluator; socket conversions are explicit. |
-| `ShaderNodeRaycast` | Unsupported | Requires additional closure, attribute, traversal, volume or output integration. Export diagnostics/fallback do not constitute native support. |
-| `ShaderNodeScript` | Unsupported | Requires additional closure, attribute, traversal, volume or output integration. Export diagnostics/fallback do not constitute native support. |
+| `ShaderNodeRaycast` | Native | Is Hit, Is Hit Self, Distance, Position and Normal; scene/local query modes on evaluated triangles. |
+| `ShaderNodeScript` | Unsupported | OSL shaders require an OSL execution backend and renderer services; rejected explicitly. |
 | `ShaderNodeSeparateColor` | Native | Shared C++ CPU/CUDA evaluator; socket conversions are explicit. |
 | `ShaderNodeSeparateXYZ` | Native | Shared C++ CPU/CUDA evaluator; socket conversions are explicit. |
 | `ShaderNodeShaderToRGB` | Outside Cycles surface scope | EEVEE, Freestyle or legacy node; not claimed as Cycles-compatible. |
 | `ShaderNodeSqueeze` | Outside Cycles surface scope | EEVEE, Freestyle or legacy node; not claimed as Cycles-compatible. |
-| `ShaderNodeSubsurfaceScattering` | Unsupported | Requires additional closure, attribute, traversal, volume or output integration. Export diagnostics/fallback do not constitute native support. |
-| `ShaderNodeTangent` | Partial | UV derivative or radial tangent; no MikkTSpace attribute export. |
+| `ShaderNodeSubsurfaceScattering` | Partial | Burley disk scattering with Cycles radial profiles and three-axis MIS. Random Walk and Random Walk Skin are rejected; intersection enumeration is capped at 64. |
+| `ShaderNodeTangent` | Partial | Named/active UV MikkTSpace tangents and radial tangents on meshes. Curve tangent semantics retain the ribbon approximation. |
 | `ShaderNodeTexBrick` | Native | Spatial evaluation with linked inputs; Cycles 5.1.1 numerical helpers. |
 | `ShaderNodeTexChecker` | Native | Spatial evaluation with linked inputs; Cycles 5.1.1 numerical helpers. |
 | `ShaderNodeTexCoord` | Partial | Generated, UV, object, normal, camera, window, reflection. No explicit reference object or instancer coordinates; generated coordinates use evaluated mesh bounds. |
@@ -150,22 +173,22 @@ Native: **45**, Partial: **24**, Legacy: **8**, Unsupported: **17**, Outside Cyc
 | `ShaderNodeTexWave` | Native | Spatial evaluation with linked inputs; Cycles 5.1.1 numerical helpers. |
 | `ShaderNodeTexWhiteNoise` | Native | Spatial evaluation with linked inputs; Cycles 5.1.1 numerical helpers. |
 | `ShaderNodeUVAlongStroke` | Outside Cycles surface scope | EEVEE, Freestyle or legacy node; not claimed as Cycles-compatible. |
-| `ShaderNodeUVMap` | Partial | One named UV stream per mesh. Conflicting named streams fail explicitly; instancer UV unsupported. |
+| `ShaderNodeUVMap` | Partial | Multiple independently named UV layers per mesh; instancer UV remains unsupported. |
 | `ShaderNodeValToRGB` | Native | Shared C++ CPU/CUDA evaluator; socket conversions are explicit. |
 | `ShaderNodeValue` | Native | Shared C++ CPU/CUDA evaluator; socket conversions are explicit. |
 | `ShaderNodeVectorCurve` | Native | Shared C++ CPU/CUDA evaluator; socket conversions are explicit. |
-| `ShaderNodeVectorDisplacement` | Unsupported | Requires additional closure, attribute, traversal, volume or output integration. Export diagnostics/fallback do not constitute native support. |
+| `ShaderNodeVectorDisplacement` | Partial | Tangent/object/world vectors, midlevel and scale; geometric displacement or BUMP shading. No adaptive subdivision. |
 | `ShaderNodeVectorMath` | Native | Shared C++ CPU/CUDA evaluator; socket conversions are explicit. |
 | `ShaderNodeVectorRotate` | Native | Shared C++ CPU/CUDA evaluator; socket conversions are explicit. |
 | `ShaderNodeVectorTransform` | Native | Shared C++ CPU/CUDA evaluator; socket conversions are explicit. |
-| `ShaderNodeVertexColor` | Partial | Selected or active color layer, including Alpha; one color stream per mesh. |
+| `ShaderNodeVertexColor` | Native | Multiple named/active mesh color layers, including Alpha, in POINT or CORNER domains. |
 | `ShaderNodeVolumeAbsorption` | Legacy | Existing homogeneous volume export. No general spatial volume graph. |
-| `ShaderNodeVolumeCoefficients` | Unsupported | Requires additional closure, attribute, traversal, volume or output integration. Export diagnostics/fallback do not constitute native support. |
-| `ShaderNodeVolumeInfo` | Unsupported | Requires additional closure, attribute, traversal, volume or output integration. Export diagnostics/fallback do not constitute native support. |
+| `ShaderNodeVolumeCoefficients` | Partial | Homogeneous scattering/absorption/emission with HG, Fournier-Forand, Draine, Rayleigh and Mie phase functions. Spatial graphs/grids and mixed distinct phase functions are unsupported. |
+| `ShaderNodeVolumeInfo` | Unsupported | Requires density/color/flame/temperature grid sampling and heterogeneous volume transport; rejected explicitly. |
 | `ShaderNodeVolumePrincipled` | Legacy | Existing homogeneous volume export. No general spatial volume graph. |
 | `ShaderNodeVolumeScatter` | Legacy | Existing homogeneous volume export. No general spatial volume graph. |
 | `ShaderNodeWavelength` | Native | Shared C++ CPU/CUDA evaluator; socket conversions are explicit. |
-| `ShaderNodeWireframe` | Unsupported | Requires additional closure, attribute, traversal, volume or output integration. Export diagnostics/fallback do not constitute native support. |
+| `ShaderNodeWireframe` | Partial | Triangle edges with world or pixel size. Pixel size uses the primary camera footprint rather than propagated ray differentials. |
 
 ## Validation
 
@@ -177,8 +200,21 @@ Native: **45**, Partial: **24**, Legacy: **8**, Unsupported: **17**, Outside Cyc
 - `blender -b --factory-startup --python-exit-code 1 --python scripts/test_shader_nodes.py`:
   315 operation/mode cases compared with Cycles and actual CUDA renders.
 - The same command with `scripts/test_shader_graphs.py`: spatial images,
-  48 cases covering named UV/color layers, alpha, object data, normal maps,
-  tangents, group instance defaults and Mix/Add.
+  65 cases covering multiple UV/color/scalar/vector layers, object/instancer/layer
+  properties, normal maps, nested bump, displacement values and Mix/Add.
+- `scripts/test_scene_nodes.py`: 18 Cycles comparisons for AO, Bevel, Wireframe
+  and Raycast, including local queries, self hits and misses.
+- `scripts/test_extended_closures.py`: Toon, Holdout, Ray Portal, Chiang's three
+  parametrizations and Burley SSS, with Color/Value AOV readback.
+- `scripts/test_aov_passes.py`: actual Blender RenderResult Color/Value passes
+  and transparent-film alpha.
+- `scripts/test_displacement.py`: tangent/object/world geometric displacement
+  and image heights, BUMP isolation and unsupported-input checks, including
+  preservation of the original Blender mesh.
+- `scripts/test_node_exports.py`: real particle-instance and hair metadata,
+  volume-phase export and explicit unsupported-mode diagnostics.
+- `scripts/test_medium_closures.py`: curved Burley SSS and five homogeneous
+  volume phases compared with Cycles at 2048 samples.
 - `scripts/test_shader_lighting.py`: procedural emission illuminating a diffuse
   receiver, compared with a 512-sample Cycles render.
 - `scripts/test_bsdf_mixtures.py`: nine Mix/Add energy checks against separately
@@ -189,6 +225,7 @@ Native: **45**, Partial: **24**, Legacy: **8**, Unsupported: **17**, Outside Cyc
   the installed Blender node inventory (run through Blender).
 
 Test artifacts are under `target/shader-nodes`, `target/shader-graphs`,
+`target/scene-nodes`, `target/extended-closures`, `target/medium-closures`,
 `target/shader-lighting` and `target/bsdf-mixtures`.
 Pinned source, hashes, adaptations and licenses are documented in
 [`vibrt-nodes/third_party/cycles`](../vibrt-nodes/third_party/cycles/README.md).

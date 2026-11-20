@@ -8,6 +8,7 @@ use rayon::prelude::*;
 use std::borrow::Cow;
 
 pub struct LoadedMesh<'bin> {
+    pub attributes: Vec<(u64, Cow<'bin, [f32]>)>,
     /// f32 x 3 per vertex. Borrowed directly from the source bin when the
     /// mesh has no displacement; an owned `Vec<f32>` when displacement
     /// perturbation has to mutate the positions.
@@ -1145,7 +1146,20 @@ fn load_mesh<'a>(desc: &MeshDesc, blobs: &[&'a [u8]]) -> Result<LoadedMesh<'a>> 
         ));
     }
 
+    let mut attributes = Vec::new();
+    let mut keys = std::collections::HashSet::new();
+    for (name, &index) in &desc.attributes {
+        let data = cast_f32_slice(lookup_blob(blobs, index)?);
+        anyhow::ensure!(
+            data.len() == 4 || data.len() == vertices.len() / 3 * 4,
+            "Attribute {name:?} must contain one float4 or one per vertex"
+        );
+        let key = vibrt_nodes::shader::attribute_key(name);
+        anyhow::ensure!(keys.insert(key), "Attribute hash collision: {name:?}");
+        attributes.push((key, data));
+    }
     Ok(LoadedMesh {
+        attributes,
         vertices,
         normals,
         uvs,

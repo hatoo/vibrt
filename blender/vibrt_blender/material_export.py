@@ -1148,6 +1148,14 @@ def _resolve_volume_coeffs(node):
                 sigma_e[i] += bb_rgb[i] * bb_tint[i] * bb_intensity * density
         return sigma_s, sigma_a, sigma_e, anisotropy
 
+    if bl == "ShaderNodeVolumeCoefficients":
+        return (
+            _vol_color_input(node.inputs.get("Scatter Coefficients")),
+            _vol_color_input(node.inputs.get("Absorption Coefficients")),
+            _vol_color_input(node.inputs.get("Emission Coefficients")),
+            _vol_scalar_input(node.inputs.get("Anisotropy"), 0.0),
+        )
+
     if bl == "ShaderNodeVolumeAbsorption":
         color = _vol_color_input(node.inputs.get("Color"))
         density = _vol_scalar_input(node.inputs.get("Density"), 1.0)
@@ -1229,6 +1237,48 @@ def _resolve_volume_coeffs(node):
     return None
 
 
+def _volume_phase(node):
+    """Preserve a shared phase through Add/Mix; reject incompatible phase mixtures."""
+    if node.bl_idname in {"ShaderNodeAddShader", "ShaderNodeMixShader"}:
+        sockets = list(node.inputs)[-2:]
+        if node.bl_idname == "ShaderNodeMixShader" and not node.inputs[0].is_linked:
+            factor = node.inputs[0].default_value
+            if factor <= 0:
+                sockets = sockets[:1]
+            elif factor >= 1:
+                sockets = sockets[1:]
+        phases = []
+        for socket in sockets:
+            socket = _follow_reroutes(socket)
+            if socket.is_linked:
+                child = socket.links[0].from_node
+                coefficients = _resolve_volume_coeffs(child)
+                if coefficients and max(coefficients[0]) > 0:
+                    phases.append(_volume_phase(child))
+        if phases and any(phase != phases[0] for phase in phases[1:]):
+            raise ValueError(
+                "Volume Mix/Add with different phase functions is not supported"
+            )
+        return phases[0] if phases else (0, [1.33, 0.1, 0.5, 20.0])
+    phase = {
+        "HENYEY_GREENSTEIN": 0,
+        "FOURNIER_FORAND": 1,
+        "DRAINE": 2,
+        "RAYLEIGH": 3,
+        "MIE": 4,
+    }.get(getattr(node, "phase", "HENYEY_GREENSTEIN"), 0)
+    parameters = [
+        _vol_scalar_input(node.inputs.get(name), default)
+        for name, default in (
+            ("IOR", 1.33),
+            ("Backscatter", 0.1),
+            ("Alpha", 0.5),
+            ("Diameter", 20.0),
+        )
+    ]
+    return phase, parameters
+
+
 def _resolve_volume(volume_socket) -> dict | None:
     """Convert a Cycles Volume output socket into a renderer VolumeParams.
 
@@ -1246,6 +1296,7 @@ def _resolve_volume(volume_socket) -> dict | None:
     if coeffs is None:
         return None
     sigma_s, sigma_a, sigma_e, anisotropy = coeffs
+    phase, phase_params = _volume_phase(src)
     if (max(sigma_s) <= 0.0 and max(sigma_a) <= 0.0 and max(sigma_e) <= 0.0):
         return None
     # Renderer convention is σ_s = color × density. We've already folded
@@ -1254,6 +1305,8 @@ def _resolve_volume(volume_socket) -> dict | None:
     # math comes out the same.
     return {
         "color": sigma_s,
+        "phase": phase,
+        "phase_params": phase_params,
         "density": 1.0,
         "anisotropy": max(-0.999, min(0.999, float(anisotropy))),
         "absorption_color": sigma_a,
@@ -4598,6 +4651,28 @@ def export_material(
 
         surface = surface_sock.links[0].from_node
         params = _resolve_shader(surface, writer, textures, mat.name)
+        from .shader_graph import compile_aovs
+
+        compile_aovs(
+            mat.node_tree,
+            params,
+            writer,
+            textures,
+            [a for a in bpy.context.view_layer.aovs if a.is_valid],
+        )
+        displacement_method = getattr(mat, "displacement_method", "BUMP")
+        if displacement_method == "BUMP":
+            from .shader_graph import compile_displacement, UnsupportedNode
+
+            try:
+                compile_displacement(
+                    out_node.inputs.get("Displacement"), params, writer, textures
+                )
+            except UnsupportedNode as exc:
+                _warn(
+                    f"displacement:{mat.name}",
+                    f"{mat.name}: displacement graph limitation: {exc}",
+                )
 
         # Per-material UV transform: read it off the TexImage nodes rather
         # than picking up any Mapping node (which may drive a Noise procedural,

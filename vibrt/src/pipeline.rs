@@ -27,6 +27,10 @@ pub fn compile_ptx(
     shader_ops: u64,
     max_closures: usize,
     shader_stack_size: usize,
+    closure_types: u32,
+    shader_output_count: usize,
+    has_aovs: bool,
+    has_extended_phases: bool,
 ) -> Result<String> {
     let cu_src = include_str!("devicecode.cu");
     let header_src = include_str!("devicecode.h");
@@ -36,7 +40,9 @@ pub fn compile_ptx(
         ..Default::default()
     };
     let full_src = format!(
-        "#define VIBRT_SHADER_OPS {shader_ops}ull\n#define VIBRT_MAX_CLOSURES {max_closures}\n#define VIBRT_SHADER_STACK_SIZE {shader_stack_size}\n// -- inlined devicecode.h --\n{}\n// -- devicecode.cu --\n{}",
+        "#define VIBRT_SHADER_OPS {shader_ops}ull\n#define VIBRT_MAX_CLOSURES {max_closures}\n#define VIBRT_SHADER_STACK_SIZE {shader_stack_size}\n#define VIBRT_CLOSURE_TYPES {closure_types}u\n#define VIBRT_SHADER_OUTPUT_COUNT {shader_output_count}\n#define VIBRT_AOVS {}\n#define VIBRT_EXTENDED_PHASES {}\n// -- inlined devicecode.h --\n{}\n// -- devicecode.cu --\n{}",
+        u8::from(has_aovs),
+        u8::from(has_extended_phases),
         header_src.replace(
             "#include \"vibrt_nodes_types.h\"",
             vibrt_nodes::DEVICE_TYPES

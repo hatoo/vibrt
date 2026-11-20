@@ -44,11 +44,19 @@ fn shader_has_alpha(mat: &PrincipledMaterial) -> bool {
 /// Surface attributes used anywhere in a Mix/Add tree, including its factor.
 /// The legacy color evaluator also accepts vertex color and object randomness.
 pub fn surface_requirements(mat: &PrincipledMaterial) -> Result<(u32, bool)> {
-    let mut contexts = 0;
+    let mut contexts = if mat.closure_type == 5 { 1 << 7 } else { 0 };
     let mut bump = false;
-    if let Some(graph) = &mat.shader_graph {
+    for graph in mat
+        .shader_graph
+        .iter()
+        .chain(mat.aov_graphs.iter().map(|a| &a.graph))
+    {
         contexts |= graph.required_contexts()?;
-        bump = graph.outputs.contains_key("bump_height");
+        bump |= graph.outputs.contains_key("bump_height")
+            || graph
+                .nodes
+                .iter()
+                .any(|n| matches!(n.op.as_str(), "bump" | "vector_bump" | "shifted_context"));
     }
     if mat.use_vertex_color || mat.color_graph.is_some() {
         contexts |= 1 << 8;
@@ -93,7 +101,7 @@ pub struct ColorGraphGpu {
 pub struct ShaderGraphGpu {
     pub nodes: u64,
     pub len: i32,
-    pub outputs: u32,
+    pub outputs: u64,
     pub contexts: u32,
 }
 
@@ -266,6 +274,8 @@ pub fn make_volume_gpu(v: &VolumeParams) -> VolumeGpu {
         sigma_s[2] + sigma_a[2],
     ];
     VolumeGpu {
+        phase: v.phase,
+        phase_params: v.phase_params,
         sigma_t,
         _pad0: 0.0,
         sigma_s,
@@ -322,6 +332,8 @@ pub fn make_material_data(
     let (mf_ptr, mf_w, mf_h, mf_c) = lookup(mat.mix_fac_tex);
 
     PrincipledGpu {
+        aov_shaders: 0,
+        num_aov_shaders: 0,
         base_color: mat.base_color,
         metallic: mat.metallic.clamp(0.0, 1.0),
         roughness: mat.roughness.clamp(0.0, 1.0),
@@ -391,6 +403,7 @@ pub fn make_material_data(
         volume_only: if mat.volume_only { 1 } else { 0 },
         pure_glossy: if mat.pure_glossy { 1 } else { 0 },
         pure_diffuse: if mat.pure_diffuse { 1 } else { 0 },
+        closure_type: mat.closure_type,
         alpha_blend: mat.alpha_blend.clamp(0.0, 1.0),
         secondary: secondary_ptr,
         left_subtree: left_subtree_ptr,

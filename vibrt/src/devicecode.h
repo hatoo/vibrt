@@ -6,6 +6,8 @@
 
 /// Homogeneous volume parameters. Mirrors `gpu_types::VolumeGpu`.
 struct Volume {
+  unsigned int phase;
+  float phase_params[4];
   float sigma_t[3];
   float _pad0;
   float sigma_s[3];
@@ -14,8 +16,10 @@ struct Volume {
   float anisotropy;
 };
 
-
+struct AovShader;
 struct PrincipledGpu {
+  AovShader *aov_shaders;
+  unsigned int num_aov_shaders;
   float base_color[3];
   float metallic;
   float roughness;
@@ -82,7 +86,7 @@ struct PrincipledGpu {
   int color_graph_output;
   unsigned long long shader_nodes;
   int shader_len;
-  unsigned int shader_outputs;
+  unsigned long long shader_outputs;
   unsigned int shader_contexts;
   int shader_has_alpha;
   unsigned int surface_contexts;
@@ -100,6 +104,7 @@ struct PrincipledGpu {
   // and skips the spec/coat eval+sampling entirely. Set alongside
   // metallic=0 by the exporter when mapping a Diffuse BSDF.
   int pure_diffuse;
+  unsigned int closure_type;
   // Constant-Alpha mix weight from Cycles Principled's `Alpha` socket.
   // Defaults to 1.0 (fully opaque). When < 1.0, the kernel adds a
   // straight-through transparent-passthrough lobe with weight
@@ -130,7 +135,20 @@ struct PrincipledGpu {
   int mix_fac_tex_channels;
 };
 
+struct AovShader {
+  PrincipledGpu *material;
+  unsigned int index;
+  unsigned int _pad;
+};
+struct ShaderAttribute {
+  unsigned long long key;
+  float *data;
+  unsigned int count;
+  unsigned int _pad;
+};
 struct HitGroupData {
+  ShaderAttribute *attributes;
+  unsigned int num_attributes;
   PrincipledGpu *mat;
   float *vertices;
   float *normals;
@@ -258,14 +276,33 @@ struct MeshLight {
   unsigned int _pad;
 };
 
+struct QueryNode {
+  float lo[3];
+  unsigned int first;
+  float hi[3];
+  unsigned int count;
+};
+struct QueryObject {
+  HitGroupData *geometry;
+  QueryNode *nodes;
+  unsigned int *indices;
+  unsigned int mask;
+  unsigned int _pad;
+};
 struct LaunchParams {
+  QueryNode *query_nodes;
+  unsigned int *query_indices;
+  QueryObject *query_objects;
+  float *aov_data;
+  unsigned int num_aovs;
   float *image; // float4 per pixel
-  float *accumulation; // unnormalized float3 sums, optional for a single launch
+  float *accumulation; // unnormalized float4 RGB/transparency sums
   unsigned int width;
   unsigned int height;
   unsigned int samples_per_pixel;
   unsigned int sample_start;
   unsigned int sample_count;
+  unsigned int film_transparent;
   unsigned int max_depth;
   // Per-lobe bounce caps mirroring Cycles' diffuse/glossy/transmission
   // limits. Once a path has consumed its quota of one lobe type the

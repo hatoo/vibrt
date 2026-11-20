@@ -22,7 +22,7 @@ fn output_group(name: &str) -> u32 {
             _ => 0,
         }
 }
-pub const OUTPUTS: [&str; 32] = [
+pub const OUTPUTS: [&str; 64] = [
     "base_color",
     "roughness",
     "metallic",
@@ -55,9 +55,41 @@ pub const OUTPUTS: [&str; 32] = [
     "displacement",
     "weight",
     "reserved",
+    "toon_size",
+    "toon_smooth",
+    "portal_position",
+    "portal_direction",
+    "specular_tint",
+    "coat_tint",
+    "coat_normal",
+    "thin_film_thickness",
+    "thin_film_ior",
+    "sss_scale",
+    "sss_ior",
+    "sss_anisotropy",
+    "hair_sigma",
+    "hair_random",
+    "hair_coat",
+    "hair_ior",
+    "hair_aspect",
+    "hair_reflection",
+    "hair_transmission",
+    "hair_secondary",
+    "hair_random_roughness",
+    "hair_random_color",
+    "hair_melanin",
+    "hair_redness",
+    "hair_tint",
+    "hair_parametrization",
+    "displacement_vector",
+    "density",
+    "absorption",
+    "scattering",
+    "phase",
+    "volume_emission",
 ];
 // Order is the ABI in native/shader.h. Inputs are explicit typed conversions.
-pub const OPS: [(&str, usize); 40] = [
+pub const OPS: [(&str, usize); 52] = [
     ("constant", 0),
     ("context", 0),
     ("convert", 1),
@@ -98,6 +130,18 @@ pub const OPS: [(&str, usize); 40] = [
     ("light_falloff", 2),
     ("radial_tiling", 3),
     ("tangent", 0),
+    ("wireframe", 1),
+    ("ambient_occlusion", 3),
+    ("bevel", 2),
+    ("raycast", 3),
+    ("attribute", 0),
+    ("hair_tangent", 0),
+    ("shifted_context", 0),
+    ("bump", 6),
+    ("normal_map_named", 3),
+    ("displacement", 4),
+    ("vector_displacement", 4),
+    ("vector_bump", 4),
 ];
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -119,6 +163,14 @@ pub struct ShaderNode {
     pub texture: Option<u32>,
     #[serde(default)]
     pub table: Vec<f32>,
+    #[serde(default)]
+    pub attribute: String,
+}
+
+pub fn attribute_key(name: &str) -> u64 {
+    name.bytes().fold(0xcbf29ce484222325, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+    })
 }
 
 #[repr(C)]
@@ -209,7 +261,8 @@ impl ShaderGraph {
                 "Shader lookup table too large"
             );
             let bounds = match node.op.as_str() {
-                "context" => [32, 1, 1, 1],
+                "context" | "shifted_context" => [32, 1, 1, 1],
+                "bump" => [2, 1, 1, 1],
                 "convert" => [4, 1, 1, 1],
                 "math" => [41, 2, 1, 1],
                 "vector_math" => [30, 2, 1, 1],
@@ -235,6 +288,13 @@ impl ShaderGraph {
                 "camera" | "light_falloff" => [3, 1, 1, 1],
                 "radial_tiling" => [4, 2, 1, 1],
                 "tangent" => [2, 3, 1, 1],
+                "wireframe" => [2, 1, 1, 1],
+                "ambient_occlusion" => [2, 2, 2, 129],
+                "bevel" => [129, 1, 1, 1],
+                "raycast" => [5, 2, 1, 1],
+                "attribute" => [5, 1, 1, 1],
+                "normal_map_named" => [2, 1, 1, 1],
+                "displacement" | "vector_displacement" => [3, 1, 1, 1],
                 _ => [u32::MAX; 4],
             };
             ensure!(
@@ -317,14 +377,18 @@ impl ShaderGraph {
                 continue;
             }
             mask |= match node.op.as_str() {
-                "context" => 1 << node.modes[0],
+                "context" | "shifted_context" => 1 << node.modes[0],
                 "image" if node.modes[2] == 1 => 1 << 13,
                 "fresnel" | "layer_weight" => (1 << 6) | (1 << 16),
                 "normal_map" => (1 << 4) | (1 << 7) | (1 << 16) | (1 << 17) | (0x3f << 22),
+                "normal_map_named" => (1 << 4) | (1 << 16),
+                "displacement" | "vector_displacement" => (1 << 4) | (0x3f << 22),
                 "vector_transform" => 0x1ff << 22,
                 "camera" => 1 << 12,
                 "light_falloff" => 1 << 18,
                 "tangent" => (1 << 1) | (1 << 4) | (1 << 7) | (0x3f << 22),
+                "wireframe" => (1 << 3) | (1 << 6),
+                "ambient_occlusion" | "bevel" | "raycast" => (1 << 3) | (1 << 4),
                 _ => 0,
             };
         }
@@ -383,6 +447,8 @@ impl ShaderGraph {
                 r.data = data;
                 r.width = w;
                 r.height = h;
+            } else if n.op == "attribute" {
+                r.data = attribute_key(&n.attribute);
             } else if !n.table.is_empty() {
                 ensure!(r.data != 0, "Null shader lookup-table binding");
             }
@@ -412,7 +478,7 @@ extern "C" {
 }
 
 /// Evaluate with owned, validated bindings. No pointers from Python are accepted.
-pub fn evaluate(graph: &ShaderGraph, contexts: &[[f32; 128]]) -> Result<Vec<[[f32; 4]; 32]>> {
+pub fn evaluate(graph: &ShaderGraph, contexts: &[[f32; 128]]) -> Result<Vec<[[f32; 4]; 64]>> {
     evaluate_selected(graph, contexts, EVAL_ALL)
 }
 
@@ -420,7 +486,39 @@ fn evaluate_selected(
     graph: &ShaderGraph,
     contexts: &[[f32; 128]],
     requested: u32,
-) -> Result<Vec<[[f32; 4]; 32]>> {
+) -> Result<Vec<[[f32; 4]; 64]>> {
+    evaluate_with_textures_selected(graph, contexts, requested, &[])
+}
+
+pub fn evaluate_with_textures(
+    graph: &ShaderGraph,
+    contexts: &[[f32; 128]],
+    textures: &[(&[f32], usize, usize)],
+) -> Result<Vec<[[f32; 4]; 64]>> {
+    evaluate_with_textures_selected(graph, contexts, EVAL_ALL, textures)
+}
+
+fn evaluate_with_textures_selected(
+    graph: &ShaderGraph,
+    contexts: &[[f32; 128]],
+    requested: u32,
+    textures: &[(&[f32], usize, usize)],
+) -> Result<Vec<[[f32; 4]; 64]>> {
+    ensure!(
+        !graph.nodes.iter().any(|n| matches!(
+            n.op.as_str(),
+            "wireframe"
+                | "ambient_occlusion"
+                | "bevel"
+                | "raycast"
+                | "attribute"
+                | "hair_tangent"
+                | "shifted_context"
+                | "bump"
+                | "vector_bump"
+        )),
+        "Scene query nodes require renderer geometry; use a render, not evaluate_shader"
+    );
     ensure!(
         contexts.len() <= 16_777_216 && contexts.iter().flatten().all(|v| v.is_finite()),
         "Invalid shader contexts"
@@ -430,10 +528,24 @@ fn evaluate_selected(
         .iter()
         .map(|n| n.table.as_ptr() as u64)
         .collect();
-    let instructions = graph.pack(&[], &tables)?;
+    let textures = textures
+        .iter()
+        .map(|&(data, w, h)| {
+            ensure!(
+                w > 0
+                    && h > 0
+                    && w <= i32::MAX as usize
+                    && h <= i32::MAX as usize
+                    && w.checked_mul(h).and_then(|n| n.checked_mul(4)) == Some(data.len()),
+                "Invalid CPU texture dimensions"
+            );
+            Ok((data.as_ptr() as u64, w as i32, h as i32))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let instructions = graph.pack(&textures, &tables)?;
     let mut result = Vec::with_capacity(contexts.len());
     for context in contexts {
-        let mut output = [[0.0; 4]; 32];
+        let mut output = [[0.0; 4]; 64];
         // SAFETY: graph validation guarantees bounded slots/outputs and live LUTs.
         unsafe {
             vibrt_shader_eval(
@@ -458,8 +570,8 @@ mod tests {
         program: &[ShaderInstruction],
         context: &[f32; 128],
         group: u32,
-    ) -> [[f32; 4]; 32] {
-        let mut output = [[-123.0; 4]; 32];
+    ) -> [[f32; 4]; 64] {
+        let mut output = [[-123.0; 4]; 64];
         // SAFETY: callers supply validated programs and keep image bindings
         // alive; context and output have the fixed ABI sizes.
         unsafe {
@@ -633,7 +745,7 @@ mod tests {
                         let mut context = [0.0; 128];
                         context[0] = (x as f32 + 0.25) / width as f32;
                         context[1] = (y as f32 + 0.25) / height as f32;
-                        let mut output = [[0.0; 4]; 32];
+                        let mut output = [[0.0; 4]; 64];
                         // SAFETY: pack validates indices; the CPU image and all
                         // fixed-size input/output arrays stay alive during FFI.
                         unsafe {
@@ -765,6 +877,59 @@ mod tests {
                 evaluate(&graph, &[prepared]).unwrap(),
                 "{op} {modes:?} reads a context slot missing from {mask:#x}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod volume_tests {
+    unsafe extern "C" {
+        fn vibrt_phase_pdf(kind: u32, p: *const f32, g: f32, cosine: f32) -> f32;
+        fn vibrt_phase_sample(kind: u32, p: *const f32, g: f32, u: f32, v: f32, out: *mut f32);
+    }
+    #[test]
+    fn phase_functions_integrate_to_one_and_sample_their_reported_pdf() {
+        let parameters = [1.33f32, 0.1, 0.5, 2.0];
+        for kind in 0..5 {
+            let steps = 131072;
+            let mut integral = 0.0f64;
+            for i in 0..steps {
+                let theta = (i as f64 + 0.5) * std::f64::consts::PI / steps as f64;
+                let pdf =
+                    unsafe { vibrt_phase_pdf(kind, parameters.as_ptr(), 0.3, theta.cos() as f32) };
+                assert!(pdf.is_finite() && pdf >= 0.0, "phase {kind} pdf {pdf}");
+                integral +=
+                    pdf as f64 * theta.sin() * 2.0 * std::f64::consts::PI.powi(2) / steps as f64;
+            }
+            assert!(
+                (integral - 1.0).abs() < 0.012,
+                "phase {kind} integral {integral}"
+            );
+            for i in 0..1024 {
+                let mut result = [0.0; 4];
+                unsafe {
+                    vibrt_phase_sample(
+                        kind,
+                        parameters.as_ptr(),
+                        0.3,
+                        (i as f32 + 0.5) / 1024.0,
+                        0.371,
+                        result.as_mut_ptr(),
+                    );
+                }
+                assert!(result.iter().all(|x| x.is_finite()));
+                assert!(
+                    (result[0] * result[0] + result[1] * result[1] + result[2] * result[2] - 1.0)
+                        .abs()
+                        < 1e-4
+                );
+                let expected =
+                    unsafe { vibrt_phase_pdf(kind, parameters.as_ptr(), 0.3, result[2]) };
+                assert!(
+                    (expected - result[3]).abs() < 1e-4 * expected.max(1.0),
+                    "phase {kind} PDF mismatch"
+                );
+            }
         }
     }
 }

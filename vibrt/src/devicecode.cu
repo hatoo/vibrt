@@ -430,6 +430,8 @@ struct PathVertex {
   float3 dPdu, dPdv;
   float3 dOdu, dOdv, dGdu, dGdv;
   HitGroupData *geometry;
+  unsigned int primitive, shader_seed;
+  float2 barycentric;
   float vertex_alpha;
   float ray_length;
   unsigned int path_depth, diffuse_depth, glossy_depth, transmission_depth, path_flags;
@@ -678,7 +680,8 @@ static __device__ EnvSample sample_envmap(RNG &rng) {
 }
 
 // ---------- Visibility (shadow rays) ----------
-// Two ray types: 0 = radiance, 1 = shadow. SBT stride = 2. Shadow hit group
+// Ray types: 0 = radiance, 1 = shadow. SBT stride = 2.
+// Shadow hit group
 // is a dummy (CH disabled, no AH) so only the miss program runs, which sets
 // payload[0]=1 meaning "reached infinity = light visible".
 static __device__ bool shadow_visible(float3 P, float3 dir, float tmax) {
@@ -814,6 +817,28 @@ static __device__ __noinline__ float3 shadow_transmittance(float3 P, float3 dir,
 // ---------- Colour graph evaluator ----------
 #include "vibrt_nodes_core.h"
 #include "vibrt_shader.h"
+static __device__ float volume_phase_eval(const Volume *vol, float cosine) {
+#if VIBRT_EXTENDED_PHASES
+  return vol->phase == 0
+             ? phase_hg_eval(vol->anisotropy, cosine)
+             : vibrt_shader::volume_phase_pdf(vol->phase, vol->phase_params,
+                                              vol->anisotropy, cosine);
+#else
+  return phase_hg_eval(vol->anisotropy, cosine);
+#endif
+}
+static __device__ float3 volume_phase_sample(const Volume *vol, float u,
+                                             float v, float &pdf) {
+#if VIBRT_EXTENDED_PHASES
+  if (vol->phase == 0)
+    return phase_hg_sample(vol->anisotropy, u, v, pdf);
+  auto result = vibrt_shader::volume_phase_sample(vol->phase, vol->phase_params,
+                                                  vol->anisotropy, u, v, &pdf);
+  return make_float3(result.x, result.y, result.z);
+#else
+  return phase_hg_sample(vol->anisotropy, u, v, pdf);
+#endif
+}
 
 static __device__ void shader_context(const PathVertex &v, vibrt_cycles::float4 *ctx,
                                       unsigned int mask, int derivative = 0) {
@@ -890,7 +915,9 @@ static __device__ void shader_context(const PathVertex &v, vibrt_cycles::float4 
 }
 static __device__ __noinline__ void evaluate_shader_vm(PrincipledGpu *m,const PathVertex &v,vibrt_cycles::float4 *out,unsigned int requested,int derivative) {
   vibrt_cycles::float4 ctx[32];shader_context(v,ctx,m->shader_contexts,derivative);
-  vibrt_shader::evaluate_vm((const ShaderInstruction*)m->shader_nodes,m->shader_len,ctx,out,requested);
+  vibrt_shader::SceneServices services{&v, derivative};
+  vibrt_shader::evaluate_vm((const ShaderInstruction *)m->shader_nodes,
+                            m->shader_len, ctx, out, requested, &services);
 }
 static __device__ __noinline__ void evaluate_shader_single(PrincipledGpu *m,float2 uv,vibrt_cycles::float4 *out,unsigned int requested) {
   const ShaderInstruction &n=*(const ShaderInstruction*)m->shader_nodes;
@@ -943,6 +970,17 @@ struct MaterialEval {
   float sheen_weight, sheen_roughness, sss_weight, translucent_weight;
   float hair_offset, hair_roughness_u, hair_roughness_v, alpha_blend;
   float3 sheen_tint, sss_radius;
+#if (VIBRT_CLOSURE_TYPES & (1u << 7))
+  float sss_scale;
+#endif
+#if VIBRT_CLOSURE_TYPES
+  float toon_size, toon_smooth;
+  float3 portal_position, portal_direction;
+#endif
+#if (VIBRT_CLOSURE_TYPES & (1u << 5))
+  vibrt_cycles::ChiangHairBSDF chiang;
+  vibrt_cycles::ShaderData hair_context;
+#endif
   PrincipledGpu *mat; // raw material ptr for coat/sheen/sss params
 };
 
@@ -970,7 +1008,7 @@ struct MaterialEvalGroup {
 // evaluated.
 struct ShaderEvalCache {
   unsigned long long nodes;
-  vibrt_cycles::float4 outputs[32];
+  vibrt_cycles::float4 outputs[VIBRT_SHADER_OUTPUT_COUNT];
   float3 normal, tangent;
 };
 
@@ -980,6 +1018,12 @@ static __device__ __noinline__ MaterialEval eval_material_one(const PathVertex &
                                                   float min_alpha = 0.0f) {
   MaterialEval e;
   e.mat = m;
+#if VIBRT_CLOSURE_TYPES
+  e.toon_size = 0.5f;
+  e.toon_smooth = 0;
+  e.portal_position = v.P;
+  e.portal_direction = -v.incoming;
+#endif
   e.base_color = make_f3(m->base_color);
   e.metallic = m->metallic;
   e.roughness = m->roughness;
@@ -1042,9 +1086,13 @@ static __device__ __noinline__ MaterialEval eval_material_one(const PathVertex &
     vibrt_cycles::float4 *out=cache.outputs;
     bool cached=cache.nodes==m->shader_nodes;
     if(!cached)evaluate_shader(m,v,out);
-    unsigned int mask=m->shader_outputs;
-#define GRAPH_SCALAR(I,F) if(mask&(1u<<I))e.F=out[I].x
-#define GRAPH_COLOR(I,F) if(mask&(1u<<I))e.F=make_float3(out[I].x,out[I].y,out[I].z)
+    unsigned long long mask = m->shader_outputs;
+#define GRAPH_SCALAR(I, F)                                                     \
+  if (mask & (1ull << I))                                                      \
+  e.F = out[I].x
+#define GRAPH_COLOR(I, F)                                                      \
+  if (mask & (1ull << I))                                                      \
+  e.F = make_float3(out[I].x, out[I].y, out[I].z)
     GRAPH_COLOR(0,base_color);GRAPH_SCALAR(1,roughness);GRAPH_SCALAR(2,metallic);GRAPH_SCALAR(3,ior);
     GRAPH_SCALAR(4,transmission);GRAPH_COLOR(5,emission);if(mask&(1u<<6))e.emission=e.emission*out[6].x;
     GRAPH_SCALAR(7,alpha_blend);GRAPH_SCALAR(8,specular_ior_level);GRAPH_SCALAR(9,anisotropy);
@@ -1053,13 +1101,53 @@ static __device__ __noinline__ MaterialEval eval_material_one(const PathVertex &
     GRAPH_SCALAR(14,sheen_weight);GRAPH_SCALAR(15,sheen_roughness);GRAPH_COLOR(16,sheen_tint);
     GRAPH_SCALAR(17,sss_weight);GRAPH_COLOR(18,sss_radius);GRAPH_SCALAR(19,translucent_weight);
     GRAPH_SCALAR(20,hair_offset);GRAPH_SCALAR(21,hair_roughness_u);GRAPH_SCALAR(22,hair_roughness_v);
+#if (VIBRT_CLOSURE_TYPES & (1u << 7))
+    GRAPH_SCALAR(41, sss_scale);
+#endif
+#if (VIBRT_CLOSURE_TYPES & (1u << 5))
+    if (m->closure_type == 5) {
+      e.hair_context = {};
+      e.hair_context.wi =
+          vibrt_cycles::make_float3(v.incoming.x, v.incoming.y, v.incoming.z);
+      float3 tangent = dot3(v.T, v.T) > 1e-10f ? v.T : v.dPdu;
+      e.hair_context.dPdu =
+          vibrt_cycles::make_float3(tangent.x, tangent.y, tangent.z);
+      e.hair_context.Ng = vibrt_cycles::make_float3(v.Ng.x, v.Ng.y, v.Ng.z);
+      e.hair_context.N = vibrt_cycles::make_float3(v.Ns.x, v.Ns.y, v.Ns.z);
+      e.hair_context.lcg_state =
+          vibrt_cycles::hash_uint2(v.shader_seed, 0x68bc21ebu);
+      e.hair_context.type =
+          v.geometry->tangents ? vibrt_cycles::PRIMITIVE_CURVE_RIBBON : 0;
+      e.hair_context.v = v.uv.x * 2 - 1;
+      e.chiang = vibrt_shader::chiang_setup(
+          e.hair_context,
+          vibrt_cycles::make_float3(e.base_color.x, e.base_color.y,
+                                    e.base_color.z),
+          vibrt_shader::xyz(out[44]), e.hair_roughness_u, e.hair_roughness_v,
+          e.hair_offset, out[47].x, out[46].x, out[45].x, out[52].x, out[53].x,
+          out[54].x, out[55].x, vibrt_shader::xyz(out[56]), (int)out[57].x);
+    }
+#endif
+#if VIBRT_CLOSURE_TYPES && VIBRT_SHADER_OUTPUT_COUNT > 32
+    if (mask & (1ull << 32))
+      e.toon_size = out[32].x;
+    if (mask & (1ull << 33))
+      e.toon_smooth = out[33].x;
+    if (mask & (1ull << 34))
+      e.portal_position = make_float3(out[34].x, out[34].y, out[34].z);
+    if (mask & (1ull << 35)) {
+      float3 d = make_float3(out[35].x, out[35].y, out[35].z);
+      if (dot3(d, d) > 1e-20f)
+        e.portal_direction = normalize3(d);
+    }
+#endif
     if(mask&(1u<<24))graph_normal=normalize3(make_float3(out[24].x,out[24].y,out[24].z));
     if(mask&(1u<<25))graph_tangent=normalize3(make_float3(out[25].x,out[25].y,out[25].z));
     if(cached) {
       graph_normal=cache.normal;graph_tangent=cache.tangent;
     } else if(mask&(1u<<26)) {
       constexpr float delta=0.001f;
-      vibrt_cycles::float4 shifted[32];
+      vibrt_cycles::float4 shifted[VIBRT_SHADER_OUTPUT_COUNT];
       evaluate_shader(m,v,shifted,vibrt_shader::EVAL_BUMP,1);
       float dhdu=(shifted[26].x-out[26].x)/delta;
       evaluate_shader(m,v,shifted,vibrt_shader::EVAL_BUMP,2);
@@ -1201,7 +1289,11 @@ static __device__ __noinline__ MaterialEval eval_material_one(const PathVertex &
 // things like edge-wear blends or multi-material decals.
 static __device__ float compute_level_mix_fac(PrincipledGpu *m, const PathVertex &v,
                                               float NoV) {
-  if(m->shader_outputs&(1u<<23)){vibrt_cycles::float4 out[32];evaluate_shader(m,v,out,vibrt_shader::EVAL_MIX);return fminf(fmaxf(out[23].x,0.0f),1.0f);}
+  if (m->shader_outputs & (1u << 23)) {
+    vibrt_cycles::float4 out[VIBRT_SHADER_OUTPUT_COUNT];
+    evaluate_shader(m, v, out, vibrt_shader::EVAL_MIX);
+    return fminf(fmaxf(out[23].x, 0.0f), 1.0f);
+  }
   float2 uv_raw=v.uv;
   // View-dependent Fresnel mix factor: the exporter encodes a Fresnel /
   // Layer-Weight MixShader factor as a NEGATIVE mix_fac whose magnitude is
@@ -1390,10 +1482,46 @@ static __device__ __noinline__ BsdfEval eval_bsdf_one(const MaterialEval &e, flo
   BsdfEval r;
   r.f = make_float3(0, 0, 0);
   r.pdf = 0.0f;
+#if (VIBRT_CLOSURE_TYPES & (1u << 7))
+  if (e.mat->closure_type == 7) {
+    r.pdf = fmaxf(dot3(e.Ns, wi), 0) * INV_PIf;
+    r.f = e.base_color * r.pdf;
+    return r;
+  }
+#endif
+#if (VIBRT_CLOSURE_TYPES & (1u << 5))
+  if (e.mat->closure_type == 5) {
+    auto I = vibrt_cycles::make_float3(wi.x, wi.y, wi.z);
+    auto &sd = e.hair_context;
+    if (!sd.type && vibrt_cycles::dot(sd.N, I) *
+                            vibrt_cycles::dot(sd.N, e.chiang.N) *
+                            vibrt_cycles::dot(e.chiang.N, I) <
+                        0)
+      return r;
+    auto value = vibrt_cycles::bsdf_hair_chiang_eval(
+        0, &e.hair_context,
+        reinterpret_cast<const vibrt_cycles::ShaderClosure *>(&e.chiang),
+        vibrt_cycles::make_float3(wi.x, wi.y, wi.z), &r.pdf);
+    r.f = make_float3(value.x, value.y, value.z);
+    return r;
+  }
+#endif
 
   float NoV = dot3(e.Ns, wo);
   if (NoV <= 0.0f)
     return r;
+#if VIBRT_CLOSURE_TYPES
+  if (e.mat->closure_type) {
+    if (e.mat->closure_type <= 2 && dot3(e.Ns, wi) > 0) {
+      float3 axis = e.mat->closure_type == 1 ? e.Ns : e.Ns * (2 * NoV) - wo;
+      auto value =
+          vibrt_shader::toon_eval(dot3(axis, wi), e.toon_size, e.toon_smooth);
+      r.f = e.base_color * value.x;
+      r.pdf = value.y;
+    }
+    return r;
+  }
+#endif
   if (e.mat->hair_weight > 0.5f)
     return eval_hair(e, wo, wi);
 
@@ -1738,6 +1866,10 @@ static __device__ __noinline__ BsdfEval eval_bsdf_one(const MaterialEval &e, flo
 #define LOBE_TRANSMISSION 2
 
 struct BsdfSample {
+#if (VIBRT_CLOSURE_TYPES & (1u << 4))
+  bool portal;
+  float3 portal_position;
+#endif
   float3 wi;
   float3 f;
   float pdf;
@@ -1747,6 +1879,11 @@ struct BsdfSample {
 };
 
 struct BsdfDirectionSample {
+#if (VIBRT_CLOSURE_TYPES & (1u << 5))
+  float3 sampled_value;
+  float sampled_pdf;
+  bool weighted_sample;
+#endif
   float3 wi;
   bool valid;
   bool specular;
@@ -1764,10 +1901,64 @@ static __device__ __noinline__ BsdfDirectionSample sample_bsdf_direction(const M
   s.specular = false;
   s.lobe = LOBE_DIFFUSE;
   s.transparent = false;
+#if (VIBRT_CLOSURE_TYPES & (1u << 5))
+  s.weighted_sample = false;
+#endif
+#if (VIBRT_CLOSURE_TYPES & (1u << 7))
+  if (e.mat->closure_type == 7) {
+    float r = sqrtf(rng.next()), phi = 2 * M_PIf * rng.next();
+    s.wi = normalize3(e.T * (r * cosf(phi)) + e.B * (r * sinf(phi)) +
+                      e.Ns * sqrtf(fmaxf(1 - r * r, 0)));
+    s.valid = true;
+    return s;
+  }
+#endif
+
+#if (VIBRT_CLOSURE_TYPES & (1u << 5))
+  if (e.mat->closure_type == 5) {
+    auto sd = e.hair_context;
+    vibrt_cycles::float3 value, wi;
+    vibrt_cycles::float2 roughness;
+    float pdf;
+    int label = vibrt_cycles::bsdf_hair_chiang_sample(
+        0, reinterpret_cast<const vibrt_cycles::ShaderClosure *>(&e.chiang),
+        &sd, vibrt_cycles::make_float3(rng.next(), rng.next(), rng.next()),
+        &value, &wi, &pdf, &roughness);
+    s.wi = make_float3(wi.x, wi.y, wi.z);
+    s.valid = pdf > 0;
+    s.lobe = (label & vibrt_cycles::LABEL_TRANSMIT) ? LOBE_TRANSMISSION
+                                                    : LOBE_GLOSSY;
+    s.sampled_value = make_float3(value.x, value.y, value.z);
+    s.sampled_pdf = pdf;
+    s.weighted_sample = true;
+    return s;
+  }
+#endif
 
   float NoV = dot3(e.Ns, wo);
   if (NoV <= 0.0f)
     return s;
+#if VIBRT_CLOSURE_TYPES
+  if (e.mat->closure_type) {
+    if (e.mat->closure_type <= 2) {
+      float angle = fminf((fminf(fmaxf(e.toon_size, 1e-5f), 1.0f) +
+                           __saturatef(e.toon_smooth)) *
+                              (0.5f * M_PIf),
+                          0.5f * M_PIf);
+      float half_sin = sinf(0.5f * angle),
+            cosine = 1 - rng.next() * (2 * half_sin * half_sin);
+      float sine = sqrtf(fmaxf(1 - cosine * cosine, 0.0f)),
+            phi = 2 * M_PIf * rng.next();
+      float3 axis = e.mat->closure_type == 1 ? e.Ns : e.Ns * (2 * NoV) - wo, T,
+             B;
+      build_frame(axis, T, B);
+      s.wi = normalize3(axis * cosine + (T * cosf(phi) + B * sinf(phi)) * sine);
+      s.valid = dot3(e.Ng, s.wi) > 0 && dot3(e.Ns, s.wi) > 0;
+      s.lobe = e.mat->closure_type == 1 ? LOBE_DIFFUSE : LOBE_GLOSSY;
+    }
+    return s;
+  }
+#endif
 
   // Cycles Principled `Alpha` socket: `alpha × principled + (1-alpha) ×
   // transparent` blend. With probability (1-alpha), pick the transparent
@@ -1978,6 +2169,20 @@ static __device__ BsdfSample sample_bsdf(const MaterialEvalGroup &g,
   }
   BsdfDirectionSample direction = sample_bsdf_direction(g.slots[picked], wo, rng);
   BsdfSample s;
+#if (VIBRT_CLOSURE_TYPES & (1u << 4))
+  s.portal = g.slots[picked].mat->closure_type == 4;
+  if (s.portal) {
+    s.portal_position = g.slots[picked].portal_position;
+    s.wi = g.slots[picked].portal_direction;
+    float w = g.n > 1 ? g.weights[picked] : 1;
+    s.f = g.slots[picked].base_color * w;
+    s.pdf = w / fmaxf(total_weight, 1e-20f);
+    s.specular = true;
+    s.transparent = true;
+    s.lobe = LOBE_TRANSMISSION;
+    return s;
+  }
+#endif
   s.wi = direction.wi;
   s.f = make_float3(0, 0, 0);
   s.pdf = 0.0f;
@@ -1986,6 +2191,25 @@ static __device__ BsdfSample sample_bsdf(const MaterialEvalGroup &g,
   s.lobe = direction.lobe;
   if (!direction.valid)
     return s;
+#if (VIBRT_CLOSURE_TYPES & (1u << 5))
+  if (direction.weighted_sample) {
+    // Preserve the selected closure's sampled estimate and density.
+    // Only the other mixture leaves need a separate evaluation.
+    for (int i = 0; i < g.n; i++) {
+      BsdfEval value;
+      if (i == picked) {
+        value.f = direction.sampled_value;
+        value.pdf = direction.sampled_pdf;
+      } else
+        value = eval_bsdf_one(g.slots[i], wo, s.wi);
+      float w = g.n == 1 ? 1 : g.weights[i];
+      s.f = s.f + value.f * w;
+      s.pdf += value.pdf * w;
+    }
+    s.pdf /= total_weight;
+    return s;
+  }
+#endif
   if (s.transparent) {
     if (g.n == 1) {
       s.f = make_float3(1, 1, 1);
@@ -2024,7 +2248,11 @@ static __device__ __noinline__ float4 emission_alpha(const PathVertex &v,bool in
     float3 em=make_f3(m->emission);float alpha=m->alpha_blend;
     if(include_emission&&m->emission_tex){const float *M=m->uv_transform;float2 uv=make_float2(M[0]*v.uv.x+M[1]*v.uv.y+M[2],M[3]*v.uv.x+M[4]*v.uv.y+M[5]);em=em*sample_rgba(m->emission_tex,m->emission_tex_w,m->emission_tex_h,m->emission_tex_channels,uv);}
     unsigned int outputs=(1u<<7)|(include_emission?((1u<<5)|(1u<<6)):0);
-    if(m->shader_outputs&outputs){vibrt_cycles::float4 out[32];evaluate_shader(m,v,out,vibrt_shader::EVAL_ALPHA|(include_emission?vibrt_shader::EVAL_EMISSION:0));
+    if (m->shader_outputs & outputs) {
+      vibrt_cycles::float4 out[VIBRT_SHADER_OUTPUT_COUNT];
+      evaluate_shader(m, v, out,
+                      vibrt_shader::EVAL_ALPHA |
+                          (include_emission ? vibrt_shader::EVAL_EMISSION : 0));
       if(include_emission&&(m->shader_outputs&(1u<<5)))em=make_float3(out[5].x,out[5].y,out[5].z);
       if(include_emission&&(m->shader_outputs&(1u<<6)))em=em*out[6].x;
       if(m->shader_outputs&(1u<<7))alpha=fminf(fmaxf(out[7].x,0.0f),1.0f);
@@ -2034,6 +2262,27 @@ static __device__ __noinline__ float4 emission_alpha(const PathVertex &v,bool in
   return make_float4(emission.x,emission.y,emission.z,1-fminf(transparent,1.0f));
 }
 
+#if VIBRT_AOVS
+static __device__ __noinline__ void write_shader_aovs(const PathVertex &v,
+                                                      float coverage) {
+  if (!params.aov_data || !v.mat || coverage <= 0)
+    return;
+  unsigned int pixel =
+      optixGetLaunchIndex().y * params.width + optixGetLaunchIndex().x;
+  unsigned int count = params.width * params.height;
+  for (unsigned int i = 0; i < v.mat->num_aov_shaders; i++) {
+    const AovShader &a = v.mat->aov_shaders[i];
+    if (a.index >= params.num_aovs)
+      continue;
+    vibrt_cycles::float4 out[VIBRT_SHADER_OUTPUT_COUNT];
+    evaluate_shader(a.material, v, out);
+    float *dest = params.aov_data + 4 * (a.index * count + pixel);
+    for (int ch = 0; ch < 3; ch++)
+      dest[ch] += out[0][ch] * coverage;
+    dest[3] += coverage;
+  }
+}
+#endif
 static __device__ float3 mesh_light_emission(const MeshLightTri &tri,float b1,float b2,float3 incoming,float distance) {
   PathVertex v;fill_surface_vertex(&v,tri.geometry,tri.primitive,make_float2(b1,b2),incoming,distance,2u);
   float4 e=emission_alpha(v);return make_float3(e.x,e.y,e.z);
@@ -2526,7 +2775,7 @@ static __device__ __noinline__ float3 direct_light_volume(float3 P, float3 wi_wo
 
   auto add = [&](float3 wi, float3 emission, float3 vis) {
     float cos_t = dot3(wi_world, wi);
-    float ph = phase_hg_eval(g, cos_t);
+    float ph = volume_phase_eval(vol, cos_t);
     L = L + vis * emission * ph;
   };
 
@@ -2690,7 +2939,7 @@ static __device__ __noinline__ float3 direct_light_volume(float3 P, float3 wi_wo
         // miss-path block (uses prev_bsdf_pdf = phase pdf). To make the
         // estimator unbiased we apply the matching light-side weight here.
         float cos_t = dot3(wi_world, es.dir);
-        float ph_pdf = phase_hg_eval(g, cos_t);
+        float ph_pdf = volume_phase_eval(vol, cos_t);
         float w = power_heuristic(es.pdf, ph_pdf);
         // `add` multiplies by phase_eval, which equals ph_pdf, so the
         // contribution is throughput * phase * vis * L * w / pdf_light.
@@ -2810,6 +3059,11 @@ static __device__ __noinline__ void fill_surface_vertex(PathVertex *v, HitGroupD
   }
 
   v->P = P;
+  v->primitive = prim;
+  v->barycentric = bary;
+  v->shader_seed = optixGetLaunchIndex().x +
+                   optixGetLaunchIndex().y * params.width +
+                   params.sample_start * 1999u;
   v->geometry=hg;v->ray_length=distance;
   v->path_depth=0;v->diffuse_depth=0;v->glossy_depth=0;v->transmission_depth=0;
   v->path_flags=flags;
@@ -2853,6 +3107,502 @@ static __device__ __noinline__ void fill_surface_vertex(PathVertex *v, HitGroupD
 static __device__ void fill_path_vertex(PathVertex *v) {
   fill_surface_vertex(v,(HitGroupData*)optixGetSbtDataPointer(),optixGetPrimitiveIndex(),optixGetTriangleBarycentrics(),-optixGetWorldRayDirection(),optixGetRayTmax(),(optixGetRayFlags()&OPTIX_RAY_FLAG_TERMINATE_ON_FIRST_HIT)?2u:1u);
 }
+
+// Geometry-only node queries use compact software BVHs. No OptiX trace or
+// continuation is entered from the interpreter (including shadow any-hit).
+struct SceneQuery {
+  HitGroupData *geometry;
+  unsigned int hit_primitive;
+  bool hit;
+  float distance;
+  float2 bary;
+  float3 P, N, Ng;
+};
+static __device__ bool query_box(const QueryNode &node, float3 P, float3 D,
+                                 float tmin, float tmax) {
+  const float *p = &P.x, *d = &D.x;
+  for (int axis = 0; axis < 3; axis++) {
+    if (fabsf(d[axis]) < 1e-30f) {
+      if (p[axis] < node.lo[axis] || p[axis] > node.hi[axis])
+        return false;
+    } else {
+      float a = (node.lo[axis] - p[axis]) / d[axis],
+            b = (node.hi[axis] - p[axis]) / d[axis];
+      tmin = fmaxf(tmin, fminf(a, b));
+      tmax = fminf(tmax, fmaxf(a, b));
+      if (tmin > tmax)
+        return false;
+    }
+  }
+  return true;
+}
+static __device__ __noinline__ void query_mesh(const QueryObject &obj,
+                                               const PathVertex &v, float3 P,
+                                               float3 D, float tmin,
+                                               bool skip_self, SceneQuery &q) {
+  HitGroupData *hg = obj.geometry;
+  P = transform_point(hg->world_to_object, P);
+  D = transform_vector(hg->world_to_object, D);
+  unsigned int stack[64];
+  int sp = 0;
+  stack[sp++] = 0;
+  while (sp) {
+    const QueryNode &node = obj.nodes[stack[--sp]];
+    if (!query_box(node, P, D, tmin, q.distance))
+      continue;
+    if (node.count == 0) {
+      stack[sp++] = node.first;
+      stack[sp++] = node.first + 1;
+      continue;
+    }
+    for (unsigned int i = 0; i < node.count; i++) {
+      unsigned int prim = obj.indices[node.first + i];
+      if (skip_self && hg->instance_id == v.geometry->instance_id &&
+          prim == v.primitive)
+        continue;
+      const int *ids = hg->indices + prim * 3;
+      float3 A = make_f3(hg->vertices + 3 * ids[0]);
+      float3 E1 = make_f3(hg->vertices + 3 * ids[1]) - A,
+             E2 = make_f3(hg->vertices + 3 * ids[2]) - A;
+      float3 H = cross3(D, E2);
+      float det = dot3(E1, H);
+      if (fabsf(det) < 1e-20f)
+        continue;
+      float inv = 1 / det;
+      float3 S = P - A;
+      float u = dot3(S, H) * inv;
+      if (u < 0 || u > 1)
+        continue;
+      float3 Q = cross3(S, E1);
+      float w = dot3(D, Q) * inv;
+      if (w < 0 || u + w > 1)
+        continue;
+      float distance = dot3(E2, Q) * inv;
+      if (distance < tmin || distance > q.distance)
+        continue;
+      q.hit = true;
+      q.distance = distance;
+      q.geometry = hg;
+      q.hit_primitive = prim;
+      q.bary = make_float2(u, w);
+    }
+  }
+}
+static __device__ __noinline__ SceneQuery
+query_scene(const PathVertex &v, float3 origin, float3 direction,
+            float distance, bool only_local, bool skip_self,
+            unsigned int mask = 0xffu, float tmin = 0.0f) {
+  SceneQuery q = {};
+  q.distance = distance;
+  if (skip_self)
+    tmin = fmaxf(tmin, 1e-6f);
+  if (distance <= tmin || dot3(direction, direction) < 1e-30f || !v.geometry ||
+      !params.query_nodes)
+    return q;
+  unsigned int stack[64];
+  int sp = 0;
+  stack[sp++] = 0;
+  while (sp) {
+    const QueryNode &node = params.query_nodes[stack[--sp]];
+    if (!query_box(node, origin, direction, tmin, q.distance))
+      continue;
+    if (node.count == 0) {
+      stack[sp++] = node.first;
+      stack[sp++] = node.first + 1;
+      continue;
+    }
+    for (unsigned int i = 0; i < node.count; i++) {
+      const QueryObject &obj =
+          params.query_objects[params.query_indices[node.first + i]];
+      if (!(obj.mask & mask) ||
+          (only_local && obj.geometry->instance_id != v.geometry->instance_id))
+        continue;
+      query_mesh(obj, v, origin, direction, tmin, skip_self, q);
+    }
+  }
+  if (q.hit) {
+    HitGroupData *hg = q.geometry;
+    const int *ids = hg->indices + 3 * q.hit_primitive;
+    float3 A = make_f3(hg->vertices + 3 * ids[0]),
+           B = make_f3(hg->vertices + 3 * ids[1]),
+           C = make_f3(hg->vertices + 3 * ids[2]);
+    float3 N = cross3(B - A, C - A);
+    q.Ng = normalize3(transform_normal(hg->world_to_object, N));
+    if (hg->normals)
+      N = make_f3(hg->normals + 3 * ids[0]) * (1 - q.bary.x - q.bary.y) +
+          make_f3(hg->normals + 3 * ids[1]) * q.bary.x +
+          make_f3(hg->normals + 3 * ids[2]) * q.bary.y;
+    q.N = normalize3(transform_normal(hg->world_to_object, N));
+    q.P = origin + direction * q.distance;
+  }
+  return q;
+}
+
+#if (VIBRT_CLOSURE_TYPES & (1u << 7))
+// Cycles' three-axis Burley disk estimator. Scene intersections use vibrt's
+// BVH.
+static __device__ __noinline__ bool scatter_subsurface(PathVertex &v,
+                                                       MaterialEval &e,
+                                                       RNG &rng,
+                                                       float3 &throughput) {
+  auto radius =
+      vibrt_cycles::make_float3(e.sss_radius.x, e.sss_radius.y, e.sss_radius.z);
+  float colors[3] = {e.base_color.x, e.base_color.y, e.base_color.z};
+  for (int c = 0; c < 3; c++) {
+    float a = __saturatef(colors[c]);
+    radius[c] = fmaxf(radius[c] * e.sss_scale, 0) * (0.25f * INV_PIf) /
+                (1.9f - a + 3.5f * (a - 0.8f) * (a - 0.8f));
+  }
+  if (vibrt_cycles::reduce_max(radius) < 1e-8f)
+    return true;
+  float3 N = v.Ng, T, B;
+  build_frame(N, T, B);
+  float probabilities[3] = {0.5f, 0.25f, 0.25f};
+  float axis = rng.next();
+  if (axis >= 0.5f && axis < 0.75f) {
+    float3 old = N;
+    N = T;
+    T = old;
+    probabilities[0] = 0.25f;
+    probabilities[1] = 0.5f;
+  } else if (axis >= 0.75f) {
+    float3 old = N;
+    N = B;
+    B = old;
+    probabilities[0] = 0.25f;
+    probabilities[2] = 0.5f;
+  }
+  float r, h;
+  vibrt_cycles::bssrdf_sample(radius, rng.next(), &r, &h);
+  float pdf = vibrt_cycles::bssrdf_pdf(radius, r);
+  if (!(pdf > 0) || !(h > 0))
+    return false;
+  float phi = 2 * M_PIf * rng.next();
+  float3 origin = v.P + N * h + (T * cosf(phi) + B * sinf(phi)) * r;
+  float tmin = 0, sum = 0, chosen_energy = 0;
+  SceneQuery chosen = {};
+  float3 chosen_weight = make_float3(0, 0, 0);
+  for (int i = 0; i < 64; i++) {
+    SceneQuery q = query_scene(v, origin, -N, 2 * h, true, false, 0xffu, tmin);
+    if (!q.hit)
+      break;
+    tmin = nextafterf(q.distance, 1e30f);
+    float pN = probabilities[0] * fabsf(dot3(N, q.Ng)),
+          pT = probabilities[1] * fabsf(dot3(T, q.Ng)),
+          pB = probabilities[2] * fabsf(dot3(B, q.Ng));
+    float denom = pN * pN + pT * pT + pB * pB;
+    if (denom < 1e-20f)
+      continue;
+    auto profile =
+        vibrt_cycles::bssrdf_eval(radius, sqrtf(dot3(q.P - v.P, q.P - v.P)));
+    float3 weight =
+        make_float3(profile.x, profile.y, profile.z) * (pN / (denom * pdf));
+    float energy = (weight.x + weight.y + weight.z) / 3;
+    sum += energy;
+    if (energy > 0 && rng.next() * sum < energy) {
+      chosen = q;
+      chosen_weight = weight;
+      chosen_energy = energy;
+    }
+  }
+  if (!chosen.hit || chosen_energy <= 0)
+    return false;
+  throughput = throughput * chosen_weight * (sum / chosen_energy);
+  v.P = chosen.P;
+  v.Ng = chosen.Ng;
+  v.Ns = chosen.N;
+  v.primitive = chosen.hit_primitive;
+  v.barycentric = chosen.bary;
+  e.Ns = v.Ns;
+  e.Ng = v.Ng;
+  build_frame(e.Ns, e.T, e.B);
+  return true;
+}
+#endif
+
+#if (VIBRT_SHADER_OPS & ((255ull << 40) | (1ull << 51)))
+namespace vibrt_shader {
+#if (VIBRT_SHADER_OPS & (7ull << 41))
+VN_INLINE float4 tracing_node(const ShaderInstruction &, const float4 *,
+                              const float4 *, const SceneServices &);
+#endif
+VN_INLINE float4 scene_node(const ShaderInstruction &n, const float4 *slots,
+                            const float4 *ctx, const SceneServices &services) {
+  const PathVertex &v = *(const PathVertex *)services.vertex;
+  auto input = [&](int i) { return slots[n.inputs[i]]; };
+  auto cuda_vec = [](float4 a) { return ::make_float3(a.x, a.y, a.z); };
+  auto result = [](::float3 a) { return make_float4(a.x, a.y, a.z, 1); };
+#if (VIBRT_SHADER_OPS & (1ull << 51))
+  if ((n.op & 255) == 51) {
+    ::float3 base = ::cross3(v.dPdu, v.dPdv);
+    float sign = ::dot3(base, v.Ns) < 0 ? -1 : 1;
+    ::float3 dpdu = v.dPdu + (cuda_vec(input(1)) - cuda_vec(input(0))) * 1000;
+    ::float3 dpdv = v.dPdv + (cuda_vec(input(2)) - cuda_vec(input(0))) * 1000;
+    ::float3 changed = ::normalize3(::cross3(dpdu, dpdv)) * sign;
+    if (::dot3(changed, changed) < 1e-12f)
+      return input(3);
+    return result(
+        ::normalize3(cuda_vec(input(3)) + changed - ::normalize3(base) * sign));
+  }
+#endif
+#if (VIBRT_SHADER_OPS & (1ull << 46))
+  if ((n.op & 255) == 46) {
+    unsigned int index = n.modes[0];
+    float4 value = ctx[index];
+    float du = n.params[0], dv = n.params[1];
+    if (index == 0) {
+      value.x += du;
+      value.y += dv;
+      return value;
+    }
+    ::float3 delta = ::make_float3(0, 0, 0);
+    if (index == 1)
+      delta = v.dGdu * du + v.dGdv * dv;
+    if (index == 2)
+      delta = v.dOdu * du + v.dOdv * dv;
+    if (index == 3)
+      delta = v.dPdu * du + v.dPdv * dv;
+    value.x += delta.x;
+    value.y += delta.y;
+    value.z += delta.z;
+    return value;
+  }
+#endif
+#if (VIBRT_SHADER_OPS & (1ull << 47))
+  if ((n.op & 255) == 47) {
+    ::float3 normal = ::normalize3(cuda_vec(input(5)));
+    ::float3 r1 = ::cross3(v.dPdv, normal), r2 = ::cross3(normal, v.dPdu);
+    float det = ::dot3(v.dPdu, r1);
+    if (fabsf(det) < 1e-12f)
+      return result(normal);
+    float du = (input(1).x - input(0).x) * 1000,
+          dv = (input(2).x - input(0).x) * 1000;
+    float distance = input(4).x * (n.modes[0] ? -1 : 1),
+          strength = __saturatef(input(3).x);
+    ::float3 bumped =
+        ::normalize3(normal - (r1 * du + r2 * dv) * (distance / det));
+    return result(::normalize3(normal * (1 - strength) + bumped * strength));
+  }
+#endif
+#if (VIBRT_SHADER_OPS & (1ull << 45))
+  if ((n.op & 255) == 45)
+    return v.geometry && v.geometry->tangents
+               ? result(
+                     ::normalize3(v.incoming - v.T * ::dot3(v.incoming, v.T)))
+               : color(make_float3(0));
+#endif
+#if (VIBRT_SHADER_OPS & (1ull << 44))
+  if ((n.op & 255) == 44) {
+    float4 value = make_float4(0);
+    bool found = false;
+    if (v.geometry)
+      for (unsigned int i = 0; i < v.geometry->num_attributes; i++) {
+        const ShaderAttribute &a = v.geometry->attributes[i];
+        if (a.key != n.data)
+          continue;
+        found = true;
+        if (a.count == 1)
+          value = make_float4(a.data[0], a.data[1], a.data[2], a.data[3]);
+        else {
+          float w[3] = {1 - v.barycentric.x - v.barycentric.y, v.barycentric.x,
+                        v.barycentric.y};
+          float du = n.params[0] + (services.derivative == 1 ? 0.001f : 0);
+          float dv = n.params[1] + (services.derivative == 2 ? 0.001f : 0);
+          if ((du != 0 || dv != 0) && v.geometry->uvs) {
+            const int *indices = v.geometry->indices + 3 * v.primitive;
+            const float *uv = v.geometry->uvs;
+            float ux = uv[2 * indices[1]] - uv[2 * indices[0]],
+                  uy = uv[2 * indices[2]] - uv[2 * indices[0]];
+            float vx = uv[2 * indices[1] + 1] - uv[2 * indices[0] + 1],
+                  vy = uv[2 * indices[2] + 1] - uv[2 * indices[0] + 1];
+            float det = ux * vy - uy * vx;
+            if (fabsf(det) > 1e-12f) {
+              float db1 = (du * vy - dv * uy) / det,
+                    db2 = (dv * ux - du * vx) / det;
+              w[0] -= db1 + db2;
+              w[1] += db1;
+              w[2] += db2;
+            }
+          }
+          for (int j = 0; j < 3; j++) {
+            const float *p =
+                a.data + 4 * v.geometry->indices[v.primitive * 3 + j];
+            value = value + make_float4(p[0], p[1], p[2], p[3]) * w[j];
+          }
+        }
+        break;
+      }
+    if (n.modes[0] == 4) {
+      ::float3 t =
+          ::transform_vector(v.geometry->object_to_world, cuda_vec(value));
+      t = ::normalize3(t - v.Ns * ::dot3(t, v.Ns));
+      return make_float4(t.x, t.y, t.z, value.w);
+    }
+    if (n.modes[0] == 3)
+      return scalar(found ? hash_uint2_to_float((unsigned int)value.x, 0) : 0);
+    return n.modes[0] == 1   ? scalar((value.x + value.y + value.z) / 3)
+           : n.modes[0] == 2 ? scalar(value.w)
+                             : value;
+  }
+#endif
+  ::float3 P = cuda_vec(ctx[3]);
+  unsigned int op = n.op & 255;
+#if (VIBRT_SHADER_OPS & (1ull << 40))
+  if (op == 40) {
+    if (!v.geometry)
+      return scalar(0);
+    float size = input(0).x, pixel_width = 1;
+    if (n.modes[0]) {
+      ::float3 camera_to_P = P - ::make_f3(params.cam_eye);
+      float depth = ::dot3(camera_to_P, ::normalize3(::make_f3(params.cam_w)));
+      ::float3 dx = ::make_f3(params.cam_u) * (2 * fabsf(depth) / params.width);
+      ::float3 dy =
+          ::make_f3(params.cam_v) * (2 * fabsf(depth) / params.height);
+      dx = dx - v.incoming * ::dot3(dx, v.incoming);
+      dy = dy - v.incoming * ::dot3(dy, v.incoming);
+      pixel_width = 0.5f * (sqrtf(::dot3(dx, dx)) + sqrtf(::dot3(dy, dy)));
+    }
+    float w = 0.5f * size * pixel_width;
+    ::float3 co[3];
+    for (int i = 0; i < 3; i++)
+      co[i] = ::transform_point(
+          v.geometry->object_to_world,
+          ::make_f3(v.geometry->vertices +
+                    3 * v.geometry->indices[3 * v.primitive + i]));
+    for (int i = 0; i < 3; i++) {
+      ::float3 edge = co[i] - co[(i + 2) % 3], area = ::cross3(edge, P - co[i]);
+      if (::dot3(area, area) < ::dot3(edge, edge) * w * w)
+        return scalar(1);
+    }
+    return scalar(0);
+  }
+#endif
+#if (VIBRT_SHADER_OPS & (7ull << 41))
+  return tracing_node(n, slots, ctx, services);
+#else
+  return scalar(0);
+#endif
+}
+#if (VIBRT_SHADER_OPS & (7ull << 41))
+VN_INLINE float4 tracing_node(const ShaderInstruction &n, const float4 *slots,
+                              const float4 *ctx,
+                              const SceneServices &services) {
+  const PathVertex &v = *(const PathVertex *)services.vertex;
+  auto input = [&](int i) { return slots[n.inputs[i]]; };
+  auto cuda_vec = [](float4 a) { return ::make_float3(a.x, a.y, a.z); };
+  auto result = [](::float3 a) { return make_float4(a.x, a.y, a.z, 1); };
+  ::float3 P = cuda_vec(ctx[3]);
+  unsigned int op = n.op & 255;
+  RNG rng(v.shader_seed, n.inputs[0], op);
+#if (VIBRT_SHADER_OPS & (1ull << 41))
+  if (op == 41) {
+    float distance = input(1).x, ao = 1;
+    ::float3 N = ::normalize3(cuda_vec(input(2))), T, B;
+    if (n.modes[1])
+      N = -N;
+    ::build_frame(N, T, B);
+    int samples = (int)n.modes[3];
+    if (distance > 0 && samples > 0 && v.geometry) {
+      int clear = 0;
+      for (int i = 0; i < samples; i++) {
+        float u = rng.next(), phi = 2 * M_PIf * rng.next(), r = sqrtf(u);
+        ::float3 D =
+            T * (r * cosf(phi)) + B * (r * sinf(phi)) + N * sqrtf(1 - u);
+        if (!::query_scene(v, P, D, distance, n.modes[2] != 0, true, 0x02u).hit)
+          clear++;
+      }
+      ao = float(clear) / samples;
+    }
+    return n.modes[0] ? make_float4(input(0).x * ao, input(0).y * ao,
+                                    input(0).z * ao, 1)
+                      : scalar(ao);
+  }
+#endif
+#if (VIBRT_SHADER_OPS & (1ull << 43))
+  if (op == 43) {
+    ::float3 origin = cuda_vec(input(0)), direction = cuda_vec(input(1));
+    float distance = input(2).x;
+    bool skip = origin.x == v.P.x && origin.y == v.P.y && origin.z == v.P.z;
+    SceneQuery q =
+        ::query_scene(v, origin, direction, distance, n.modes[1] != 0, skip);
+    switch (n.modes[0]) {
+    case 0:
+      return scalar(q.hit ? 1 : 0);
+    case 1:
+      return scalar(
+          q.hit && q.geometry->instance_id == v.geometry->instance_id ? 1 : 0);
+    case 2:
+      return scalar(q.hit ? q.distance : distance);
+    case 3:
+      return q.hit ? result(q.P) : color(make_float3(0));
+    default:
+      return q.hit ? result(::dot3(q.N, direction) > 0 ? -q.N : q.N)
+                   : color(make_float3(0));
+    }
+  }
+#endif
+#if (VIBRT_SHADER_OPS & (1ull << 42))
+  // Cycles' three-axis cubic BSSRDF sampling used by the Bevel node.
+  // Walk all same-object intersections instead of evaluating their materials.
+  float radius = input(0).x;
+  ::float3 normal = cuda_vec(input(1));
+  int samples = (int)n.modes[0];
+  if (radius <= 0 || samples < 1 || !v.geometry)
+    return result(normal);
+  ::float3 T, B, Ng = v.Ng;
+  ::build_frame(Ng, T, B);
+  ::float3 sum = ::make_float3(0, 0, 0);
+  for (int i = 0; i < samples; i++) {
+    float axis_u = rng.next(), u = rng.next();
+    ::float3 axis = Ng, dx = T, dy = B;
+    float axis_weight = 0.5f, tx_weight = 0.25f, ty_weight = 0.25f;
+    if (axis_u < 0.5f)
+      axis_u *= 2;
+    else if (axis_u < 0.75f) {
+      axis = T;
+      dx = Ng;
+      axis_weight = 0.25f;
+      tx_weight = 0.5f;
+      axis_u = (axis_u - 0.5f) * 4;
+    } else {
+      axis = B;
+      dy = Ng;
+      axis_weight = 0.25f;
+      ty_weight = 0.5f;
+      axis_u = (axis_u - 0.75f) * 4;
+    }
+    float r = radius * bevel_cubic_radius(u),
+          h = sqrtf(fmaxf(radius * radius - r * r, 0.0f));
+    float phi = 2 * M_PIf * axis_u;
+    ::float3 origin = P + axis * h + (dx * cosf(phi) + dy * sinf(phi)) * r;
+    float tmin = 0;
+// Repeated closest hits have no reservoir bias. The cap bounds pathological
+// coincident/non-manifold meshes; ordinary closed surfaces need two hits.
+#pragma unroll 1
+    for (int hit = 0; hit < 64; hit++) {
+      SceneQuery q =
+          ::query_scene(v, origin, -axis, 2 * h, true, false, 0xffu, tmin);
+      if (!q.hit)
+        break;
+      float pn = axis_weight * fabsf(::dot3(axis, q.Ng));
+      float pt = tx_weight * fabsf(::dot3(dx, q.Ng)),
+            pb = ty_weight * fabsf(::dot3(dy, q.Ng));
+      float weight = pn / fmaxf(pn * pn + pt * pt + pb * pb, 1e-20f);
+      ::float3 offset = q.P - P;
+      weight *= bevel_cubic_pdf(radius, sqrtf(::dot3(offset, offset))) /
+                fmaxf(bevel_cubic_pdf(radius, r), 1e-20f);
+      sum = sum + q.N * weight;
+      tmin = nextafterf(q.distance, FLT_MAX);
+    }
+  }
+  ::float3 bevel = ::dot3(sum, sum) > 1e-20f ? ::normalize3(sum) : v.Ns;
+  return result(::normalize3(normal + bevel - v.Ns));
+#endif
+  return scalar(0);
+}
+#endif
+} // namespace vibrt_shader
+#endif
 
 extern "C" __global__ void __closesthit__ch() {
   fill_path_vertex(get_path_vertex());
@@ -3067,11 +3817,14 @@ static __device__ int intersect_rect_lights(float3 origin, float3 dir,
   return best;
 }
 
-static __device__ __noinline__ float3 trace_path(float3 origin, float3 dir, RNG &rng,
-                                    float first_ray_tmin) {
+static __device__ __noinline__ float3 trace_path(float3 origin, float3 dir,
+                                                 RNG &rng, float first_ray_tmin,
+                                                 float &transparency) {
   float3 throughput = make_float3(1, 1, 1);
   float3 L = make_float3(0, 0, 0);
   bool last_specular = true;
+  bool camera_path = true;
+  transparency = 0;
   float prev_bsdf_pdf = 0.0f;
   // Last BSDF-sampled vertex's shading normal. Used by the
   // constant-world (`world_type==0`) branch in the envmap-miss block to
@@ -3138,7 +3891,7 @@ static __device__ __noinline__ float3 trace_path(float3 origin, float3 dir, RNG 
     optixTrace(params.traversable, origin, dir, ray_tmin, 1e20f, 0.0f,
                OptixVisibilityMask(rad_mask), OPTIX_RAY_FLAG_NONE,
                0, // SBT offset (radiance ray type)
-               2, // SBT stride (2 ray types: radiance + shadow)
+               2, // SBT stride (radiance and shadow)
                0, // miss index (radiance miss)
                hi, lo);
     if (bounce == 0 && v.hit != 0 && dot3(v.Ng, dir) > 0.0f) {
@@ -3223,8 +3976,7 @@ static __device__ __noinline__ float3 trace_path(float3 origin, float3 dir, RNG 
           float u1 = rng.next();
           float u2 = rng.next();
           float pdf_phase;
-          float3 wi_local =
-              phase_hg_sample(cur_vol->anisotropy, u1, u2, pdf_phase);
+          float3 wi_local = volume_phase_sample(cur_vol, u1, u2, pdf_phase);
           float3 T_frame, B_frame;
           build_frame(dir, T_frame, B_frame);
           float3 wi = T_frame * wi_local.x + B_frame * wi_local.y +
@@ -3294,6 +4046,10 @@ static __device__ __noinline__ float3 trace_path(float3 origin, float3 dir, RNG 
     }
 
     if (v.hit == 0) {
+      if (params.film_transparent && camera_path) {
+        transparency += (throughput.x + throughput.y + throughput.z) / 3;
+        break;
+      }
       // is_camera_ray for the world-bg split: bounce==0 is the primary
       // ray, and a chain of specular bounces (mirror / glass) preserves
       // the camera-ray semantic in Cycles' Light Path classification.
@@ -3402,13 +4158,66 @@ static __device__ __noinline__ float3 trace_path(float3 origin, float3 dir, RNG 
     // Stack-allocated leaves of the material's binary Mix tree. Lifetime
     // covers every direct_light / sample_bsdf call that reads `e_group`.
     MaterialEval e_slots[MAX_LEAVES];
-    v.path_depth=bounce;v.diffuse_depth=diffuse_bounces;v.glossy_depth=glossy_bounces;v.transmission_depth=transmission_bounces;v.path_flags=last_path_flags;
+    v.shader_seed = rng.state;
+    v.path_depth = bounce;
+    v.diffuse_depth = diffuse_bounces;
+    v.glossy_depth = glossy_bounces;
+    v.transmission_depth = transmission_bounces;
+    v.path_flags = last_path_flags;
     float e_weights[MAX_LEAVES];
     // View cosine for view-dependent (Fresnel) mix factors. `dir` is the
     // incoming ray (origin→hit); |dot(Ns, dir)| is the incidence cosine.
     float NoV_mix = fabsf(dot3(v.Ns, dir));
     int e_n = eval_material(v, e_slots, e_weights, MAX_LEAVES, min_alpha, NoV_mix);
     MaterialEvalGroup e_group = {e_slots, e_weights, e_n};
+#if VIBRT_AOVS
+    if (camera_path && v.mat->num_aov_shaders) {
+      float transparent = 0;
+      for (int i = 0; i < e_n; i++)
+        transparent += e_weights[i] * (1 - e_slots[i].alpha_blend);
+      write_shader_aovs(v, 1 - fminf(transparent, 1.0f));
+    }
+#endif
+#if (VIBRT_CLOSURE_TYPES & (1u << 3))
+    if (params.film_transparent && camera_path) {
+      float holdout = 0;
+      for (int i = 0; i < e_n; i++)
+        if (e_slots[i].mat->closure_type == 3)
+          holdout += e_weights[i];
+      transparency += (throughput.x + throughput.y + throughput.z) *
+                      (fminf(holdout, 1.0f) / 3);
+    }
+#endif
+#if (VIBRT_CLOSURE_TYPES & (1u << 7))
+    bool has_subsurface = false;
+    for (int i = 0; i < e_n; i++)
+      has_subsurface |= e_slots[i].mat->closure_type == 7;
+    if (has_subsurface) {
+      float total = 0;
+      for (int i = 0; i < e_n; i++)
+        total += e_weights[i];
+      float choice = rng.next() * total;
+      int picked = e_n - 1;
+      for (int i = 0; i < e_n; i++) {
+        choice -= e_weights[i];
+        if (choice <= 0) {
+          picked = i;
+          break;
+        }
+      }
+      e_slots[0] = e_slots[picked];
+      e_weights[0] = 1;
+      e_n = 1;
+      e_group.n = 1;
+      throughput = throughput * total;
+      if (e_slots[0].mat->closure_type == 7) {
+        if (!scatter_subsurface(v, e_slots[0], rng, throughput))
+          break;
+        dir = -v.Ns;
+        camera_path = false;
+      }
+    }
+#endif
     // Flip normal if ray hit backside (for dielectric transmission). Mirror
     // the bitangent instead of rebuilding the frame so the authored tangent
     // rotation (anisotropy axis) survives on back-faces; negating one axis
@@ -3507,6 +4316,16 @@ static __device__ __noinline__ float3 trace_path(float3 origin, float3 dir, RNG 
       break;
     float3 contrib = bs.f / bs.pdf;
     throughput = throughput * contrib;
+    camera_path = camera_path && bs.transparent;
+#if (VIBRT_CLOSURE_TYPES & (1u << 4))
+    if (bs.portal) {
+      origin = bs.portal_position + bs.wi * 1e-4f;
+      dir = bs.wi;
+      last_specular = true;
+      last_path_flags = 1u | 16u | 64u;
+      continue;
+    }
+#endif
     last_specular = bs.specular;
     last_path_flags=(bs.lobe==LOBE_DIFFUSE?4u:bs.lobe==LOBE_GLOSSY?8u:0u)|(bs.specular?16u:0u)|(dot3(bs.wi,v.Ng)*dot3(-dir,v.Ng)>0?32u:64u);
     prev_bsdf_pdf = bs.pdf;
@@ -3686,8 +4505,10 @@ extern "C" __global__ void __raygen__rg() {
   }
 
   float3 accum = make_float3(0, 0, 0);
+  float transparency_sum = 0;
   if (params.sample_start != 0 && params.accumulation != nullptr) {
-    accum = make_f3(&params.accumulation[pixel * 3]);
+    accum = make_f3(&params.accumulation[pixel * 4]);
+    transparency_sum = params.accumulation[pixel * 4 + 3];
   }
   const unsigned int sample_end = params.sample_start + params.sample_count;
   for (unsigned int s = params.sample_start; s < sample_end; s++) {
@@ -3726,13 +4547,17 @@ extern "C" __global__ void __raygen__rg() {
       dir = normalize3(focus_point - origin);
     }
 
-    accum = accum + trace_path(origin, dir, rng, params.cam_clip_start);
+    float transparency;
+    accum = accum +
+            trace_path(origin, dir, rng, params.cam_clip_start, transparency);
+    transparency_sum += transparency;
   }
   if (params.accumulation != nullptr) {
-    float *sum = &params.accumulation[pixel * 3];
+    float *sum = &params.accumulation[pixel * 4];
     sum[0] = accum.x;
     sum[1] = accum.y;
     sum[2] = accum.z;
+    sum[3] = transparency_sum;
   }
   float inv = 1.0f / (float)sample_end;
   accum = accum * inv;
@@ -3742,5 +4567,5 @@ extern "C" __global__ void __raygen__rg() {
   out[0] = accum.x;
   out[1] = accum.y;
   out[2] = accum.z;
-  out[3] = 1.0f;
+  out[3] = 1.0f - __saturatef(transparency_sum * inv);
 }

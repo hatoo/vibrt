@@ -338,6 +338,7 @@ def export_hair(
     writer,
     resolve_material,
     log_tag: str,
+    attribute_requests=None,
 ):
     """Build a hair mesh (positions/normals/tangents/indices) for one object.
 
@@ -394,6 +395,8 @@ def export_hair(
 
     slot_idx, mat = _pick_hair_material(obj_eval)
     mat_id = resolve_material(mat)
+    requested = (attribute_requests or {}).get(mat.name if mat else "", set())
+    need_info = any(key.startswith("hair:") for key in requested)
 
     # Some psys evaluators (`set_resolution`) re-run modifier evaluation; we
     # try render-mode in case it widens children for `psys.particles` — but
@@ -408,6 +411,7 @@ def export_hair(
     nrm_chunks: list[np.ndarray] = []
     tan_chunks: list[np.ndarray] = []
     uv_chunks: list[np.ndarray] = []
+    info_chunks: list[np.ndarray] = []
 
     psys_seed_base = abs(hash(log_tag)) & 0xFFFFFFFF
     for psys_i, psys in enumerate(hair_psys):
@@ -424,6 +428,32 @@ def export_hair(
             nrm_chunks.append(n)
             tan_chunks.append(t)
             uv_chunks.append(uv)
+            # Curve intercept follows arc length, matching Cycles' curve key u.
+            if need_info:
+                lengths = np.linalg.norm(np.diff(points, axis=0), axis=1)
+                total = float(lengths.sum())
+                intercepts = np.concatenate(([0.0], np.cumsum(lengths))) / max(
+                    total, 1e-20
+                )
+                segments = np.arange(len(points) - 1)
+                keys = np.stack(
+                    (
+                        segments,
+                        segments + 1,
+                        segments,
+                        segments,
+                        segments + 1,
+                        segments + 1,
+                    ),
+                    axis=1,
+                ).ravel()
+                data = np.empty((len(p), 4), np.float32)
+                data[:, 0] = intercepts[keys]
+                data[:, 1] = total
+                # Hair Info Thickness is diameter, matching the ribbon width.
+                data[:, 2] = root_w * (1 - uv[:, 1]) + tip_w * uv[:, 1]
+                data[:, 3] = (seed & 0xFFFFFF) / 16777216.0
+                info_chunks.append(data)
 
     for psys in hair_psys:
         try:
@@ -457,6 +487,18 @@ def export_hair(
         "indices": writer.write_u32(indices),
         "tangents": writer.write_f32(tangents.reshape(-1)),
     }
+    attributes = {}
+    if need_info:
+        info = np.concatenate(info_chunks)
+        for ch, name in enumerate(("Intercept", "Length", "Thickness", "Random")):
+            if "hair:" + name not in requested:
+                continue
+            values = np.ones((len(info), 4), np.float32)
+            values[:, :3] = info[:, ch, None]
+            attributes["hair:" + name] = writer.write_f32(values.reshape(-1))
+        if "hair:Is Strand" in requested:
+            attributes["hair:Is Strand"] = writer.write_f32(np.ones(4, np.float32))
+    mesh_desc["attributes"] = attributes
 
     # Hair vertices live in the host mesh's object-local frame (see
     # `_iter_strands`). Mirror the host's matrix_world on the instance so

@@ -11,6 +11,7 @@ pub mod camera;
 pub mod gpu_types;
 pub mod pipeline;
 pub mod principled;
+mod query_bvh;
 pub mod render;
 pub mod scene_format;
 pub mod scene_loader;

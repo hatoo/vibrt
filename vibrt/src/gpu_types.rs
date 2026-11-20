@@ -6,6 +6,8 @@ pub use vibrt_nodes::types::*;
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct PrincipledGpu {
+    pub aov_shaders: optix_sys::CUdeviceptr,
+    pub num_aov_shaders: u32,
     pub base_color: [f32; 3],
     pub metallic: f32,
     pub roughness: f32,
@@ -80,7 +82,7 @@ pub struct PrincipledGpu {
     pub color_graph_output: i32,
     pub shader_nodes: optix_sys::CUdeviceptr,
     pub shader_len: i32,
-    pub shader_outputs: u32,
+    pub shader_outputs: u64,
     pub shader_contexts: u32,
     /// A leaf in the Mix/Add tree can change opacity. Legacy cutouts and
     /// transmission are handled separately by the any-hit program.
@@ -110,6 +112,7 @@ pub struct PrincipledGpu {
     /// term. Default 0 keeps the existing Principled dielectric
     /// behaviour.
     pub pure_diffuse: i32,
+    pub closure_type: u32,
     /// Constant Cycles `Alpha` socket value (no texture). When < 1.0
     /// the kernel adds a transparent-passthrough lobe with weight
     /// `1 - alpha_blend`, mixing the opaque BSDF with straight-through
@@ -146,6 +149,8 @@ pub struct PrincipledGpu {
 #[repr(C)]
 #[derive(Copy, Clone, Default)]
 pub struct VolumeGpu {
+    pub phase: u32,
+    pub phase_params: [f32; 4],
     /// σ_t per channel (extinction = scattering + absorption).
     pub sigma_t: [f32; 3],
     pub _pad0: f32,
@@ -161,6 +166,8 @@ pub struct VolumeGpu {
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct HitGroupData {
+    pub attributes: optix_sys::CUdeviceptr,
+    pub num_attributes: u32,
     pub mat: optix_sys::CUdeviceptr,
     pub vertices: optix_sys::CUdeviceptr,
     pub normals: optix_sys::CUdeviceptr,
@@ -188,6 +195,41 @@ pub struct HitGroupData {
     pub object_index: u32,
     pub instance_id: u32,
     pub light_pdf: optix_sys::CUdeviceptr,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct ShaderAttribute {
+    pub key: u64,
+    pub data: optix_sys::CUdeviceptr,
+    pub count: u32,
+    pub _pad: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Default)]
+pub struct QueryNode {
+    pub lo: [f32; 3],
+    pub first: u32,
+    pub hi: [f32; 3],
+    pub count: u32,
+}
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct QueryObject {
+    pub geometry: optix_sys::CUdeviceptr,
+    pub nodes: optix_sys::CUdeviceptr,
+    pub indices: optix_sys::CUdeviceptr,
+    pub mask: u32,
+    pub _pad: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct AovShader {
+    pub material: optix_sys::CUdeviceptr,
+    pub index: u32,
+    pub _pad: u32,
 }
 
 #[repr(C)]
@@ -332,6 +374,11 @@ pub struct MeshLight {
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct LaunchParams {
+    pub query_nodes: optix_sys::CUdeviceptr,
+    pub query_indices: optix_sys::CUdeviceptr,
+    pub query_objects: optix_sys::CUdeviceptr,
+    pub aov_data: optix_sys::CUdeviceptr,
+    pub num_aovs: u32,
     /// float4 image buffer (linear RGB + weight)
     pub image: optix_sys::CUdeviceptr,
     /// Unnormalized float3 sums retained across progressive launches; 0 for
@@ -342,6 +389,7 @@ pub struct LaunchParams {
     pub samples_per_pixel: u32,
     pub sample_start: u32,
     pub sample_count: u32,
+    pub film_transparent: u32,
     pub max_depth: u32,
     /// Per-lobe bounce caps (Cycles `diffuse_bounces` / `glossy_bounces` /
     /// `transmission_bounces`). Tracked separately by the path tracer so

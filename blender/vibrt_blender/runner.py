@@ -29,6 +29,7 @@ def run_render_inproc(
     denoise: bool = False,
     texture_arrays=None,
     preview_cb=None,
+    aov_outputs=None,
 ):
     """Render a live scene dict (or legacy JSON) and borrowed pixel/mesh buffers.
 
@@ -76,6 +77,8 @@ def run_render_inproc(
     kwargs = {"texture_arrays": texture_arrays}
     if preview_cb is not None:
         kwargs["preview_cb"] = preview_cb
+    if aov_outputs is not None:
+        kwargs["aov_outputs"] = aov_outputs
     return native.render(
         scene_json, blobs_u8, opts, log_cb, cancel_cb,
         **kwargs,

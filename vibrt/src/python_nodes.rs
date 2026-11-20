@@ -64,10 +64,12 @@ pub fn fold_color_constants(graph: &Bound<'_, PyAny>) -> PyResult<Vec<Option<[f3
 }
 
 #[pyfunction]
+#[pyo3(signature = (graph, contexts, textures=None))]
 pub fn shader_pixels<'py>(
     py: Python<'py>,
     graph: &Bound<'py, PyAny>,
     contexts: PyReadonlyArrayDyn<'py, f32>,
+    textures: Option<Vec<(PyReadonlyArrayDyn<'py, f32>, usize, usize)>>,
 ) -> PyResult<Bound<'py, numpy::PyArray3<f32>>> {
     let graph: vibrt_nodes::shader::ShaderGraph = crate::python_scene::from_python(graph)?;
     if contexts.as_array().ndim() != 2 || contexts.as_array().shape()[1] != 128 {
@@ -78,12 +80,18 @@ pub fn shader_pixels<'py>(
     let data = contexts.as_slice()?;
     let (contexts, tail) = data.as_chunks::<128>();
     debug_assert!(tail.is_empty());
-    let output = vibrt_nodes::shader::evaluate(&graph, contexts)
+    let textures = textures.unwrap_or_default();
+    let textures = textures
+        .iter()
+        .map(|(a, w, h)| Ok((a.as_slice()?, *w, *h)))
+        .collect::<PyResult<Vec<_>>>()?;
+    let output = vibrt_nodes::shader::evaluate_with_textures(&graph, contexts, &textures)
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
     let flat: Vec<f32> = output.into_iter().flatten().flatten().collect();
-    Ok(
-        numpy::ndarray::Array::from_shape_vec((contexts.len(), 32, 4), flat)
-            .unwrap()
-            .into_pyarray_bound(py),
+    Ok(numpy::ndarray::Array::from_shape_vec(
+        (contexts.len(), vibrt_nodes::shader::OUTPUTS.len(), 4),
+        flat,
     )
+    .unwrap()
+    .into_pyarray_bound(py))
 }

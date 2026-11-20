@@ -14,6 +14,7 @@ fn main() {
     for (file, end) in [
         ("tables.h", ""),
         ("hash.h", ""),
+        ("volume_util.h", ""),
         ("math_util.h", ""),
         ("color_util.h", ""),
         ("noise.h", ""),
@@ -56,7 +57,29 @@ fn main() {
             source.push_str("#undef ADAPT_TO_SVM\n");
         }
     }
-    source.push_str("\n} // namespace vibrt_cycles\n");
+    source.push_str(&std::fs::read_to_string("native/closures_compat.h").unwrap());
+    for (file, end) in [(
+        "bsdf_principled_hair_chiang.h",
+        "/* Implements Filter Glossy",
+    )] {
+        let text = std::fs::read_to_string(format!("third_party/cycles/{file}")).unwrap();
+        for line in text[..text.find(end).unwrap()].lines() {
+            if !line.trim_start().starts_with("#  include")
+                && !line.starts_with("#include")
+                && !line.starts_with("CCL_NAMESPACE_")
+            {
+                source.push_str(line);
+                source.push('\n');
+            }
+        }
+    }
+    source.push_str("\n#undef __HAIR__\n#undef SHADER_CLOSURE_BASE\n} // namespace vibrt_cycles\n");
+    let bssrdf = std::fs::read_to_string("third_party/cycles/bssrdf.h").unwrap();
+    let start = bssrdf.find("ccl_device float bssrdf_burley_eval").unwrap();
+    let end = bssrdf.find("/* Setup */").unwrap();
+    source.push_str("\nnamespace vibrt_cycles {\n#define BURLEY_TRUNCATE 16.0f\n#define BURLEY_TRUNCATE_CDF 0.9963790093708328f\n#define FOREACH_SPECTRUM_CHANNEL(i) for(int i=0;i<3;i++)\n#define GET_SPECTRUM_CHANNEL(v,i) ((v)[i])\n");
+    source.push_str(&bssrdf[start..end]);
+    source.push_str("\n#undef FOREACH_SPECTRUM_CHANNEL\n#undef GET_SPECTRUM_CHANNEL\n}\n");
     std::fs::write(out.join("cycles_nodes.h"), source).unwrap();
     println!("cargo:rerun-if-changed=native");
     println!("cargo:rerun-if-changed=third_party/cycles");

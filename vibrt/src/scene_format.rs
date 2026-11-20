@@ -11,6 +11,8 @@ use serde::Deserialize;
 
 #[derive(Deserialize)]
 pub struct SceneFile {
+    #[serde(default)]
+    pub aov_names: Vec<String>,
     pub version: u32,
     pub render: RenderSettings,
     pub camera: CameraDesc,
@@ -59,6 +61,10 @@ pub struct SceneFile {
 ///   pre-multiplied RGB.
 #[derive(Deserialize, Default, Copy, Clone)]
 pub struct VolumeParams {
+    #[serde(default)]
+    pub phase: u32,
+    #[serde(default)]
+    pub phase_params: [f32; 4],
     /// Scattering tint. Multiplied by `density` to give σ_s.
     #[serde(default = "default_volume_color")]
     pub color: [f32; 3],
@@ -84,6 +90,8 @@ fn default_volume_color() -> [f32; 3] {
 
 #[derive(Deserialize, Copy, Clone)]
 pub struct RenderSettings {
+    #[serde(default)]
+    pub film_transparent: bool,
     pub width: u32,
     pub height: u32,
     pub spp: u32,
@@ -169,6 +177,9 @@ pub type BlobIdx = u32;
 
 #[derive(Deserialize)]
 pub struct MeshDesc {
+    /// Named float4 attributes in emitted vertex order (or one constant).
+    #[serde(default)]
+    pub attributes: std::collections::BTreeMap<String, BlobIdx>,
     /// f32 x 3 per vertex
     pub vertices: BlobIdx,
     /// f32 x 3 per vertex; optional
@@ -210,7 +221,14 @@ pub struct MeshDesc {
 
 #[derive(Deserialize)]
 pub struct PrincipledMaterial {
+    #[serde(default)]
+    pub aov_graphs: Vec<AovGraph>,
     pub base_color: [f32; 3],
+    /// Additional Cycles closure. 0: Principled, 1/2: diffuse/glossy Toon,
+    /// 3: Holdout, 4: Ray Portal, 5: Chiang Hair, 7: Burley SSS (6 reserved).
+    /// Parameters are supplied by shader outputs.
+    #[serde(default)]
+    pub closure_type: u32,
     #[serde(default)]
     pub metallic: f32,
     /// Cycles' `ShaderNodeBsdfAnisotropic` / `ShaderNodeBsdfGlossy` is
@@ -412,6 +430,12 @@ pub struct PrincipledMaterial {
     pub mix_fac_tex: Option<u32>,
 }
 
+#[derive(Deserialize)]
+pub struct AovGraph {
+    pub index: u32,
+    pub graph: vibrt_nodes::shader::ShaderGraph,
+}
+
 pub use vibrt_nodes::graph::{ColorFactor, ColorGraph, ColorNode};
 
 fn default_sss_radius() -> [f32; 3] {
@@ -463,6 +487,8 @@ pub struct TextureDesc {
 
 #[derive(Deserialize)]
 pub struct ObjectDesc {
+    #[serde(default)]
+    pub attributes: std::collections::BTreeMap<String, [f32; 4]>,
     pub mesh: u32,
     pub material: u32,
     /// Per-slot material IDs; used together with `MeshDesc::material_indices`.

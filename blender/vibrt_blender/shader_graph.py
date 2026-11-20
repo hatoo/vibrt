@@ -32,6 +32,7 @@ class Compiler:
         self.constants = {}
         self.visiting = set()
         self.attributes = set()
+        self.offset = (0.0, 0.0)
 
     def add(self, op, inputs=(), modes=(), params=(), **kwargs):
         if len(self.nodes) >= 256:
@@ -53,10 +54,18 @@ class Compiler:
         return self.constants[rgba]
 
     def context(self, index):
-        key = ("context", index)
+        key = ("context", index, self.offset)
         if key not in self.memo:
-            self.memo[key] = self.add("context", modes=[index])
+            self.memo[key] = (
+                self.add("shifted_context", modes=[index], params=self.offset)
+                if any(self.offset)
+                else self.add("context", modes=[index])
+            )
         return self.memo[key]
+
+    def attribute(self, key, output=0):
+        self.attributes.add(key)
+        return self.add("attribute", modes=[output], params=self.offset, attribute=key)
 
     def input(self, socket, groups=None, default=None):
         groups = self.groups if groups is None else groups
@@ -76,7 +85,12 @@ class Compiler:
     def output(self, socket, groups=None):
         groups = self.groups if groups is None else groups
         node = socket.node
-        key = (tuple(g.as_pointer() for g in groups), node.as_pointer(), socket.identifier)
+        key = (
+            tuple(g.as_pointer() for g in groups),
+            node.as_pointer(),
+            socket.identifier,
+            self.offset,
+        )
         if key in self.memo:
             return self.memo[key]
         if key in self.visiting:
@@ -103,8 +117,6 @@ class Compiler:
             return s(key) if n.inputs.get(key) is not None else self.constant(value)
         def coord(default=1):
             sock = n.inputs.get("Vector")
-            if default == 0 and not (sock and sock.is_linked):
-                self.attributes.add("uv:")
             return self.input(sock, groups) if sock and sock.is_linked else self.context(default)
         def prop(key, choices):
             return _enum(getattr(n, key), choices)
@@ -181,6 +193,30 @@ class Compiler:
             return self.add("radial_tiling", ins(0, 1, 2), [list(n.outputs).index(out), int(n.normalize)])
         if kind == "ShaderNodeCameraData":
             return self.add("camera", modes=[{"View Vector":0,"View Z Depth":1,"View Distance":2}[name]])
+        if kind == "ShaderNodeWireframe":
+            return self.add("wireframe", ins("Size"), [int(n.use_pixel_size)])
+        if kind == "ShaderNodeAmbientOcclusion":
+            normal = s("Normal") if n.inputs["Normal"].is_linked else self.context(4)
+            return self.add(
+                "ambient_occlusion",
+                [s("Color"), s("Distance"), normal],
+                [int(name == "Color"), int(n.inside), int(n.only_local), n.samples],
+            )
+        if kind == "ShaderNodeBevel":
+            normal = s("Normal") if n.inputs["Normal"].is_linked else self.context(4)
+            return self.add("bevel", [s("Radius"), normal], [n.samples])
+        if kind == "ShaderNodeRaycast":
+            position = (
+                s("Position") if n.inputs["Position"].is_linked else self.context(3)
+            )
+            direction = (
+                s("Direction") if n.inputs["Direction"].is_linked else self.context(4)
+            )
+            return self.add(
+                "raycast",
+                [position, direction, s("Length")],
+                [list(n.outputs).index(out), int(n.only_local)],
+            )
         if kind == "ShaderNodeLightPath":
             fields = {"Is Camera Ray":(20,0), "Is Shadow Ray":(20,1), "Is Diffuse Ray":(20,2), "Is Glossy Ray":(20,3), "Is Singular Ray":(21,0), "Is Reflection Ray":(21,1), "Is Transmission Ray":(21,2), "Ray Length":(18,0), "Ray Depth":(18,1), "Diffuse Depth":(18,2), "Glossy Depth":(18,3), "Transmission Depth":(19,0)}
             if name not in fields:
@@ -268,21 +304,75 @@ class Compiler:
             if n.object is not None or n.from_instancer:
                 raise UnsupportedNode("Explicit coordinate object / instancer coordinates")
             contexts = {"UV": 0, "Generated": 1, "Object": 2, "Normal": 13, "Camera": 12, "Window": 14, "Reflection": 15}
-            if name == "UV":
-                self.attributes.add("uv:")
             return self.context(contexts[name])
+        if kind == "ShaderNodeBump":
+            height = s("Height")
+            saved = self.offset
+            try:
+                self.offset = (saved[0] + 0.001, saved[1])
+                dx = s("Height")
+                self.offset = (saved[0], saved[1] + 0.001)
+                dy = s("Height")
+            finally:
+                self.offset = saved
+            normal = s("Normal") if n.inputs["Normal"].is_linked else self.context(4)
+            return self.add(
+                "bump",
+                [height, dx, dy, s("Strength"), s("Distance"), normal],
+                [int(n.invert)],
+            )
+        if kind == "ShaderNodeDisplacement":
+            normal = s("Normal") if n.inputs["Normal"].is_linked else self.context(4)
+            return self.add(
+                "displacement",
+                ins("Height", "Midlevel", "Scale") + [normal],
+                [1 if n.space == "OBJECT" else 2],
+            )
+        if kind == "ShaderNodeVectorDisplacement":
+            tangent = (
+                self.attribute("tangent:")
+                if n.space == "TANGENT"
+                else self.constant((0, 0, 0, 1))
+            )
+            return self.add(
+                "vector_displacement",
+                ins("Vector", "Midlevel", "Scale") + [tangent],
+                [_enum(n.space, ["TANGENT", "OBJECT", "WORLD"])],
+            )
         if kind == "ShaderNodeUVMap":
             if n.from_instancer:
                 raise UnsupportedNode("Instancer UV")
-            self.attributes.add("uv:" + n.uv_map)
-            return self.context(0)
+            return self.attribute("uv:" + n.uv_map)
         if kind in {"ShaderNodeVertexColor", "ShaderNodeAttribute"}:
             attr = n.layer_name if kind.endswith("VertexColor") else n.attribute_name
-            if kind.endswith("Attribute") and n.attribute_type != "GEOMETRY":
-                raise UnsupportedNode("Only mesh geometry attributes are available")
-            self.attributes.add("color:" + attr)
-            index = self.context(8)
-            return self.add("convert", [index], [2 if name == "Alpha" else 1]) if name in {"Alpha", "Fac"} else index
+            prefix = (
+                "color:"
+                if kind.endswith("VertexColor")
+                else {
+                    "GEOMETRY": "attr:",
+                    "OBJECT": "object:",
+                    "INSTANCER": "instancer:",
+                    "VIEW_LAYER": "layer:",
+                }[n.attribute_type]
+            )
+            return self.attribute(
+                prefix + attr, 2 if name == "Alpha" else 1 if name == "Fac" else 0
+            )
+        if kind in {"ShaderNodePointInfo", "ShaderNodeVolumeInfo", "ShaderNodeScript"}:
+            reason = {
+                "ShaderNodePointInfo": "point-cloud geometry",
+                "ShaderNodeVolumeInfo": "volume-grid sampling",
+                "ShaderNodeScript": "an OSL execution backend",
+            }[kind]
+            raise UnsupportedNode(f"{kind} requires {reason}, which is not available")
+        if kind in {"ShaderNodeHairInfo", "ShaderNodeParticleInfo"}:
+            prefix = "hair:" if kind == "ShaderNodeHairInfo" else "particle:"
+            if kind == "ShaderNodeHairInfo" and name == "Tangent Normal":
+                return self.add("hair_tangent", modes=[])
+            return self.attribute(
+                prefix + name,
+                3 if kind == "ShaderNodeParticleInfo" and name == "Random" else 0,
+            )
         if kind == "ShaderNodeNewGeometry":
             contexts = {"Position": 3, "Normal": 4, "True Normal": 5, "Incoming": 6, "Tangent": 7, "Backfacing": 16}
             if name not in contexts:
@@ -306,8 +396,13 @@ class Compiler:
             normal = s("Normal") if n.inputs["Normal"].is_linked else self.context(4)
             return self.add("layer_weight", [s("Blend"), normal], [int(name == "Facing")])
         if kind == "ShaderNodeNormalMap":
-            if n.space == "TANGENT":
-                self.attributes.add("uv:" + n.uv_map)
+            if n.space == "TANGENT" and n.uv_map:
+                tangent = self.attribute("tangent:" + n.uv_map, 4)
+                return self.add(
+                    "normal_map_named",
+                    ins("Color", "Strength") + [tangent],
+                    [int(getattr(n, "convention", "OPENGL") == "DIRECTX")],
+                )
             return self.add("normal_map", ins("Color", "Strength"),
                             [mode("space", "TANGENT OBJECT WORLD BLENDER_OBJECT BLENDER_WORLD"),
                              int(getattr(n, "convention", "OPENGL") == "DIRECTX")])
@@ -315,7 +410,7 @@ class Compiler:
             return self.add("normal", [s(0) if n.inputs[0].is_linked else self.context(4)], [int(name == "Dot")], list(n.outputs["Normal"].default_value))
         if kind == "ShaderNodeTangent":
             if n.direction_type == "UV_MAP":
-                self.attributes.add("uv:" + n.uv_map)
+                return self.attribute("tangent:" + n.uv_map, 4)
             return self.add("tangent", modes=[int(n.direction_type == "RADIAL"), mode("axis", "X Y Z")])
         raise UnsupportedNode("No evaluator for this node/output")
 
@@ -323,14 +418,7 @@ class Compiler:
         return {"nodes": self.nodes, "outputs": outputs}
 
     def attach_attributes(self, params):
-        colors = sorted(a[6:] for a in self.attributes if a.startswith("color:"))
-        uvs = sorted(a[3:] for a in self.attributes if a.startswith("uv:"))
-        if len(colors) > 1 or len(uvs) > 1:
-            raise UnsupportedNode("Multiple color/UV layers require additional mesh attributes")
-        if colors:
-            params["_vertex_color_attr"] = colors[0]
-        if uvs:
-            params["_uv_map"] = uvs[0]
+        params["_shader_attributes"] = sorted(self.attributes)
 
 
 PRINCIPLED_INPUTS = {
@@ -365,18 +453,7 @@ def attach(node, params, writer, textures, group_stack=()):
         if sock is None or not sock.enabled or not sock.is_linked:
             continue
         # The caller reports precise unsupported sockets rather than guessing a value.
-        source = sock.links[0].from_node
-        if target == "normal" and source.bl_idname == "ShaderNodeBump":
-            outputs["bump_height"] = compiler.input(source.inputs["Height"])
-            outputs["bump_strength"] = compiler.input(source.inputs["Strength"])
-            distance = compiler.input(source.inputs["Distance"])
-            if source.invert:
-                distance = compiler.add("math", [distance, compiler.constant(-1), compiler.constant(0)], [MATH.index("MULTIPLY")])
-            outputs["bump_distance"] = distance
-            if source.inputs["Normal"].is_linked:
-                outputs["normal"] = compiler.input(source.inputs["Normal"])
-        else:
-            outputs[target] = compiler.input(sock)
+        outputs[target] = compiler.input(sock)
     if not outputs:
         return params
     # Emission needs its separate strength even when only one input is linked.
@@ -402,6 +479,113 @@ def attach(node, params, writer, textures, group_stack=()):
 def compile_leaf(node, writer, textures, group_stack=()):
     """Fast path: compile sockets before the legacy image-baking traversal."""
     kind = node.bl_idname
+    if kind == "ShaderNodeSubsurfaceScattering":
+        if node.falloff != "BURLEY":
+            raise UnsupportedNode(
+                "Subsurface random-walk requires interior volume transport; use Burley"
+            )
+        compiler = Compiler(writer, textures, group_stack)
+        outputs = {
+            field: compiler.input(node.inputs[socket])
+            for socket, field in (
+                ("Color", "base_color"),
+                ("Scale", "sss_scale"),
+                ("Radius", "sss_radius"),
+            )
+        }
+        if node.inputs["Normal"].is_linked:
+            outputs["normal"] = compiler.input(node.inputs["Normal"])
+        params = {
+            "closure_type": 7,
+            "base_color": [1.0] * 3,
+            "pure_diffuse": True,
+            "specular_ior_level": 0.0,
+            "shader_graph": compiler.graph(outputs),
+        }
+        compiler.attach_attributes(params)
+        return params
+    if kind == "ShaderNodeBsdfHairPrincipled":
+        if node.model != "CHIANG":
+            raise UnsupportedNode(
+                "Huang hair has unresolved Cycles comparison differences; only Chiang is supported"
+            )
+        compiler = Compiler(writer, textures, group_stack)
+        fields = {
+            "Color": "base_color",
+            "Absorption Coefficient": "hair_sigma",
+            "Roughness": "hair_roughness_u",
+            "Radial Roughness": "hair_roughness_v",
+            "Offset": "hair_offset",
+            "IOR": "hair_ior",
+            "Coat": "hair_coat",
+            "Random Roughness": "hair_random_roughness",
+            "Random Color": "hair_random_color",
+            "Melanin": "hair_melanin",
+            "Melanin Redness": "hair_redness",
+            "Tint": "hair_tint",
+        }
+        sockets = {s.name: s for s in node.inputs}
+        outputs = {
+            field: compiler.input(sockets[socket]) for socket, field in fields.items()
+        }
+        strand = compiler.attribute("hair:Is Strand")
+        random = compiler.attribute("hair:Random")
+        fallback = compiler.input(node.inputs["Random"])
+        zero = compiler.constant(0)
+        difference = compiler.add(
+            "math", [random, fallback, zero], [MATH.index("SUBTRACT")]
+        )
+        weighted = compiler.add(
+            "math", [strand, difference, zero], [MATH.index("MULTIPLY")]
+        )
+        outputs["hair_random"] = compiler.add(
+            "math", [fallback, weighted, zero], [MATH.index("ADD")]
+        )
+        if node.inputs["Random"].is_linked:
+            outputs["hair_random"] = fallback
+        outputs["hair_parametrization"] = compiler.constant(
+            _enum(node.parametrization, ["COLOR", "MELANIN", "ABSORPTION"])
+        )
+        params = {
+            "closure_type": 5,
+            "base_color": [1.0] * 3,
+            "shader_graph": compiler.graph(outputs),
+        }
+        compiler.attach_attributes(params)
+        return params
+    if kind in {"ShaderNodeBsdfToon", "ShaderNodeHoldout", "ShaderNodeBsdfRayPortal"}:
+        compiler = Compiler(writer, textures, group_stack)
+        outputs = {}
+        params = {
+            "base_color": [0.0] * 3,
+            "pure_diffuse": True,
+            "specular_ior_level": 0.0,
+        }
+        if kind == "ShaderNodeBsdfToon":
+            params["closure_type"] = 1 if node.component == "DIFFUSE" else 2
+            for socket, field in (
+                ("Color", "base_color"),
+                ("Size", "toon_size"),
+                ("Smooth", "toon_smooth"),
+            ):
+                outputs[field] = compiler.input(node.inputs[socket])
+            if node.inputs["Normal"].is_linked:
+                outputs["normal"] = compiler.input(node.inputs["Normal"])
+        elif kind == "ShaderNodeHoldout":
+            params["closure_type"] = 3
+        else:
+            params["closure_type"] = 4
+            outputs["base_color"] = compiler.input(node.inputs["Color"])
+            outputs["portal_position"] = (
+                compiler.input(node.inputs["Position"])
+                if node.inputs["Position"].is_linked
+                else compiler.context(3)
+            )
+            outputs["portal_direction"] = compiler.input(node.inputs["Direction"])
+        if outputs:
+            params["shader_graph"] = compiler.graph(outputs)
+        compiler.attach_attributes(params)
+        return params
     if kind == "ShaderNodeBsdfMetallic" and node.fresnel_type != "F82":
         raise UnsupportedNode("Metallic physical-conductor IOR/extinction requires a conductor closure")
     if kind not in {"ShaderNodeBsdfPrincipled", "ShaderNodeBsdfDiffuse", "ShaderNodeBsdfAnisotropic", "ShaderNodeBsdfGlossy", "ShaderNodeBsdfGlass", "ShaderNodeBsdfRefraction", "ShaderNodeBsdfTranslucent", "ShaderNodeBsdfTransparent", "ShaderNodeEmission", "ShaderNodeBsdfMetallic"}:
@@ -435,3 +619,67 @@ def compile_leaf(node, writer, textures, group_stack=()):
     if strength is not None:
         params["emission"] = [c*float(strength.default_value) for c in params["emission"]]
     return attach(node, params, writer, textures, group_stack)
+
+
+def compile_aovs(tree, params, writer, textures, passes):
+    """AOV nodes are graph roots even when disconnected from Material Output."""
+    outputs = []
+    attributes = set(params.get("_shader_attributes", ()))
+
+    def visit(current, groups=(), visited=()):
+        if current.as_pointer() in visited:
+            raise UnsupportedNode("Recursive AOV node group")
+        for node in current.nodes:
+            if node.mute:
+                continue
+            if node.bl_idname == "ShaderNodeGroup" and node.node_tree:
+                visit(
+                    node.node_tree, groups + (node,), visited + (current.as_pointer(),)
+                )
+            elif node.bl_idname == "ShaderNodeOutputAOV":
+                match = next(
+                    ((i, a) for i, a in enumerate(passes) if a.name == node.aov_name),
+                    None,
+                )
+                if match is None:
+                    continue
+                i, aov = match
+                compiler = Compiler(writer, textures, groups)
+                socket = "Color" if aov.type == "COLOR" else "Value"
+                value = compiler.input(node.inputs[socket])
+                outputs.append(
+                    {"index": i, "graph": compiler.graph({"base_color": value})}
+                )
+                attributes.update(compiler.attributes)
+
+    visit(tree)
+    if outputs:
+        params["aov_graphs"] = outputs
+        params["_shader_attributes"] = sorted(attributes)
+
+
+def compile_displacement(socket, params, writer, textures):
+    """Evaluate Material Output displacement as spatial bump on every closure."""
+    if socket is None or not socket.is_linked:
+        return
+    for key in ("left_subtree", "secondary"):
+        if params.get(key):
+            compile_displacement(socket, params[key], writer, textures)
+    if params.get("left_subtree"):
+        return
+    compiler = Compiler(writer, textures)
+    old = params.get("shader_graph", {})
+    compiler.nodes.extend(old.get("nodes", []))
+    compiler.attributes.update(params.get("_shader_attributes", ()))
+    outputs = dict(old.get("outputs", {}))
+    normal = outputs.get("normal")
+    if normal is None:
+        normal = compiler.context(4)
+    displacement = compiler.input(socket)
+    compiler.offset = (0.001, 0.0)
+    dx = compiler.input(socket)
+    compiler.offset = (0.0, 0.001)
+    dy = compiler.input(socket)
+    outputs["normal"] = compiler.add("vector_bump", [displacement, dx, dy, normal])
+    params["shader_graph"] = compiler.graph(outputs)
+    compiler.attach_attributes(params)

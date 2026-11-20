@@ -29,6 +29,132 @@ using vibrt_cycles::make_float4;
 VN_INLINE float4 scalar(float v) { return make_float4(v, v, v, 1); }
 VN_INLINE float4 color(float3 v) { return make_float4(v, 1); }
 VN_INLINE float3 xyz(float4 v) { return make_float3(v); }
+// Cycles' color/melanin parametrizations, followed by its unmodified Chiang
+// closure.
+VN_INLINE float3 hair_absorption(float3 reflectance, float roughness) {
+  float r = roughness;
+  float scale =
+      (((((0.245f * r) + 5.574f) * r - 10.73f) * r + 2.532f) * r - 0.215f) * r +
+      5.969f;
+  float3 result;
+  for (int i = 0; i < 3; i++)
+    result[i] = sqr(logf(fmaxf(reflectance[i], 1e-20f)) / scale);
+  return result;
+}
+VN_INLINE ChiangHairBSDF
+chiang_setup(ShaderData &sd, float3 color_value, float3 absorption,
+             float roughness, float radial, float offset, float ior, float coat,
+             float random, float random_roughness, float random_color,
+             float melanin, float redness, float3 tint, int parametrization) {
+  float factor = 1 + 2 * (random - 0.5f) * random_roughness;
+  ChiangHairBSDF b = {};
+  b.v = roughness * factor;
+  b.s = radial * factor;
+  b.alpha = offset;
+  b.eta = fmaxf(ior, 1.0001f);
+  b.m0_roughness = 1 - clamp(coat, 0, 1);
+  b.sigma = absorption;
+  if (parametrization == 0)
+    b.sigma = hair_absorption(color_value, b.s);
+  if (parametrization == 1) {
+    melanin *= (1 + 2 * (random - 0.5f) * clamp(random_color, 0, 1));
+    melanin = -logf(fmaxf(1 - melanin, 0.0001f));
+    b.sigma = melanin * ((1 - redness) * make_float3(0.506f, 0.841f, 1.653f) +
+                         redness * make_float3(0.343f, 0.733f, 1.924f)) +
+              hair_absorption(tint, b.s);
+  }
+  bsdf_hair_chiang_setup(&sd, &b);
+  return b;
+}
+// Cycles svm/bevel.h cubic radial profile (Apache-2.0), v5.1.1.
+VN_INLINE float bevel_cubic_radius(float u) {
+  float x = 0.25f;
+  for (int i = 0; i < 10; ++i) {
+    float x2 = x * x, x3 = x2 * x;
+    float f = 10 * x2 - 20 * x3 + 15 * x3 * x - 4 * x3 * x2 - u;
+    if (fabsf(f) < 1e-6f)
+      break;
+    float t = 1 - x;
+    x = clamp(x - f / fmaxf(20 * x * t * t * t, 1e-8f), 0.0f, 1.0f);
+  }
+  return x;
+}
+VN_INLINE float bevel_cubic_pdf(float radius, float distance) {
+  float x = fmaxf(1 - distance / radius, 0.0f);
+  return 10 * x * x * x / (M_PI_F * radius * radius);
+}
+// Cycles closure/bsdf_toon.h (BSD-3-Clause), v5.1.1. Returns eval and PDF.
+VN_INLINE float2 toon_eval(float cosine, float size, float smooth) {
+  float max_angle = clamp(size, 1e-5f, 1.0f) * M_PI_2_F;
+  float width = clamp(smooth, 0.0f, 1.0f) * M_PI_2_F;
+  float sample_angle = fminf(max_angle + width, M_PI_2_F);
+  float angle = acosf(clamp(cosine, -1.0f, 1.0f));
+  if (angle >= sample_angle)
+    return make_float2(0, 0);
+  float intensity = angle < max_angle
+                        ? 1.0f
+                        : (width > 0 ? 1 - (angle - max_angle) / width : 0);
+  // 2*sin(a/2)^2 is stable even for the minimum size.
+  float s = sinf(0.5f * sample_angle), pdf = 1 / (4 * M_PI_F * s * s);
+  return make_float2(pdf * intensity, pdf);
+}
+VN_INLINE float volume_phase_pdf(unsigned int type, const float *p, float g,
+                                 float cosine) {
+  if (type == 1)
+    return phase_fournier_forand(
+        cosine, phase_fournier_forand_coeffs(clamp(p[1], 0.001f, 0.5f),
+                                             fmaxf(p[0], 1.001f)));
+  if (type == 2)
+    return phase_draine(cosine, g, fmaxf(p[2], 0.0f));
+  if (type == 3)
+    return phase_rayleigh(cosine);
+  if (type == 4) {
+    float hg, d, alpha, w;
+    phase_mie_fitted_parameters(p[3], &hg, &d, &alpha, &w);
+    return (1 - w) * phase_henyey_greenstein(cosine, hg) +
+           w * phase_draine(cosine, d, alpha);
+  }
+  return phase_henyey_greenstein(cosine, g);
+}
+VN_INLINE float3 volume_phase_sample(unsigned int type, const float *p, float g,
+                                     float u, float v, float *pdf) {
+  float3 Z = make_float3(0, 0, 1);
+  float2 random = make_float2(u, v);
+  if (type == 1)
+    return phase_fournier_forand_sample(
+        Z,
+        phase_fournier_forand_coeffs(clamp(p[1], 0.001f, 0.5f),
+                                     fmaxf(p[0], 1.001f)),
+        random, pdf);
+  if (type == 2)
+    return phase_draine_sample(Z, g, fmaxf(p[2], 0.0f), random, pdf);
+  if (type == 3)
+    return phase_rayleigh_sample(Z, random, pdf);
+  if (type == 4) {
+    float hg, d, alpha, w;
+    phase_mie_fitted_parameters(p[3], &hg, &d, &alpha, &w);
+    float3 direction;
+    if (u < w)
+      direction = phase_draine_sample(
+          Z, d, alpha, make_float2(u / fmaxf(w, 1e-20f), v), pdf);
+    else
+      direction = phase_henyey_greenstein_sample(
+          Z, hg, make_float2((u - w) / fmaxf(1 - w, 1e-20f), v), pdf);
+    *pdf = volume_phase_pdf(type, p, g, direction.z);
+    return direction;
+  }
+  return phase_henyey_greenstein_sample(Z, g, random, pdf);
+}
+// Scene access is supplied by the renderer. The standalone CPU API rejects
+// these operations rather than inventing geometry or returning fallback values.
+struct SceneServices {
+  const void *vertex;
+  int derivative;
+};
+#ifdef __CUDACC__
+VN_INLINE float4 scene_node(const ShaderInstruction &node, const float4 *slots,
+                            const float4 *ctx, const SceneServices &services);
+#endif
 VN_INLINE float luminance(float3 v) { return 0.2126f * v.x + 0.7152f * v.y + 0.0722f * v.z; }
 VN_INLINE float3 rotate(float3 p, float3 axis, float angle) {
   axis = safe_normalize(axis);
@@ -203,7 +329,7 @@ template <typename T> VN_DEVICE float4 voronoi(const VoronoiParams &params, T p,
   return scalar(o.distance);
 }
 
-// Context ABI: 32 float4 values. Outputs are 32 float4 socket values.
+// Context ABI: 32 float4 values. Outputs are up to 64 float4 socket values.
 // Host validation guarantees topological order, arity, mode and table bounds.
 #ifndef VIBRT_SHADER_STACK_SIZE
 #define VIBRT_SHADER_STACK_SIZE 256
@@ -235,8 +361,10 @@ VN_INLINE void evaluate_single(const ShaderInstruction &n, float4 uv, float4 *ou
 #endif
   outputs[n.inputs[1]] = finite_value(r);
 }
-VN_INLINE void evaluate_vm(const ShaderInstruction *nodes, int count, const float4 *ctx,
-                        float4 *outputs, unsigned int requested = EVAL_ALL) {
+VN_INLINE void evaluate_vm(const ShaderInstruction *nodes, int count,
+                           const float4 *ctx, float4 *outputs,
+                           unsigned int requested = EVAL_ALL,
+                           const SceneServices *services = nullptr) {
   float4 slots[VIBRT_SHADER_STACK_SIZE];
   for (int i = 0; i < count; i++) {
     const ShaderInstruction &n = nodes[i];
@@ -658,6 +786,43 @@ VN_INLINE void evaluate_vm(const ShaderInstruction *nodes, int count, const floa
       break;
     }
 #endif
+#if (VIBRT_SHADER_OPS & (1ull << 48))
+    case 48: {
+      float3 nrm = V(0) * 2 - 1, N = xyz(ctx[4]), T = V(2);
+      if (m[0])
+        nrm.y = -nrm.y;
+      float3 B = cross(N, T) * A(2).w;
+      nrm.x *= S(1);
+      nrm.y *= S(1);
+      nrm.z = mix(1.0f, nrm.z, clamp(S(1), 0, 1));
+      nrm = safe_normalize(T * nrm.x + B * nrm.y + N * nrm.z);
+      r = color(dot(nrm, nrm) > 0 ? nrm : N);
+      break;
+    }
+#endif
+#if (VIBRT_SHADER_OPS & (3ull << 49))
+    case 49:
+    case 50: {
+      float3 d;
+      if ((n.op & 255) == 49) {
+        d = V(3);
+        if (m[0] == 1)
+          d = vector_transform(d, ctx, 2, 0, 1);
+        d *= (S(0) - S(1)) * S(2);
+      } else {
+        d = (V(0) - S(1)) * S(2);
+        if (m[0] == 0) {
+          float3 N = vector_transform(xyz(ctx[4]), ctx, 2, 0, 1), T = V(3);
+          float3 B = safe_normalize(cross(N, T)) * A(3).w;
+          d = T * d.x + N * d.y + B * d.z;
+        }
+      }
+      if (m[0] != 2)
+        d = vector_transform(d, ctx, 0, 1, 0);
+      r = color(d);
+      break;
+    }
+#endif
 #if (VIBRT_SHADER_OPS & (1ull << 33))
     case 33: {
       float3 nrm = safe_normalize(make_float3(p[0], p[1], p[2]));
@@ -720,6 +885,21 @@ VN_INLINE void evaluate_vm(const ShaderInstruction *nodes, int count, const floa
       r = color(cross(N, safe_normalize(cross(t, N))));
       break;
     }
+#endif
+#ifdef __CUDACC__
+#if (VIBRT_SHADER_OPS & ((255ull << 40) | (1ull << 51)))
+    case 40:
+    case 41:
+    case 42:
+    case 43:
+    case 44:
+    case 45:
+    case 46:
+    case 47:
+    case 51:
+      r = scene_node(n, slots, ctx, *services);
+      break;
+#endif
 #endif
     case 255:
       outputs[m[0]] = A(0);

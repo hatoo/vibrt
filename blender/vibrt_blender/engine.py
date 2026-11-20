@@ -49,6 +49,18 @@ class VibrtRenderEngine(bpy.types.RenderEngine):
         versions where the API spelling drifts.
         """
         self.register_pass(scene, renderlayer, "Combined", 4, "RGBA", "COLOR")
+        if renderlayer is not None:
+            for aov in renderlayer.aovs:
+                if aov.is_valid:
+                    color = aov.type == "COLOR"
+                    self.register_pass(
+                        scene,
+                        renderlayer,
+                        aov.name,
+                        4 if color else 1,
+                        "RGBA" if color else "X",
+                        "COLOR" if color else "VALUE",
+                    )
 
         rl = renderlayer
         try:
@@ -171,6 +183,7 @@ class VibrtRenderEngine(bpy.types.RenderEngine):
                         status += " | Denoising..."
                     self.update_stats("vibrt", status)
 
+                aovs = {}
                 pixels, depth = runner.run_render_inproc(
                     scene_data,
                     mesh_blobs,
@@ -179,6 +192,7 @@ class VibrtRenderEngine(bpy.types.RenderEngine):
                     denoise=denoise,
                     texture_arrays=texture_arrays,
                     preview_cb=preview,
+                    aov_outputs=aovs,
                 )
                 self.report(
                     {"INFO"},
@@ -187,7 +201,12 @@ class VibrtRenderEngine(bpy.types.RenderEngine):
                 )
                 self.update_stats("vibrt", "Loading result...")
                 t_blit = time.perf_counter()
-                display.finish(pixels, depth, lambda d: _compute_mist(d, depsgraph.scene_eval))
+                display.finish(
+                    pixels,
+                    depth,
+                    lambda d: _compute_mist(d, depsgraph.scene_eval),
+                    aovs,
+                )
                 self.update_progress(1.0)
                 self.report(
                     {"INFO"},
@@ -232,7 +251,10 @@ def _unsupported_compositor_passes(scene) -> set:
         for sock in n.outputs:
             if not sock.is_linked:
                 continue
-            if sock.name in _SUPPORTED_RENDER_LAYER_OUTPUTS:
+            aov_names = {
+                a.name for layer in scene.view_layers for a in layer.aovs if a.is_valid
+            }
+            if sock.name in _SUPPORTED_RENDER_LAYER_OUTPUTS or sock.name in aov_names:
                 continue
             unsupported.add(sock.name)
     return unsupported
