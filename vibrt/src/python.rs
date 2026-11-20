@@ -242,6 +242,86 @@ fn render<'py>(
     Ok((arr.into_pyarray_bound(py), depth.into_pyarray_bound(py)))
 }
 
+/// Compile exactly the renderer's shader variant without loading geometry,
+/// uploading scene buffers or launching a render. Both driver caches persist.
+#[pyfunction]
+#[pyo3(signature = (description, log_cb = None, cancel_cb = None))]
+fn precompile_shaders<'py>(
+    py: Python<'py>,
+    description: &Bound<'py, PyAny>,
+    log_cb: Option<PyObject>,
+    cancel_cb: Option<PyObject>,
+) -> PyResult<Bound<'py, PyDict>> {
+    use crate::shader_compile::{self, ShaderRequirements};
+    use crate::CudaResultExt;
+    use anyhow::Context;
+
+    #[derive(serde::Deserialize)]
+    struct ShaderScene {
+        #[serde(default)]
+        materials: Vec<crate::scene_format::PrincipledMaterial>,
+        #[serde(default)]
+        aov_names: Vec<String>,
+        #[serde(default)]
+        world_volume: Option<crate::scene_format::VolumeParams>,
+    }
+    let scene: ShaderScene = crate::python_scene::from_python(description)?;
+    let mut progress = PyProgress {
+        log_cb,
+        cancel_cb,
+        preview_cb: None,
+        callback_error: None,
+        cancelled: false,
+    };
+    let result = py.allow_threads(|| -> anyhow::Result<_> {
+        let started = std::time::Instant::now();
+        let requirements = ShaderRequirements::new(
+            &scene.materials,
+            scene.aov_names.len(),
+            scene.world_volume.as_ref(),
+        )?;
+        anyhow::ensure!(!progress.cancelled(), "shader compilation cancelled");
+        progress.log("Initializing shader compiler...");
+        let cuda = cudarc::driver::CudaContext::new(0)
+            .cuda()
+            .context("CUDA context")?;
+        let optix = optix::init().context("OptiX init")?;
+        let context = optix::DeviceContext::new(
+            &optix,
+            cuda.cu_ctx() as optix_sys::CUcontext,
+            &optix::DeviceContextOptions::default(),
+        )
+        .context("OptiX context")?;
+        let compiled = shader_compile::compile(&context, requirements, &mut progress)?;
+        Ok((
+            requirements,
+            started.elapsed().as_secs_f64(),
+            compiled.ptx_time.as_secs_f64(),
+            compiled.pipeline_time.as_secs_f64(),
+        ))
+    });
+    if let Some(error) = progress.callback_error {
+        return Err(error);
+    }
+    if progress.cancelled {
+        return Err(PyKeyboardInterrupt::new_err("shader compilation cancelled"));
+    }
+    let (r, seconds, ptx_seconds, pipeline_seconds) =
+        result.map_err(|e| PyRuntimeError::new_err(format!("vibrt: {e:#}")))?;
+    let output = PyDict::new_bound(py);
+    output.set_item("seconds", seconds)?;
+    output.set_item("ptx_seconds", ptx_seconds)?;
+    output.set_item("pipeline_seconds", pipeline_seconds)?;
+    output.set_item("shader_ops", r.shader_ops)?;
+    output.set_item("max_closures", r.max_closures)?;
+    output.set_item("shader_stack_size", r.shader_stack_size)?;
+    output.set_item("closure_types", r.closure_types)?;
+    output.set_item("shader_output_count", r.shader_output_count)?;
+    output.set_item("has_aovs", r.has_aovs)?;
+    output.set_item("has_extended_phases", r.has_extended_phases)?;
+    Ok(output)
+}
+
 #[pymodule]
 fn vibrt_native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(crate::python_nodes::sky_pixels, m)?)?;
@@ -252,6 +332,7 @@ fn vibrt_native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     m.add_function(wrap_pyfunction!(crate::python_nodes::shader_pixels, m)?)?;
     m.add_function(wrap_pyfunction!(render, m)?)?;
+    m.add_function(wrap_pyfunction!(precompile_shaders, m)?)?;
     m.add_function(wrap_pyfunction!(crate::blender_mesh::read_mesh, m)?)?;
     m.add_function(wrap_pyfunction!(crate::python_pixels::srgb_to_linear, m)?)?;
     m.add_function(wrap_pyfunction!(

@@ -232,6 +232,19 @@ Pinned source, hashes, adaptations and licenses are documented in
 
 ## Rendering performance
 
+In Blender's **Render Properties > Shaders**, click **Precompile Shaders** to
+prepare the current scene/view-layer shader variant before rendering. The
+background job fills both the PTX and OptiX caches using the same compiler as
+the renderer. Progress and a Cancel button appear in the panel; Esc also stops
+the job. Unsaved edits are included in a temporary snapshot, without replacing
+the current Render Result or saving the working `.blend` file.
+
+This prepares shader compilation only. Scene export, texture uploads and BVH
+construction still happen when rendering. Changing node types, closure trees,
+AOVs or volume phases can require a different variant; run the button again
+after those edits. Material discovery uses a render-mode dependency graph and
+skips mesh export and world-lighting preparation.
+
 Run the same scene, resolution, samples and preview mode for each revision:
 
 ```sh

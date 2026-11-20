@@ -289,214 +289,21 @@ pub fn render_to_pixels(
     .context("OptiX context")?;
 
     let context_time = t_prepare.elapsed();
-    let t_ptx = std::time::Instant::now();
-    fn validate_shader_tree(
-        material: &scene_format::PrincipledMaterial,
-        depth: usize,
-        shader_stack_size: &mut usize,
-        aov_count: usize,
-    ) -> Result<usize> {
-        anyhow::ensure!(depth <= 8, "Material shader tree exceeds 8 levels");
-        if let Some(graph) = &material.shader_graph {
-            *shader_stack_size = (*shader_stack_size).max(graph.required_stack_size()?);
-        }
-        for aov in &material.aov_graphs {
-            anyhow::ensure!(
-                (aov.index as usize) < aov_count,
-                "AOV index is out of range"
-            );
-            anyhow::ensure!(
-                aov.graph.outputs.contains_key("base_color"),
-                "AOV graph requires a base_color output"
-            );
-            *shader_stack_size = (*shader_stack_size).max(aov.graph.required_stack_size()?);
-        }
-        if let Some(volume) = &material.volume {
-            anyhow::ensure!(
-                volume.phase <= 4 && volume.phase_params.iter().all(|v| v.is_finite()),
-                "Invalid volume phase parameters"
-            );
-        }
-        let leaves = match (&material.left_subtree, &material.secondary) {
-            (None, None) => 1,
-            (left, right) => {
-                let l = if let Some(c) = left {
-                    validate_shader_tree(c, depth + 1, shader_stack_size, aov_count)?
-                } else {
-                    1
-                };
-                let r = if let Some(c) = right {
-                    validate_shader_tree(c, depth + 1, shader_stack_size, aov_count)?
-                } else {
-                    1
-                };
-                l + r
-            }
-        };
-        anyhow::ensure!(leaves <= 16, "Material shader tree exceeds 16 BSDF leaves");
-        Ok(leaves)
-    }
-    let mut max_closures = 1;
-    let mut shader_stack_size = 1;
-    for material in &scene.file.materials {
-        max_closures = max_closures.max(validate_shader_tree(
-            material,
-            0,
-            &mut shader_stack_size,
-            scene.file.aov_names.len(),
-        )?);
-    }
-    if let Some(volume) = &scene.file.world_volume {
-        anyhow::ensure!(
-            volume.phase <= 4 && volume.phase_params.iter().all(|v| v.is_finite()),
-            "Invalid world volume phase parameters"
-        );
-    }
-    fn shader_operations(material: &scene_format::PrincipledMaterial) -> u64 {
-        let mut flags = 0;
-        for graph in material
-            .shader_graph
-            .iter()
-            .chain(material.aov_graphs.iter().map(|a| &a.graph))
-        {
-            for node in &graph.nodes {
-                if let Some(index) = vibrt_nodes::shader::OPS
-                    .iter()
-                    .position(|(op, _)| *op == node.op)
-                {
-                    flags |= 1u64 << index;
-                }
-            }
-        }
-        if let Some(child) = &material.secondary {
-            flags |= shader_operations(child);
-        }
-        if let Some(child) = &material.left_subtree {
-            flags |= shader_operations(child);
-        }
-        flags
-    }
-    let shader_ops = scene
-        .file
-        .materials
-        .iter()
-        .fold(0, |mask, m| mask | shader_operations(m));
-    fn extended_requirements(m: &scene_format::PrincipledMaterial) -> Result<(u32, usize)> {
-        anyhow::ensure!(
-            m.closure_type <= 7 && m.closure_type != 6,
-            "Unsupported closure type {}",
-            m.closure_type
-        );
-        let mut kinds = if m.closure_type == 0 {
-            0
-        } else {
-            1 << m.closure_type
-        };
-        let mut outputs = 32;
-        for graph in m
-            .shader_graph
-            .iter()
-            .chain(m.aov_graphs.iter().map(|a| &a.graph))
-        {
-            if graph
-                .outputs
-                .keys()
-                .any(|name| vibrt_nodes::shader::OUTPUTS[32..].contains(&name.as_str()))
-            {
-                outputs = 64;
-            }
-        }
-        for child in [&m.left_subtree, &m.secondary].into_iter().flatten() {
-            let (child_kinds, child_outputs) = extended_requirements(child)?;
-            kinds |= child_kinds;
-            outputs = outputs.max(child_outputs);
-        }
-        Ok((kinds, outputs))
-    }
-    let (mut closure_types, mut shader_output_count) = (0, 32);
-    for m in &scene.file.materials {
-        let (kinds, outputs) = extended_requirements(m)?;
-        closure_types |= kinds;
-        shader_output_count = shader_output_count.max(outputs);
-    }
-    // Bucket capacities to keep a small set of cached kernels across scene edits.
-    let scene_queries = shader_ops & (7u64 << 41) != 0 || closure_types & (1 << 7) != 0;
-    fn extended_volume(m: &scene_format::PrincipledMaterial) -> bool {
-        m.volume.as_ref().is_some_and(|v| v.phase != 0)
-            || [&m.left_subtree, &m.secondary]
-                .into_iter()
-                .flatten()
-                .any(|m| extended_volume(m))
-    }
-    let extended_phases = scene
-        .file
-        .world_volume
-        .as_ref()
-        .is_some_and(|v| v.phase != 0)
-        || scene.file.materials.iter().any(extended_volume);
-    let ptx_src = pipeline::compile_ptx(
-        shader_ops,
-        max_closures,
-        shader_stack_size.max(4).next_power_of_two(),
-        closure_types,
-        shader_output_count,
-        !scene.file.aov_names.is_empty(),
-        extended_phases,
+    let requirements = crate::shader_compile::ShaderRequirements::new(
+        &scene.file.materials,
+        scene.file.aov_names.len(),
+        scene.file.world_volume.as_ref(),
     )?;
-    let ptx_time = t_ptx.elapsed();
-    let t_pipeline = std::time::Instant::now();
-
-    // --- Pipeline ---
-    let pipeline_options = PipelineCompileOptions::new("params")
-        .traversable_graph_flags(TraversableGraphFlags::ALLOW_SINGLE_LEVEL_INSTANCING)
-        .num_payload_values(2)
-        .num_attribute_values(2)
-        .uses_primitive_type_flags(PrimitiveTypeFlags::TRIANGLE);
-
-    let module_opts = ModuleCompileOptions::default();
-    let module = Module::new(&ctx, &module_opts, &pipeline_options, ptx_src.as_bytes())
-        .context("module")?
-        .value;
-
-    let raygen_pg = ProgramGroup::raygen(&ctx, &module, "__raygen__rg")
-        .context("raygen")?
-        .value;
-    let miss_rg_pg = ProgramGroup::miss(&ctx, &module, "__miss__ms")
-        .context("miss radiance")?
-        .value;
-    let miss_shadow_pg = ProgramGroup::miss(&ctx, &module, "__miss__shadow")
-        .context("miss shadow")?
-        .value;
-    let hit_rg_pg = ProgramGroup::hitgroup(&ctx)
-        .closest_hit(&module, "__closesthit__ch")
-        .any_hit(&module, "__anyhit__ah")
-        .build()
-        .context("hitgroup radiance")?
-        .value;
-    let hit_shadow_pg = ProgramGroup::hitgroup(&ctx)
-        .closest_hit(&module, "__closesthit__shadow")
-        .any_hit(&module, "__anyhit__ah")
-        .build()
-        .context("hitgroup shadow")?
-        .value;
-    let all_pgs: Vec<&ProgramGroup> = vec![
-        &raygen_pg,
-        &miss_rg_pg,
-        &miss_shadow_pg,
-        &hit_rg_pg,
-        &hit_shadow_pg,
-    ];
-    let pipeline = Pipeline::new(
-        &ctx,
-        &pipeline_options,
-        &PipelineLinkOptions { max_trace_depth: 2 },
-        &all_pgs,
-    )
-    .context("pipeline")?
-    .value;
-    // Node graphs and closure trees change stack use; query the compiled programs.
-    pipeline.set_stack_size_for_programs(&all_pgs, 2, 2)?;
-    let pipeline_time = t_pipeline.elapsed();
+    let scene_queries = requirements.scene_queries();
+    let shaders = crate::shader_compile::compile(&ctx, requirements, progress)?;
+    let pipeline = &shaders.pipeline;
+    let raygen_pg = &shaders.raygen;
+    let miss_rg_pg = &shaders.miss_radiance;
+    let miss_shadow_pg = &shaders.miss_shadow;
+    let hit_rg_pg = &shaders.hit_radiance;
+    let hit_shadow_pg = &shaders.hit_shadow;
+    let ptx_time = shaders.ptx_time;
+    let pipeline_time = shaders.pipeline_time;
     let t_scene_upload = std::time::Instant::now();
 
     // --- Upload textures (shared across materials) ---
@@ -944,8 +751,8 @@ pub fn render_to_pixels(
                 _pad: 0,
             });
         }
-        tri_hg_records.push(SbtRecord::new(&hit_rg_pg, hg)?);
-        tri_hg_records.push(SbtRecord::new(&hit_shadow_pg, hg)?);
+        tri_hg_records.push(SbtRecord::new(hit_rg_pg, hg)?);
+        tri_hg_records.push(SbtRecord::new(hit_shadow_pg, hg)?);
         gas_entries.push(GasEntry {
             handle: m.handle,
             sbt_offset: (obj_idx as u32) * 2,
@@ -1012,9 +819,9 @@ pub fn render_to_pixels(
     _buffers.push(d_output);
 
     // --- SBT ---
-    let raygen_record = SbtRecord::new(&raygen_pg, RayGenData {})?;
-    let miss_rg_record = SbtRecord::new(&miss_rg_pg, MissData { _unused: 0 })?;
-    let miss_shadow_record = SbtRecord::new(&miss_shadow_pg, MissData { _unused: 0 })?;
+    let raygen_record = SbtRecord::new(raygen_pg, RayGenData {})?;
+    let miss_rg_record = SbtRecord::new(miss_rg_pg, MissData { _unused: 0 })?;
+    let miss_shadow_record = SbtRecord::new(miss_shadow_pg, MissData { _unused: 0 })?;
 
     let d_rg = uploads.copy(&raygen_record)?;
     let mut miss_bytes: Vec<u8> = Vec::new();

@@ -15,6 +15,7 @@ mod query_bvh;
 pub mod render;
 pub mod scene_format;
 pub mod scene_loader;
+pub mod shader_compile;
 pub use vibrt_nodes::sky;
 pub mod transform;
 

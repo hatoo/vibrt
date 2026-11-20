@@ -3007,11 +3007,22 @@ def export_scene_to_memory(
     )
 
 
+def export_shader_scene(depsgraph):
+    """Use the render exporter to collect shader variants, without mesh/sky export.
+
+    Material conversion can still read images for legacy conversions; none of
+    their pixel buffers are passed to the compiler or uploaded to the GPU.
+    """
+    return _export_into(depsgraph, BinWriter(), None, shaders_only=True)
+
+
 def _export_into(
     depsgraph: bpy.types.Depsgraph,
     writer: "BinWriter",
     texture_pct: int | None,
     prepare_world=None,
+    *,
+    shaders_only=False,
 ) -> dict:
     """Drive the export, writing blobs through `writer`. Returns the
     JSON-serialisable scene dict.
@@ -3181,6 +3192,8 @@ def _export_into(
                 else:
                     obj_eval = obj.evaluated_get(depsgraph)
 
+                if shaders_only and obj_eval.type != "MESH":
+                    continue
                 if obj_eval.type == "MESH":
                     slot_mat_ids: list[int] = []
                     vc_attr_name: str | None = None
@@ -3201,6 +3214,8 @@ def _export_into(
                                     uv_map_name = uv
                     if not slot_mat_ids:
                         slot_mat_ids = [resolve_material(None)]
+                    if shaders_only:
+                        continue
 
                     # Lamp-Output emissive mesh carrying an IES profile
                     # (ies_light's red `Mesh`): promote the quad to an IES
@@ -3476,6 +3491,12 @@ def _export_into(
             depsgraph_iter_s = max(0.0, loop_total_s - iter_body_s)
             t_post = time.perf_counter()
 
+            if shaders_only:
+                return {
+                    "materials": materials,
+                    "aov_names": [a.name for a in bpy.context.view_layer.aovs if a.is_valid],
+                    "world_volume": _export_world_volume(scene.world),
+                }
             if cam_obj is None and scene.camera is not None:
                 cam_obj = scene.camera.evaluated_get(depsgraph)
             if cam_obj is None:
