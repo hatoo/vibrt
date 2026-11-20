@@ -60,8 +60,8 @@ extension, `scripts/test_native_sky.py` checks the sky models against Cycles,
 and `scripts/test_render_job.py -- --expect-sky --expect-native-sky
 --expect-progress` exercises F12 in a separate foreground-capable Blender.
 
-`scripts/test_shader_nodes.py` compares 315 numerical cases against Cycles and
-CUDA in one atlas. `scripts/test_shader_graphs.py` exercises 48 cases: images, named UVs,
+`scripts/test_shader_nodes.py` compares numerical node cases against Cycles and
+CUDA in one atlas. `scripts/test_shader_graphs.py` exercises images, named UVs,
 vertex alpha, object attributes, normal maps, group instance defaults and
 Mix/Add closures against Cycles. Run these through Blender with
 `-b --factory-startup --python-exit-code 1 --python SCRIPT`.

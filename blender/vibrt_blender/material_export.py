@@ -1,8 +1,8 @@
-"""Map Blender shader graphs to vibrt's Principled material JSON.
+"""Translate Blender shader graphs into vibrt materials and shared buffers.
 
-Supports common non-Principled patterns used by legacy Cycles scenes:
-Diffuse, Glossy, Diffuse+Glossy Mix, Glass, Emission, and Group nodes.
-All collapsed onto the renderer's Principled-only parameter set.
+The general shader compiler emits typed GPU graphs and Mix/Add closure trees.
+Legacy conversion remains a fallback, using material parameters, color graphs,
+and texture baking where supported. See docs/shader-nodes.md for limitations.
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ _CURRENT_MATERIAL: str = ""
 
 
 # Phase timing accumulators — populated by the hot paths in this module and
-# drained by exporter.py after each `export_scene` call. Self-times subtract
+# drained by exporter.py after each export. Self-times subtract
 # nested child timings so the breakdown in the summary log is additive.
 _STATS: dict = {
     "material_self_s": 0.0,
@@ -180,7 +180,7 @@ def _follow_reroutes(sock):
 
 # Integer percentage applied to final-written texture dimensions, or None/100
 # for no-op. Intermediate caches (linear RGB, mean RGBA, premix) still operate
-# at full resolution; the downsample only affects what lands in scene.bin.
+# at full resolution; the downsample affects the exported texture buffers.
 _TEXTURE_PCT = None
 
 
@@ -196,7 +196,7 @@ def end_export() -> None:
 
 
 class _PreBakedTexture:
-    """A synthetic, fully-resolved linear RGB texture produced offline (e.g. by
+    """A synthetic linear RGB texture produced during legacy export (e.g. by
     pre-mixing the two sides of a two-texture Mix node).
 
     Carries `rgb` as a numpy (h, w, 3) float32 array and a `cache_key` so the
@@ -218,7 +218,7 @@ def export_image_texture(
     colorspace: str | None = None,
     chain: tuple = (),
 ) -> int:
-    """Serialize an image into scene.bin and register a TextureDesc entry.
+    """Retain an image's float32 pixel buffer and register its TextureDesc.
 
     Accepts either a `bpy.types.Image` (chain transforms baked into its pixels)
     or a `_PreBakedTexture` (already in linear space; chain is applied on top of
@@ -277,9 +277,7 @@ def export_image_texture(
         "channels": 4,
         "colorspace": colorspace,
         "_key": key,
-        # `write_texture_pixels` either returns `{"pixels": BlobRef}` (disk
-        # mode) or `{"array_index": i}` (in-process FFI mode). Spread it
-        # so the right field lands on the TextureDesc.
+        # Add the index into the writer's separate texture-array list.
         **writer.write_texture_pixels(pixels),
     }
     textures.append(desc)
@@ -463,7 +461,7 @@ def _bake_chain(pixels, w, h, colorspace, chain):
         for _id, apply_fn in chain:
             rgb = apply_fn(rgb)
         arr[..., :3] = rgb
-        # Return numpy directly — _pack_f32 handles it without a list round-trip.
+        # The writer accepts NumPy arrays directly, without a list round-trip.
         return arr.reshape(-1), "linear"
     finally:
         _STATS["bake_chain_s"] += time.perf_counter() - t_enter
@@ -2580,16 +2578,13 @@ def _tex_node_uv_transform(tex_node) -> list[float]:
 
 
 def _try_emit_color_graph(sock, writer, textures, group_stack=None, vc_attrs=None) -> dict | None:
-    """Walk the shader graph feeding `sock` and emit a `color_graph` dict that
-    the GPU evaluator can run per-pixel. Returns None if the graph uses a
-    node we can't yet translate (ShaderNodeValToRGB, ShaderNodeTexNoise, ...);
-    callers fall back to the existing bake path in that case.
+    """Emit the legacy color-only GPU graph for the socket feeding `sock`.
 
-    Only handles a focused subset today — ImageTex, Mix, Invert, Math,
-    HueSat (treated as pass-through until HSV lands on the GPU), plus
-    constant-RGB leaves. classroom's paintedCeiling comes out as a 7-node
-    graph that mirrors the Cycles shader exactly except for the HSV
-    saturation bump.
+    Supports images, Mix, Invert, selected Math operations, Hue/Saturation,
+    RGB Curves, Bright/Contrast, vertex colors, object random, and constants.
+    ColorRamp handles constant or uniform-random factors here. Unsupported
+    inputs return None so callers can try baking. These restrictions belong
+    to this fallback; shader_graph.py compiles the broader typed shader DAG.
 
     `vc_attrs`, when provided, is a list populated with the vertex colour
     attribute names referenced by emitted `vertex_color` nodes. Callers use
@@ -2659,11 +2654,8 @@ def _try_emit_color_graph(sock, writer, textures, group_stack=None, vc_attrs=Non
             if fac_sock.is_linked:
                 # Prefer a real per-pixel node so the factor can vary with
                 # texture content. Fall back to host-side constant folding
-                # so chains like `ObjectInfo.Random → Math(GREATER_THAN, …)`
-                # (unsupported by the graph evaluator) collapse to the
-                # representative constant instead of dropping the whole
-                # graph — classroom's schoolDesk_wood picks its texture
-                # variant this way.
+                # when this legacy graph cannot represent the factor chain,
+                # instead of dropping the whole graph.
                 fi = emit(fac_sock)
                 if fi is not None:
                     fac_spec: float | dict = {"node": fi}
@@ -2835,8 +2827,8 @@ def _try_emit_color_graph(sock, writer, textures, group_stack=None, vc_attrs=Non
         if bl == "ShaderNodeAttribute":
             # Per-vertex colour attribute feeding the chain (classroom's
             # schoolDesk_wood OVERLAY-mixes a per-instance tint this way).
-            # Only GEOMETRY-type attributes are real vertex data — Cycles'
-            # Instancer / Object attributes don't map to anything we ship.
+            # This legacy graph reads one geometry color layer. Object and
+            # instancer attributes are handled by the general shader compiler.
             attr_type = getattr(src, "attribute_type", "GEOMETRY")
             if attr_type != "GEOMETRY":
                 return None
@@ -2881,13 +2873,9 @@ def _try_emit_color_graph(sock, writer, textures, group_stack=None, vc_attrs=Non
             return idx
 
         if bl == "ShaderNodeValToRGB":
-            # ColorRamp: scalar in, RGB out. We fold it to a Const node when
-            # the Fac chain reduces to a constant (noise / procedural leaves
-            # fold to their mean, Math/Clamp fold through
-            # `_resolve_constant_scalar`, Mix(RGBA) folds through
-            # `_socket_constant_rgb`). Non-foldable inputs (live textures
-            # driving the ramp) would need a per-pixel LUT eval node,
-            # deferred until the GPU grows one.
+            # This legacy exporter emits a LUT for uniform random below,
+            # otherwise folds Fac to a constant when possible. General live
+            # ColorRamp inputs are supported by shader_graph.py.
             in_sock = src.inputs.get("Fac")
             if in_sock is None:
                 return None
@@ -2989,7 +2977,7 @@ def _normal_perturbation(normal_sock):
     if src.bl_idname in ("ShaderNodeMix", "ShaderNodeMixRGB"):
         # `Mix(NormalMap, NormalMap)` / `Mix(NormalMap, Bump)` is the typical
         # "blend two perturbations" idiom (lone_monk's leather book covers).
-        # The kernel only carries one normal/bump texture per material, so
+        # The legacy material path has one normal/bump texture slot, so
         # we walk both Mix branches and pick the side whose `fac` weight is
         # higher — falling back to A when fac == 0.5. Strength is scaled by
         # the chosen Mix factor so a lightly-blended detail bump fades.

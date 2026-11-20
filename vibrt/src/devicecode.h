@@ -394,10 +394,10 @@ struct LaunchParams {
   float *ggx_e_avg_lut;
   float *ggx_b_lut;
 
-  // Clamp for indirect (bounce>=1) contributions. <=0 disables.
+  // Clamp indirect (bounce>=1) contributions by |R|+|G|+|B|. <=0 disables.
   float clamp_indirect;
-  // Clamp for direct (NEE on the camera ray's first surface). Mirrors
-  // Cycles' `sample_clamp_direct`. <=0 disables.
+  // Clamp direct NEE on the first surface by |R|+|G|+|B|. Mirrors Cycles'
+  // `sample_clamp_direct`. <=0 disables.
   float clamp_direct;
   // Cycles' Light Paths > Filter Glossy. Used by trace_path to track a
   // per-path minimum BSDF α that grows after each glossy / transmission

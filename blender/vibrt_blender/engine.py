@@ -2,10 +2,9 @@
 
 Uses the bundled `vibrt_native.pyd` PyO3 extension exclusively — there's
 no subprocess fallback. If the extension isn't importable the addon
-errors out at render time with instructions on how to build it. Subprocess
-rendering through the standalone `vibrt.exe` binary is still available
-for CLI tooling (`scripts/render_blend.py`, `make <scene>-preview`) but
-is not used by the addon itself.
+errors out at render time with instructions on how to build it. Command-line
+helpers (`scripts/render_blend.py`, `make <scene>-preview`) launch headless
+Blender and invoke this engine through the same in-process extension.
 """
 
 from __future__ import annotations

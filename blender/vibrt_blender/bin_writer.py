@@ -1,19 +1,11 @@
 """Per-blob writer for the in-process FFI export path.
 
-There is no longer a "bin" — the previous version concatenated every
-blob into one giant `bytearray` and returned `{"offset", "len"}`
-references. That forced Python to grow a single buffer through log-N
-reallocs (with all the memoryview-pinning gymnastics that implies) and
-forced Rust to resolve each blob against the same byte slice with
-`bytemuck::cast_slice`. Both are unnecessary: each blob is independently
-usable.
-
 `write_f32` / `write_u32` append a contiguous numpy array to
-`mesh_blobs` and return `{"array_index": i}`. The Rust loader picks the
-slice by index. `write_texture_pixels` does the same for f32 RGBA
-texture data, but parks into a separate list (`texture_arrays`) because
-Rust receives them as a typed `Vec<PyBuffer<f32>>` for the GPU upload
-path.
+`mesh_blobs` and return a plain integer index. The Rust loader reinterprets
+each blob as f32 or u32 according to the scene field. `write_texture_pixels`
+stores f32 RGBA data in a separate `texture_arrays` list and returns
+`{"array_index": i}` for the texture descriptor. The writer retains these
+arrays so the native binding can borrow them for the duration of rendering.
 
 This module has no bpy imports, so tests can import and exercise it
 under plain CPython (see `test_bin_writer.py`).

@@ -1,12 +1,9 @@
-//! GPU render pipeline: CUDA + OptiX setup, per-scene uploads, kernel launch,
-//! optional denoise, readback. Returns pixels rather than writing to disk so
-//! both the CLI binary and the in-process Python path can share it.
+//! GPU render pipeline: CUDA + OptiX setup, per-scene uploads, one-sample
+//! launches, optional denoising, and readback of color, depth, and AOVs.
 //!
-//! The body here is the verbatim split-out of what used to be `render()` in
-//! `main.rs`; the only behavioural changes are (1) progress text routes
-//! through the `Progress` trait so callers can capture it (Blender's status
-//! bar, CLI stdout, ...), and (2) the function returns `RenderOutput` instead
-//! of saving an image — `image_io::save_image` is now the CLI's job.
+//! `Progress` provides logging, cancellation, and optional preview snapshots.
+//! Final buffers are returned to the caller; Blender handles display, color
+//! management, and file output.
 
 use crate::gpu_types::*;
 use crate::scene_format;
@@ -21,8 +18,8 @@ use optix::*;
 use std::mem;
 use std::sync::Arc;
 
-/// Per-render knobs supplied by the CLI / Python wrapper. `None` fields use
-/// whatever the scene file specified; `denoise` is a flag (always known).
+/// Per-render overrides supplied by the caller. `None` fields use the scene's
+/// render settings, except for the preview cadence documented below.
 #[derive(Default, Clone, Copy)]
 pub struct RenderOptions {
     pub spp: Option<u32>,
@@ -36,12 +33,11 @@ pub struct RenderOptions {
     pub preview_interval_ms: Option<u64>,
 }
 
-/// Final rendered RGBA buffer plus the dimensions the caller can save / hand
-/// to numpy.
+/// Final color, depth, and named AOV buffers with their image dimensions.
 pub struct RenderOutput {
     pub aovs: std::collections::BTreeMap<String, Vec<f32>>,
-    /// width × height × 4 floats, top-left origin (Blender convention; vibrt
-    /// has always written its PNGs / EXRs assuming this layout).
+    /// width × height × 4 floats, bottom-left origin, matching Blender's
+    /// RenderResult pixel order. RGB is linear; the fourth channel is alpha.
     pub pixels: Vec<f32>,
     /// width × height single-channel primary-ray hit distance from the
     /// camera, in metres. Misses store `cam_clip_end`. Drives the addon's
@@ -73,7 +69,7 @@ pub trait Progress {
     }
 }
 
-/// Default `Progress` impl for the CLI: lines go to stdout, no cancellation.
+/// Log to stdout without cancellation or intermediate image readback.
 pub struct StdoutProgress;
 impl Progress for StdoutProgress {
     fn log(&mut self, msg: &str) {
@@ -219,11 +215,11 @@ fn build_rect_light_cdf(rects: &[AreaRectLight]) -> Vec<f32> {
     cdf
 }
 
-/// Render `scene` to an in-memory RGBA buffer.
+/// Render `scene` to in-memory color, depth, and AOV buffers.
 ///
-/// Applies any non-`None` overrides from `opts` to the scene's render block,
-/// then runs the same pipeline today's `render()` does — minus the final
-/// `image_io::save_image` call, which is the CLI's responsibility now.
+/// Applies `opts` without mutating the caller's scene. Each launch completes
+/// one sample, including when previews are disabled; optional denoising runs
+/// after sampling, before the final readback.
 pub fn render_to_pixels(
     scene: &LoadedScene,
     opts: &RenderOptions,

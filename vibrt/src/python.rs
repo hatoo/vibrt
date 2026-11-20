@@ -1,12 +1,13 @@
 //! PyO3 bindings — gated by the `python` Cargo feature.
 //!
 //! Exposes `render(scene_json, mesh_blobs, opts, log_cb=None,
-//! cancel_cb=None, texture_arrays=None)` plus native scene-sync helpers.
+//! cancel_cb=None, texture_arrays=None, preview_cb=None, aov_outputs=None)`
+//! plus shader precompilation, node evaluation, and native scene-sync helpers.
 //! The scene description is read directly from a Python dict; the legacy
 //! JSON string is also accepted. Two buffer-protocol-pinned array lists
 //! carry the large payloads (mesh blobs as
-//! bytes, texture pixels as f32) — never copied; Rust borrows for the
-//! duration of the call.
+//! bytes, texture pixels as f32). The binding borrows them for the call;
+//! scene conversion and GPU uploads allocate as needed.
 //!
 //! All CUDA / OptiX work happens inside `py.allow_threads(...)` so the GIL
 //! is released for the entire render. Progress callbacks reacquire the GIL
@@ -22,7 +23,8 @@ use pyo3::types::{PyDict, PyString};
 
 /// `Progress` impl backed by Python callables. Logs go through `log_cb`
 /// (called as `log_cb(msg: str)`) and cancellation polls `cancel_cb` (called
-/// as `cancel_cb() -> bool`). Both callbacks are optional.
+/// as `cancel_cb() -> bool`). `preview_cb(pixels, completed, total)` receives
+/// owned image snapshots. All callbacks are optional.
 struct PyProgress {
     log_cb: Option<PyObject>,
     cancel_cb: Option<PyObject>,
@@ -124,7 +126,7 @@ fn parse_options(opts: &Bound<'_, PyDict>) -> PyResult<RenderOptions> {
 
 /// Render an in-memory scene and return a `(pixels, depth)` tuple where
 /// `pixels` is a `(height, width, 4)` float32 numpy array (linear RGBA,
-/// top-left origin) and `depth` is a `(height, width)` float32 array of
+/// bottom-left origin) and `depth` is a `(height, width)` float32 array of
 /// per-pixel primary-ray hit distance from the camera (metres; misses
 /// store the camera's `clip_end`). The addon turns `depth` into Mist /
 /// Z passes so Cycles-authored compositors run on top of vibrt's output.
@@ -138,6 +140,9 @@ fn parse_options(opts: &Bound<'_, PyDict>) -> PyResult<RenderOptions> {
 /// `texture_arrays` is the parallel list for `TextureDesc.array_index` —
 /// kept separate because Rust takes texture data as typed
 /// `Vec<PyBuffer<f32>>` for the GPU upload path.
+/// `preview_cb(pixels, completed, total)` receives owned snapshots during
+/// sampling. When supplied, `aov_outputs` is filled with named float32 arrays
+/// after rendering; the return value remains the `(pixels, depth)` tuple.
 #[pyfunction]
 #[pyo3(signature = (
     scene_json, mesh_blobs, opts, log_cb = None, cancel_cb = None,

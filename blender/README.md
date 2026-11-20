@@ -37,7 +37,9 @@ for shipping the source layout.
 
 2. Add geometry, lights (Point, Sun, Spot, or Area), and a camera.
 
-3. Assign materials using the **Principled BSDF** shader.
+3. Assign materials using supported shader nodes, including **Principled BSDF**
+   and **Mix/Add Shader**. Consult the [support matrix](../docs/shader-nodes.md)
+   for node-specific limitations.
 
 4. Optionally set a World background with an **Environment Texture** (HDRI)
    or **Sky Texture**.
@@ -46,8 +48,8 @@ for shipping the source layout.
 
 6. Press `F12` (or `Render > Render Image`). The addon hands the
    evaluated scene directly to `vibrt_native.render(...)` in the same
-   process and copies the resulting RGBA float buffer
-   into Blender's Combined pass.
+   process and writes color, depth and named AOV buffers into Blender's
+   render passes.
 
 The first completed sample is displayed immediately. Further samples
 accumulate on the GPU, and Render Result and the sample counter update up to
@@ -70,10 +72,10 @@ Building the native extension now also requires a C++17 compiler; bundled
 model sources and license notices are described in
 [`vibrt-nodes/third_party/sky`](../vibrt-nodes/third_party/sky/README.md).
 
-Sky and color/math calculations live in the independent
+Sky and shader-node calculations live in the independent
 [`vibrt-nodes`](../vibrt-nodes/README.md) crate. Python reads Blender nodes and
 tables, while native CPU batches and the CUDA graph interpreter share the
-color implementation. `cargo test -p vibrt-nodes` tests this core without
+node implementations. `cargo test -p vibrt-nodes` tests this core without
 Blender or CUDA. The Python binding tests require a staged native extension.
 
 For regression checks, run `make test` with a POSIX shell, then:
@@ -92,10 +94,13 @@ procedural sky or portal lighting. Add `--expect-native-sky` to assert that a
 supported sky never starts a Cycles worker. The native-sky test compares sky
 models, sun discs, color processing and camera-ray splits against Cycles.
 
-The progressive GPU test checks identical results to a single launch,
+The progressive GPU test compares preview-enabled and preview-disabled renders,
 normalization of the first sample, final denoising, snapshot lifetime,
 cancellation, and callback errors. The render-job test inspects actual Blender
 passes while F12 is still running.
+
+Both modes launch one sample at a time. Omitting a preview callback avoids
+intermediate pixel readback; it does not combine samples into one launch.
 
 ## Supported features
 
@@ -122,6 +127,10 @@ on borrowed image arrays. Material graph translation and image pixel retrieval
 still use Blender's Python API; this is not a complete port of Cycles' shader
 synchronization. GPU uploads remain necessary.
 
+CPU texture buffers stay float32 RGBA. Before upload, redundant channels are
+removed losslessly to use L, LA, RGB or RGBA on the GPU; image dimensions and
+float32 values are preserved. This is separate from optional texture resizing.
+
 Direct mesh reads are enabled only for Blender 5.1, whose RNA layouts are
 verified against Blender's source. Other versions use `foreach_get`.
 Set `VIBRT_PYTHON_EXPORT=1` before launching Blender to compare the original
@@ -138,17 +147,17 @@ render-job check above after modifying the memory reader.
 
 ### Rendering
 
-- Camera: perspective only (no DoF yet).
+- Camera: perspective, lens shift, and circular-aperture depth of field.
 - Meshes: triangulated, per-corner normals and UVs, multi-material slots (per-triangle material index).
-- Materials: Principled BSDF — base color, metallic, roughness, IOR, transmission, emission, anisotropy (+ rotation), coat (weight / roughness / IOR), sheen (weight / roughness / tint), subsurface (weight / radius / anisotropy), alpha cutout, normal map (with strength), bump, displacement. Image textures on base color / normal / roughness / metallic. Colour- and scalar-math node chains between TexImage and the BSDF are traversed; the effect of RGBCurve, Gamma, BrightContrast, Invert, HueSaturation, ColorRamp, Clamp and Mix/MixRGB (MIX / MULTIPLY / ADD / SUBTRACT, when the non-texture side is constant) is baked into the exported texture pixels. Other node effects are approximated by pass-through.
-- Lights: Point, Sun, Spot, Area (square/rectangle).
-- World: constant colour background or Environment Texture (importance-sampled).
+- Materials: linked Principled inputs, image/procedural textures, normal/bump mapping, displacement and Mix/Add closure trees. Supported graphs run on the GPU; legacy conversion may bake textures or approximate unsupported inputs. Standalone Chiang Hair and Burley Subsurface Scattering have dedicated closures; Principled SSS remains approximate.
+- Lights: Point, Sun, Spot, Area (square/rectangle), IES profiles, and emissive-mesh NEE.
+- World: constant background, importance-sampled Environment Texture, or supported native Sky Texture graphs; other world graphs use the isolated Cycles preparation path.
 - Volumes: homogeneous Principled / Absorption / Scatter (mesh-bounded and world-volume).
 - Transparent shadows through transmissive / alpha-cutout surfaces.
-- Output: linear float image loaded into Blender's image editor.
+- Output: linear Combined, depth/Mist and named Color/Value AOV passes; Blender manages display and file output.
 
 ## Not supported yet
 
 - Viewport IPR (live preview).
-- Depth of field, motion blur, heterogeneous volumes (OpenVDB).
-- Thin-film, true SSS (subsurface is currently diffuse-blend approximation).
+- Motion blur, heterogeneous volumes (OpenVDB), and modern Curves geometry.
+- Thin film, Huang Hair and random-walk SSS. See the support matrix for other partial node modes.

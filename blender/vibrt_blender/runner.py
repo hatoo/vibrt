@@ -1,8 +1,7 @@
 """Discover and invoke `vibrt_native` — the in-process PyO3 extension.
 
-The addon renders exclusively through the bundled `vibrt_native.pyd`. The
-standalone `vibrt.exe` binary still exists for CLI tooling but is not
-invoked from the addon itself.
+The addon renders through the bundled `vibrt_native` extension. Command-line
+helpers launch headless Blender and use this same in-process path.
 """
 
 from __future__ import annotations
@@ -34,7 +33,7 @@ def run_render_inproc(
     """Render a live scene dict (or legacy JSON) and borrowed pixel/mesh buffers.
 
     Returns a `(pixels, depth)` tuple where `pixels` is a
-    `(height, width, 4)` float32 ndarray (linear RGBA, top-left origin)
+    `(height, width, 4)` float32 ndarray (linear RGBA, bottom-left origin)
     and `depth` is a `(height, width)` float32 ndarray of per-pixel
     primary-ray hit distance from the camera, in metres (misses store
     the camera's `clip_end`). The addon turns `depth` into Mist / Z
@@ -44,10 +43,12 @@ def run_render_inproc(
 
     `mesh_blobs` is the per-blob byte-buffer list (mesh / index / vertex-
     color / colour-graph LUT data). Each entry is a numpy array; the Rust
-    side picks them by `MeshDesc.array_index` references in the JSON.
+    side indexes them via fields such as `MeshDesc.vertices` and `.indices`.
     `texture_arrays` is the parallel list for `TextureDesc.array_index`.
     `preview_cb(pixels, samples, total)` receives normalized, owned RGBA
-    snapshots while sampling. Omitting it keeps the single-launch path.
+    snapshots while sampling. Omitting it disables intermediate readback and
+    callbacks; both paths launch one sample at a time. If supplied,
+    `aov_outputs` receives the named final AOV arrays.
     """
     import numpy as np
     native = find_native_module()

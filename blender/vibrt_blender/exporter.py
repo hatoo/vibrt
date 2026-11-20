@@ -1,14 +1,13 @@
-"""Export the evaluated Blender scene to (json, bin, texture_arrays) for the
-in-process FFI render path.
+"""Export Blender's evaluated scene description and arrays for native rendering.
 
 Blender uses right-handed, Z-up, metres. vibrt uses the same, so no
-axis conversion is required — only matrix transposition (Blender matrices are
-column-major via mathutils, our JSON schema expects row-major 16-float arrays).
+axis conversion is required. Matrices are flattened by row into the schema's
+16-float arrays.
 
-The bin contains mesh / index / vertex-color / colour-graph LUT blobs.
-Texture pixels travel as a separate `list[ndarray]` and are referenced
-from `TextureDesc.array_index` in the JSON; they cross PyO3 as
-`Vec<PyBuffer<f32>>` instead of being concatenated into the bin.
+The addon normally passes a live scene dict; JSON serialization remains an
+option. Mesh / index / vertex-color / colour-graph LUT blobs are separate
+NumPy arrays referenced by integer indices. Texture pixels use a second
+array list, indexed by `TextureDesc.array_index`, and cross PyO3 as f32 buffers.
 """
 
 from __future__ import annotations
@@ -88,12 +87,10 @@ def _try_emissive_quad_as_rect_light(obj, obj_eval, mat_params):
     bodies whose silhouette matters.
 
     Pure emissive = emission > 0 with base_color ≈ 0, no transmission, no
-    textures/graphs tinting the lobes. vibrt only importance-samples light
-    objects; emissive-mesh surfaces are hit via BSDF sampling alone, so
-    small bright panels (BMW27's hood light, classroom blackboard lights)
-    under-contribute to indirect illumination. Converting them to
-    `area_rect` routes them through NEE, recovering the several-× drop in
-    ambient lift vs Cycles.
+    textures/graphs tinting the lobes. Ordinary emissive meshes already use
+    triangle-mesh NEE. This conversion serves the camera-hidden panel fallback
+    and Lamp Output/IES promotion; it approximates geometry rather than
+    enabling importance sampling for mesh emitters in general.
 
     The returned dict's `camera_visible` field mirrors Blender's
     Ray Visibility → Camera flag so that authored "invisible light panel"
@@ -2979,14 +2976,12 @@ def export_scene_to_memory(
     serialize: bool = True,
     prepare_world=None,
 ) -> tuple[str | dict, list, list]:
-    """Build (scene.json, mesh_blobs, texture_arrays) in RAM.
+    """Build (scene description, mesh_blobs, texture_arrays) in RAM.
 
     All three feed `vibrt_native.render` directly:
-    - `json_str`: the scene description (a live dict when serialize=False).
-      Rust reads that dict directly; JSON remains available for diagnostics.
-      Every BlobRef has been replaced
-      with an `array_index: u32` referencing the corresponding entry in
-      one of the two array lists.
+    - Scene description: a live dict when serialize=False (the native addon
+      path), otherwise JSON text. Mesh fields contain plain integer blob
+      indices; texture descriptors use `array_index` into the texture list.
     - `mesh_blobs`: contiguous numpy arrays for mesh / index / vertex-
       colour / colour-graph LUT data. Mixed dtypes (f32 / u32). PyO3
       borrows each via the buffer protocol; the Rust loader picks the
@@ -3082,16 +3077,13 @@ def _export_into(
     # Each entry is `{"object_idx": N}` referencing an object that's already
     # in `objects[]`; the loader walks that object's mesh + material slots,
     # finds triangles whose material has nonzero emission, and builds a
-    # per-light triangle table + CDF. Coexists with `lights_json`'s
-    # area_rect: meshes that can't be in the BLAS (camera-hidden emissive
-    # panels) still go through the rect-promotion fallback below.
+    # per-light triangle table + CDF. This coexists with area_rect lights;
+    # selected camera-hidden panels and IES emitters use rect promotion below.
     mesh_lights_json: list[dict] = []
 
-    # The reusable foreach_get buffer is now grown lazily on first use, so we
-    # no longer pre-walk `bpy.data.images`. That walk used to cost ~7 s on
-    # junk_shop because reading `img.size` materialises image headers from
-    # disk for every datablock — including unused ones (orphan textures,
-    # the Render Result / Viewer Node images Blender always keeps around).
+    # Read image metadata/pixels only when a material requests a texture.
+    # Pre-walking bpy.data.images can load headers for unused images too.
+    # Each exported texture owns its foreach_get buffer until rendering ends.
     t_alloc = time.perf_counter()
     material_export.begin_export(texture_pct=texture_pct)
     alloc_s += time.perf_counter() - t_alloc
@@ -3258,11 +3250,10 @@ def _export_into(
                         )
 
                     # Detect emissive material slots up front so we can route
-                    # the mesh through either the rect-promotion fallback (for
-                    # camera-hidden panels — they can't live in the BLAS or
-                    # they'd shadow other lights) or the mesh-light NEE path
-                    # (multi-material emissive meshes that the rect promotion
-                    # couldn't handle, plus mixed emissive+BSDF meshes).
+                    # the mesh through either rect promotion or mesh-light NEE.
+                    # Camera-hidden pure single quads retain actual geometry
+                    # with a visibility mask; other camera-hidden emitters use
+                    # the legacy rect fallback when they can be promoted.
                     #
                     # Both constant- and texture-emission materials are
                     # mesh-light NEE candidates: the loader stores per-tri

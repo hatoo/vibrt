@@ -11,8 +11,8 @@
 #   make addon                # blender/vibrt_blender.zip (Python only — won't render)
 #   make addon-with-native    # also build + bundle vibrt_native.pyd
 #   make dev-install          # build .pyd, stage, junction into Blender's user-addons
-#   make test                 # run pure-Python unit tests (color_fold, ...)
-#   make clean                # remove preview.png, addon zip, staged .pyd
+#   make test                 # check layouts, Rust node core, Python suites
+#   make clean                # remove previews, addon zip, staged extension
 #
 # Overridable:
 #   PYTHON  (default: py)
@@ -55,9 +55,9 @@ ADDON_SOURCES := $(wildcard blender/vibrt_blender/*.py)
 
 FORCE:
 
-# CPU node-core and Python tests (no Blender / CUDA required). Each Python file
-# runs as a standalone script; we glob the directory so adding a new
-# test_*.py picks it up automatically.
+# CPU node-core and Python tests (no Blender / GPU rendering required).
+# Python suites need NumPy; binding tests need a staged native extension.
+# Each test_*.py runs as a standalone script. The loop requires a POSIX shell.
 test: check-layouts test-nodes
 	@for f in blender/vibrt_blender/test_*.py; do \
 		echo "=== $$f ==="; \
@@ -68,16 +68,15 @@ test: check-layouts test-nodes
 test-nodes:
 	cargo test -p vibrt-nodes
 
-# Sanity-check that every #[repr(C)] struct in vibrt/src/gpu_types.rs
-# matches its declaration in vibrt/src/devicecode.h field-for-field.
+# Check shared renderer and vibrt-nodes C/Rust structs field-for-field.
 # Catches the silent depth_aov<->world_volume class of bug.
 check-layouts:
 	$(PYTHON) scripts/check_struct_layouts.py
 
 # Build the PyO3 extension and stage it next to the addon source. Cargo is
-# incremental, so this is a no-op when nothing changed. `make dev-install`
+# incremental, so unchanged native sources need no recompilation. `make dev-install`
 # does the full pipeline (build + stage + junction); this target is the
-# build-only step the preview rules depend on.
+# build-and-stage step the preview rules depend on.
 native-build:
 	$(PYTHON) blender/build_addon.py --with-native --stage-only
 

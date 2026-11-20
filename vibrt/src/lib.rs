@@ -1,7 +1,8 @@
 //! In-process Rust API for the vibrt renderer.
 //!
-//! The Blender addon is the only consumer: it links this library via PyO3
-//! (under the `python` feature) and hands scene buffers to Rust in-memory.
+//! The Blender addon loads this library via PyO3 (under the `python` feature)
+//! and hands scene buffers to Rust in-memory. Rust callers can also use the
+//! public scene-loading and rendering APIs directly.
 //! There is no standalone CLI binary — the disk-loading path was removed
 //! along with the addon's subprocess fallback.
 

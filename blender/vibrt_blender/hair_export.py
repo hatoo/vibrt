@@ -3,22 +3,19 @@
 Cycles renders hair as curve primitives. vibrt currently has only triangle
 support, so each strand is converted to a ribbon: a chain of quads, two
 triangles each, with width tapering from `root_radius` to `tip_radius`. We
-emit a per-vertex tangent (strand axis) so the kernel's Kajiya-Kay lobe
-reads the correct anisotropy direction — closesthit interpolates the
-tangent and eval_material substitutes it for the synthetic build_frame()
-tangent.
+emit strand tangents and Hair Info attributes for the legacy and Chiang hair
+closures. Strands with matching key counts are tessellated in bounded NumPy
+batches; only the final geometry arrays survive export.
 
 Limitations vs Cycles:
-- Children: Python only sees parent strands via
-  `ParticleSystem.particles[i].hair_keys`. The render-time children that
-  Cycles computes inside the modifier (clumping / curl / curve curves)
-  aren't queryable, so we approximate "Simple" children: each parent is
+- Children: the exporter reads parent strands via
+  `ParticleSystem.particles[i].hair_keys` and approximates "Simple" children.
+  It does not reproduce Cycles' evaluated child paths: each parent is
   duplicated `rendered_child_count` times with a random in-plane offset
   within `child_radius` at the root. No clumping or curl.
-- Ribbon plane: we pick a per-strand random axis perpendicular to the root
-  tangent and parallel-transport it along the strand. Cycles orients
-  ribbons toward the camera; without a camera at export time, a fixed
-  per-strand plane is the closest stable substitute.
+- Ribbon plane: a per-strand random axis is parallel-transported from the
+  root tangent. The ribbon does not rotate toward the camera at render time.
+- Modern Curves objects are not exported by this particle-system path.
 """
 
 from __future__ import annotations
@@ -349,7 +346,7 @@ def export_hair(
     writer
         BinWriter used to stream geometry blobs.
     resolve_material
-        `exporter.export_scene.resolve_material` closure — assigns / dedupes
+        The exporter's `resolve_material` closure — assigns / dedupes
         a material id for the hair material picked from the host object.
     log_tag
         Short label (object name) used in warnings.
@@ -369,8 +366,8 @@ def export_hair(
     # each particle with a separate mesh instance (lone_monk's grass /
     # bushes use COLLECTION → `grass blades` / `leaves bush` source
     # meshes), and turning those into 4 m vertical ribbons fills the
-    # courtyard with stretched leaf cards. Until proper instancing is
-    # in place, skip the system rather than mis-rendering it.
+    # courtyard with stretched leaf cards. Skip ribbon tessellation for
+    # these systems; mesh instances are visited by the main depsgraph exporter.
     instancing_psys = [
         ps for ps in hair_psys
         if ps.settings.render_type in ("OBJECT", "COLLECTION")

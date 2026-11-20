@@ -309,7 +309,7 @@ static __forceinline__ __device__ float3 f_avg_schlick(float3 F0) {
          make_float3(1.0f / 21.0f, 1.0f / 21.0f, 1.0f / 21.0f);
 }
 
-// ---------- Volumes (homogeneous, Henyey-Greenstein phase) ----------
+// ---------- Homogeneous volumes and phase functions ----------
 
 // Maximum nesting depth for mesh-bounded volumes within a single ray. Four is
 // generous: real scenes top out at "two overlapping volumes" (e.g. a fog cube
@@ -2757,16 +2757,15 @@ static __device__ __noinline__ float3 direct_light(const MaterialEvalGroup &e, f
 }
 
 // In-scatter NEE for volume scatter events. Same lights as `direct_light`
-// but the BSDF role is played by the HG phase function and there's no
+// but the BSDF role is played by the volume's phase function and there's no
 // `MaterialEval` — the scatter point is in free space inside `vol`.
 //
 // `wi_world` is the incoming ray direction (so wo_world = -wi_world is the
 // "outgoing" direction back toward the scatter event's predecessor); the
 // phase function depends on the angle between wi_world and the chosen
-// shadow direction. PDFs aren't MIS-weighted against phase sampling here —
-// volume MIS only matters at scatter events that are followed by another
-// MIS-able interaction, and one-sample importance sampling of the lights
-// is already a substantial improvement over BSDF-only.
+// shadow direction. Environment NEE uses MIS against phase sampling, paired
+// with the miss-path weight. The explicit-light and mesh-light blocks below
+// do not apply that phase-sampling MIS weight.
 static __device__ __noinline__ float3 direct_light_volume(float3 P, float3 wi_world,
                                               const Volume *vol,
                                               const VolumeStack &vstack,
@@ -2870,10 +2869,8 @@ static __device__ __noinline__ float3 direct_light_volume(float3 P, float3 wi_wo
     }
   }
   // Mesh lights — same two-stage CDF as the surface NEE block, contribution
-  // routed through `add` (phase function in place of BSDF eval). No MIS
-  // on the volume in-scatter path: phase sampling + light NEE for volumes
-  // is one-sample importance sampling (matches the rect-light + envmap
-  // volume blocks above), so the BSDF-side weight gate doesn't apply.
+  // routed through `add` (phase function in place of BSDF eval). This block
+  // does not apply the phase-sampling MIS used by environment NEE below.
   if (params.num_mesh_lights > 0) {
     float u = rng.next();
     int mli = cdf_search(params.mesh_light_cdf, params.num_mesh_lights, u);
@@ -3977,9 +3974,9 @@ static __device__ __noinline__ float3 trace_path(float3 origin, float3 dir,
             nee = clamp_indirect(nee, params.clamp_indirect);
           L = L + nee;
 
-          // Sample new direction via HG phase function. Frame is built
-          // around the previous direction so wi_local.z corresponds to
-          // forward scatter.
+          // Sample a direction from the volume's selected phase function.
+          // Build the frame around the previous direction so wi_local.z
+          // corresponds to forward scatter.
           float u1 = rng.next();
           float u2 = rng.next();
           float pdf_phase;

@@ -1,4 +1,4 @@
-//! Load scene.json + scene.bin into host-side structures ready for GPU upload.
+//! Load a scene description and borrowed array buffers for GPU upload.
 
 use crate::gpu_types::{AreaRectLight, PointLight, SpotLight, SunLight};
 use crate::scene_format::*;
@@ -9,7 +9,7 @@ use std::borrow::Cow;
 
 pub struct LoadedMesh<'bin> {
     pub attributes: Vec<(u64, Cow<'bin, [f32]>)>,
-    /// f32 x 3 per vertex. Borrowed directly from the source bin when the
+    /// f32 x 3 per vertex. Borrowed directly from the source blob when the
     /// mesh has no displacement; an owned `Vec<f32>` when displacement
     /// perturbation has to mutate the positions.
     pub vertices: Cow<'bin, [f32]>,
@@ -31,7 +31,7 @@ pub struct LoadedMesh<'bin> {
 pub struct LoadedTexture<'bin> {
     /// RGBA f32, width*height*4 floats, already linearised if colorspace ==
     /// "srgb". Linear textures (`colorspace == "linear"`, channels == 4)
-    /// borrow directly from the bin — no host-side memcpy. sRGB textures get
+    /// borrow directly from the caller's pixel array. sRGB textures get
     /// an owned `Vec<f32>` because the linearisation has to write into a
     /// fresh buffer; that pass folds the copy and the conversion together.
     pub data: Cow<'bin, [f32]>,
@@ -144,17 +144,15 @@ pub struct LoadedScene<'bin> {
     pub envmap_layer_b_rgb: Option<(Vec<f32>, u32, u32)>,
 }
 
-/// Parse an in-memory `scene.json` plus per-blob byte buffers into a
+/// Parse an in-memory JSON description plus per-blob byte buffers into a
 /// [`LoadedScene`]. Mesh and texture payloads are borrowed from the
-/// caller-owned slices wherever possible; only sRGB textures and
-/// displacement-modified mesh vertices end up with owned `Vec`s.
+/// caller-owned slices wherever possible. Color conversion, RGB-to-RGBA
+/// expansion, and displacement allocate owned data when needed.
 ///
 /// `mesh_blobs` is the list of caller-owned byte buffers indexed by
 /// `MeshDesc.vertices` / `.indices` / etc. — one entry per blob. Each
-/// blob is reinterpreted as f32 or u32 by `bytemuck::cast_slice`
-/// according to the field's declared type. There is no longer a single
-/// concatenated bin: each blob is independently a Python numpy array
-/// passed directly across PyO3 as `PyBuffer<u8>`.
+/// blob is reinterpreted as f32 or u32 according to the field's declared
+/// type. The addon passes separate NumPy arrays across PyO3 as `PyBuffer<u8>`.
 ///
 /// `texture_arrays` is the parallel list for `TextureDesc.array_index`,
 /// kept separate because Rust takes texture data as typed
@@ -1173,8 +1171,8 @@ fn load_mesh<'a>(desc: &MeshDesc, blobs: &[&'a [u8]]) -> Result<LoadedMesh<'a>> 
 
 fn load_texture<'a>(desc: &TextureDesc, texture_arrays: &[&'a [f32]]) -> Result<LoadedTexture<'a>> {
     // Texture pixels always travel as a caller-owned f32 slice (parked in
-    // a `Vec<PyBuffer<f32>>` on the Python side). `array_index` picks the
-    // right one — pixel data was removed from the bin.
+    // a `Vec<PyBuffer<f32>>` in the Python binding). `array_index` selects
+    // the texture's entry in that list.
     let arr = texture_arrays
         .get(desc.array_index as usize)
         .ok_or_else(|| {
@@ -1202,8 +1200,8 @@ fn load_texture<'a>(desc: &TextureDesc, texture_arrays: &[&'a [f32]]) -> Result<
 
     let data: Cow<'a, [f32]> = match desc.channels {
         4 if !srgb => {
-            // Linear 4-channel: borrow straight from the source (bin or
-            // caller-supplied array). No host-side memcpy, no allocation.
+            // Linear 4-channel: borrow straight from the caller's array.
+            // No host-side memcpy or allocation is needed here.
             // This is the dominant cost saving on junk_shop-class scenes.
             src
         }

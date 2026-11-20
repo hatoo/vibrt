@@ -379,10 +379,10 @@ pub struct LaunchParams {
     pub query_objects: optix_sys::CUdeviceptr,
     pub aov_data: optix_sys::CUdeviceptr,
     pub num_aovs: u32,
-    /// float4 image buffer (linear RGB + weight)
+    /// float4 image buffer (normalized linear RGB + alpha).
     pub image: optix_sys::CUdeviceptr,
-    /// Unnormalized float3 sums retained across progressive launches; 0 for
-    /// a single full render. Never accumulate previously normalized pixels.
+    /// Unnormalized float4 RGB/transparency sums retained between samples.
+    /// Null for a one-sample render; independent of preview readback settings.
     pub accumulation: optix_sys::CUdeviceptr,
     pub width: u32,
     pub height: u32,

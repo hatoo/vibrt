@@ -256,8 +256,10 @@ blender -b --factory-startup test_scenes/classroom/classroom/classroom.blend \
 The script exports once and renders twice without denoising. `results.json`
 separates export/preparation from render time and records every sample callback
 without Blender display work. `--repo` selects another checkout with its own
-staged native extension; `--batch` renders all samples in one launch without
-preview readback, so its timing difference does not isolate display overhead.
+staged native extension; `--batch` disables intermediate readback and sample
+callbacks. Both modes now launch one sample at a time. Their timing difference
+includes readback/callback overhead, not Blender display work; older checkouts
+may have used a different launch schedule.
 `--without-graphs` and `--without-bump` are diagnostic ablations that change
 materials. Likewise, versions predating graph support can omit material detail;
 their timings do not represent equivalent rendering quality.

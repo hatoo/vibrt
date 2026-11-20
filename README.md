@@ -9,25 +9,29 @@ A GPU path-tracing renderer for Blender, powered by NVIDIA OptiX 9.
 | [`optix-sys`](optix-sys/) | Raw FFI bindings to OptiX 9.0.0 (bindgen) |
 | [`optix`](optix/) | Safe Rust wrapper with RAII, builders, and type-safe enums |
 | [`vibrt-nodes`](vibrt-nodes/) | Standalone shader and sky nodes with shared C++/CUDA evaluation |
-| [`vibrt`](vibrt/) | OptiX path-tracing renderer with a Blender-native JSON+binary input format |
+| [`vibrt`](vibrt/) | OptiX renderer and `vibrt_native` Python extension |
 
-The [`blender/vibrt_blender/`](blender/) directory contains the Blender addon that registers `vibrt` as a render engine, exports the scene, spawns the renderer, and loads the result back into Blender.
+The [`blender/vibrt_blender/`](blender/vibrt_blender/) addon registers `vibrt` as a render engine. It passes a live scene dictionary and NumPy buffers to the native extension in the same Blender process, then updates Blender's Render Result.
 
 ## Features
 
-- Path tracing with NEE + MIS for point / sun / spot / area-rect lights and HDRI envmap (importance sampling)
+- Path tracing with direct-light sampling for point / sun / spot / area-rect lights, emissive meshes and HDRI environments; MIS for competing sampling paths
 - Transparent shadow rays through transmissive / alpha-cutout surfaces
-- Principled BSDF: base color, metallic, roughness, IOR, transmission, emission, anisotropy, coat, sheen, subsurface, alpha cutout, displacement, bump, with image textures for base color / normal / roughness / metallic
+- GPU shader graphs for linked material inputs, image/procedural textures, color/vector math, and Mix/Add closures; see the [node support matrix](docs/shader-nodes.md) for supported modes and approximations
 - GGX multi-scattering energy compensation (Kulla-Conty)
-- Indirect-contribution luminance clamp to suppress fireflies
+- Direct/indirect contribution clamping using the sum of absolute RGB components
 - Triangle mesh geometry with multi-material slots (per-triangle material index); multi-object scenes via single-level OptiX instancing
 - Right-handed Z-up (no axis conversion from Blender)
+- Perspective camera with lens shift and circular-aperture depth of field
 - Native Preetham, Hosek/Wilkie and single/multiple scattering sky models on Blender 5.1
-- Output: EXR (linear RGBA float), PNG (tonemapped sRGB), or raw float binary (addon ingestion)
+- Homogeneous volumes, legacy particle-hair ribbons, Chiang hair and Burley SSS closures
+- Progressive sample previews, cancellation, and optional final OptiX denoising
+- Output: linear RGBA, depth and named AOV buffers delivered to Blender; Blender handles color management and image-file output
 
 ## Requirements
 
-- **C++17 compiler** (MSVC, Clang or GCC) — for the bundled atmosphere models
+- **Rust** and **Python 3.11+** — for the native extension and build scripts
+- **C++17 compiler** (MSVC, Clang or GCC) — for the shared node and atmosphere implementations
 - **NVIDIA OptiX SDK 9.0.0** — set `OPTIX_ROOT` or install at default location
 - **CUDA Toolkit** — for NVRTC runtime compilation
 - **LLVM/Clang** — for bindgen (set `LIBCLANG_PATH` if not auto-detected)
@@ -37,39 +41,32 @@ The [`blender/vibrt_blender/`](blender/) directory contains the Blender addon th
 ## Building
 
 ```bash
-cargo build --release -p vibrt
+make dev-install          # build, stage, and link the addon into Blender
+make native-build         # rebuild and stage the extension after native edits
+make addon-with-native    # package blender/vibrt_blender.zip for installation
 ```
+
+To build just the native library, run `cargo build --release -p vibrt --features python`. The addon needs the resulting extension staged beside its Python sources. `make addon` packages Python sources only. See [addon installation and usage](blender/README.md).
 
 ## Usage
 
-### CLI (standalone)
+Select **vibrt** as Blender's render engine and press **F12**. The first completed sample appears immediately; subsequent previews update periodically. **Render Properties → Shaders → Precompile Shaders** warms the shader caches before rendering.
 
-```bash
-cargo run --release -p vibrt -- scene.json --spp 128 --output render.exr
-```
-
-Common flags: `--spp`, `--depth`, `--clamp-indirect`, `--width`, `--height`. See [`vibrt/src/main.rs`](vibrt/src/main.rs) for the full list.
-
-### Rendering `.blend` files from the CLI
-
-[`scripts/render_blend.py`](scripts/render_blend.py) spawns Blender headlessly to export a `.blend` via the addon's exporter, then runs `vibrt` on the result:
+There is no standalone renderer executable. [`scripts/render_blend.py`](scripts/render_blend.py) launches headless Blender, loads the working-tree addon and renders through the same native extension:
 
 ```bash
 py scripts/render_blend.py scene.blend --output render.png --spp 128
 ```
 
-### Blender addon
+## Tests and preview scenes
 
-See [`blender/README.md`](blender/README.md) for installation and usage.
-
-### Test scenes & Makefile
-
-Hand-built scenes live in [`test_scenes/`](test_scenes/) (`cornell`, `furnace`, `veach_mis`, `classroom`). The top-level [`Makefile`](Makefile) regenerates scenes and previews:
+The [`Makefile`](Makefile) renders `.blend` fixtures. The IES scene is tracked under [`test_scenes/ies_light/`](test_scenes/ies_light/); large scenes such as classroom and junk_shop are local, gitignored assets. `previews` and `cycles-previews` require all scenes listed in `BLEND_SCENES`.
 
 ```bash
-make                      # regenerate every test_scenes/*/scene.json
-make veach_mis-preview    # render a preview for one scene
-make previews             # render previews for all scenes (incl. .blend-based)
-make addon                # build blender/vibrt_blender.zip
-make dev-install          # junction the addon into Blender's user addons dir
+make test                              # layouts, Rust node tests, Python suites
+make ies_light-preview SPP=32 PCT=50   # vibrt preview
+make ies_light-cycles SPP=32 PCT=50    # Cycles reference
+cargo fmt --all -- --check
 ```
+
+`make test` uses a POSIX shell and NumPy; native binding tests need a staged extension. `cargo test -p vibrt-nodes` runs the shared CPU core without Blender or CUDA. GPU regression commands are documented in [blender/README.md](blender/README.md) and the [node support matrix](docs/shader-nodes.md).

@@ -1,4 +1,4 @@
-//! Host-side material upload for Principled BSDF.
+//! Host-side texture, shader-graph, closure-tree, and volume uploads.
 
 use crate::gpu_types::{PrincipledGpu, TextureBinding, VolumeGpu};
 use crate::scene_format::{ColorGraph, ColorNode, PrincipledMaterial, VolumeParams};

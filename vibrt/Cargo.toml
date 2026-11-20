@@ -15,10 +15,9 @@ path = "src/lib.rs"
 crate-type = ["rlib", "cdylib"]
 
 [features]
-# Build the PyO3 extension. Off by default so plain `cargo build` produces
-# only the rlib. `cargo build --release --features python` produces the
-# cdylib at `target/release/vibrt_native.dll`, which `build_addon.py`
-# stages as `vibrt_blender/vibrt_native.pyd`.
+# Enable Python bindings in the library. Both rlib and cdylib are built;
+# the cdylib is importable from Python only with this feature enabled.
+# `build_addon.py` stages the release cdylib as `vibrt_native.pyd` on Windows.
 python = ["dep:pyo3", "dep:numpy"]
 
 [dependencies]

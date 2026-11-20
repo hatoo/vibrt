@@ -1,11 +1,10 @@
-//! JSON schema for the vibrt scene format.
+//! Scene schema shared by the Blender exporter and the native renderer.
 //!
 //! Produced by `blender/vibrt_blender/exporter.py::export_scene_to_memory`
-//! and consumed by `scene_loader::load_scene_from_bytes`. The Python side
-//! drives `vibrt_native.render(scene_json, scene_bin, ...)` directly — the
-//! schema is not designed for on-disk archival; texture pixels travel
-//! across PyO3 as a separate `Vec<PyBuffer<f32>>` rather than living in
-//! the bin (see `TextureDesc::array_index`).
+//! and consumed by `scene_loader::load_scene`. The Python binding accepts a
+//! live dict or a JSON string, plus separate mesh and texture buffer lists.
+//! Mesh fields index byte-buffer views; `TextureDesc::array_index` indexes
+//! typed f32 pixel arrays. Payloads are not embedded in the scene description.
 
 use serde::Deserialize;
 
@@ -105,11 +104,12 @@ pub struct RenderSettings {
     pub max_glossy_bounces: u32,
     #[serde(default = "default_lobe_bounces")]
     pub max_transmission_bounces: u32,
-    /// Clamp for indirect (bounce>=1) contribution luminance. 0 disables.
+    /// Clamp for indirect (bounce>=1) contributions using |R|+|G|+|B|.
+    /// Non-positive values disable clamping.
     #[serde(default)]
     pub clamp_indirect: f32,
-    /// Clamp for direct (NEE on the primary surface) contribution
-    /// luminance. Mirrors Cycles' `sample_clamp_direct`. 0 disables.
+    /// Clamp for direct NEE on the primary surface using |R|+|G|+|B|.
+    /// Mirrors Cycles' `sample_clamp_direct`; non-positive values disable it.
     #[serde(default)]
     pub clamp_direct: f32,
     /// Cycles' Light Paths > Filter Glossy (`cycles.blur_glossy`).
@@ -169,10 +169,8 @@ fn one_f32() -> f32 {
 
 /// Index into the caller-supplied `mesh_blobs: &[&[u8]]` slice. Each blob
 /// is a contiguous byte buffer that the loader reinterprets as f32 / u32
-/// according to the field's declared type. Replaces the old
-/// `BlobRef { offset, len }` — the bin used to be one giant bytearray and
-/// every field stored an offset into it; now each blob is its own numpy
-/// array on the Python side, parked into a list, and addressed by index.
+/// according to the field's declared type. Each blob is a separate NumPy
+/// array on the Python side; fields store a plain integer list index.
 pub type BlobIdx = u32;
 
 #[derive(Deserialize)]
@@ -475,13 +473,12 @@ fn default_ior() -> f32 {
 pub struct TextureDesc {
     pub width: u32,
     pub height: u32,
-    /// 3 or 4
+    /// Source channels: 3 or 4. GPU channel compaction happens after loading.
     pub channels: u32,
     /// "srgb" | "linear"
     pub colorspace: String,
     /// Index into the caller-supplied `texture_arrays` slice. Pixel data
-    /// always travels alongside the scene as a separate list of f32
-    /// buffers — the bin no longer carries texture pixels.
+    /// travels alongside the scene description as separate f32 buffers.
     pub array_index: u32,
 }
 
