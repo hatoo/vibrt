@@ -43,6 +43,15 @@ socket conversion) use one packed instruction and bypass the GPU interpreter.
 They share its texture filtering, alpha handling and non-finite-value cleanup.
 Projected images and more complex graphs retain the general evaluator.
 
+Before render setup or shader precompilation, pure subgraphs with constant
+inputs are evaluated once by the shared C++ CPU implementation. This includes
+math, color/vector operations, curves/ramps and procedurals with constant
+coordinates. Unreachable nodes are removed and bit-identical float4 constants
+are shared before kernel requirements and LUT uploads are computed. Image,
+shading-context and scene-query dependencies remain dynamic. The CPU evaluator
+used for displacement applies the same optimization; alpha, HDR values and
+per-operation non-finite cleanup follow the shader VM.
+
 Math implements 41 operations; Vector Math 30; color Mix 19. Noise supports
 1D–4D and all five fractal modes; Voronoi supports all five features, four
 distance metrics and normalization. Curves and color ramps use 257-sample
@@ -254,12 +263,18 @@ blender -b --factory-startup test_scenes/classroom/classroom/classroom.blend \
 ```
 
 The script exports once and renders twice without denoising. `results.json`
-separates export/preparation from render time and records every sample callback
-without Blender display work. `--repo` selects another checkout with its own
+separates export/preparation from render time and records preview callbacks
+at the addon's default 100 ms cadence, without Blender display work.
+`--preview-interval-ms 0` measures explicit every-sample display;
+`--preview-delay-ms 30` simulates a 30 ms synchronous display callback.
+`--repo` selects another checkout with its own
 staged native extension; `--batch` disables intermediate readback and sample
-callbacks. Both modes now launch one sample at a time. Their timing difference
-includes readback/callback overhead, not Blender display work; older checkouts
-may have used a different launch schedule.
+callbacks. Normal and headless renders queue short batches of one-sample launches;
+explicit every-sample previews wait after each sample. Compare the same cadence
+and callback delay across revisions. Callback timings average over the samples
+between snapshots; they do not measure individual GPU launches. Simulated delays
+are not measurements of Blender display work. Older checkouts may have used a
+different launch schedule.
 `--without-graphs` and `--without-bump` are diagnostic ablations that change
 materials. Likewise, versions predating graph support can omit material detail;
 their timings do not represent equivalent rendering quality.

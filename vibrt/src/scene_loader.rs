@@ -169,13 +169,14 @@ pub fn load_scene_from_bytes<'a>(
 
 /// Load an already-deserialized scene, including the live Python dict path.
 pub fn load_scene<'a>(
-    file: SceneFile,
+    mut file: SceneFile,
     mesh_blobs: &[&'a [u8]],
     texture_arrays: &[&'a [f32]],
 ) -> Result<LoadedScene<'a>> {
     if file.version != 1 {
         return Err(anyhow!("unsupported scene.json version: {}", file.version));
     }
+    crate::shader_compile::optimize_materials(&mut file.materials)?;
 
     // ~half of junk_shop's 142 textures are sRGB and pay a host-side
     // pow-2.4 conversion in `load_texture` (linear ones are zero-copy).

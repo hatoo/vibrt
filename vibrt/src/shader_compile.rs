@@ -8,6 +8,31 @@ use anyhow::{Context, Result};
 use optix::*;
 use std::time::{Duration, Instant};
 
+/// Prepare the same graphs before render setup and shader-cache warmup.
+/// Folding precedes operation/stack/context analysis and GPU LUT uploads.
+pub fn optimize_materials(materials: &mut [PrincipledMaterial]) -> Result<()> {
+    fn optimize(material: &mut PrincipledMaterial, depth: usize) -> Result<()> {
+        anyhow::ensure!(depth <= 8, "Material shader tree exceeds 8 levels");
+        if let Some(graph) = &mut material.shader_graph {
+            *graph = graph.optimized()?;
+        }
+        for aov in &mut material.aov_graphs {
+            aov.graph = aov.graph.optimized()?;
+        }
+        for child in [&mut material.left_subtree, &mut material.secondary]
+            .into_iter()
+            .flatten()
+        {
+            optimize(child, depth + 1)?;
+        }
+        Ok(())
+    }
+    for material in materials {
+        optimize(material, 0)?;
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ShaderRequirements {
     pub shader_ops: u64,
@@ -276,4 +301,51 @@ pub fn compile(
         ptx_time,
         pipeline_time: t_pipeline.elapsed(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn optimization_reaches_closure_children_and_aovs_before_requirements() {
+        let graph = json!({"nodes":[
+            {"op":"constant","params":[2.0,2.0,2.0,1.0]},
+            {"op":"constant","params":[3.0,3.0,3.0,1.0]},
+            {"op":"math","inputs":[0,1,0],"modes":[2,0,0,0]}
+        ],"outputs":{"base_color":2}});
+        let leaf = json!({
+            "base_color":[1.0,1.0,1.0], "shader_graph":graph,
+            "aov_graphs":[{"index":0,"graph":graph}]
+        });
+        let mut materials: Vec<PrincipledMaterial> = serde_json::from_value(json!([{
+            "base_color":[1.0,1.0,1.0],"shader_graph":graph,
+            "left_subtree":leaf,
+            "secondary":{
+                "base_color":[1.0,1.0,1.0],"shader_graph":graph,
+                "secondary":leaf
+            }
+        }]))
+        .unwrap();
+        let before = ShaderRequirements::new(&materials, 1, None).unwrap();
+        assert_ne!(before.shader_ops & (1 << 3), 0);
+        optimize_materials(&mut materials).unwrap();
+        let after = ShaderRequirements::new(&materials, 1, None).unwrap();
+        assert_eq!(after.shader_ops, 1); // Only constant instructions remain.
+        assert_eq!(after.max_closures, before.max_closures);
+        assert!(after.has_aovs);
+        let aov = &materials[0].left_subtree.as_ref().unwrap().aov_graphs[0].graph;
+        assert_eq!(aov.nodes.len(), 1);
+        assert_eq!(aov.nodes[0].params, [6.0, 6.0, 6.0, 1.0]);
+        let nested = materials[0]
+            .secondary
+            .as_ref()
+            .unwrap()
+            .secondary
+            .as_ref()
+            .unwrap();
+        assert_eq!(nested.shader_graph.as_ref().unwrap().nodes.len(), 1);
+        assert_eq!(nested.aov_graphs[0].graph.nodes.len(), 1);
+    }
 }

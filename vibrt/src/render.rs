@@ -5,11 +5,14 @@
 //! Final buffers are returned to the caller; Blender handles display, color
 //! management, and file output.
 
+mod sample_batches;
+
 use crate::gpu_types::*;
 use crate::scene_format;
 use crate::scene_loader;
 use crate::scene_loader::LoadedScene;
 use crate::{camera, pipeline, principled, CudaResultExt};
+use sample_batches::{SampleBatches, MAX_BATCH_SAMPLES};
 
 use anyhow::{Context, Result};
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DevicePtr};
@@ -1067,9 +1070,8 @@ pub fn render_to_pixels(
         )
     };
     let progressive = progress.wants_preview();
-    // Keep sample scheduling independent of preview readback. A single long
-    // per-pixel sample loop leaves the GPU waiting for the slowest paths;
-    // bounded launches also let headless renders observe cancellation promptly.
+    // Keep one sample per launch: a long per-pixel loop leaves the GPU waiting
+    // for the slowest paths. Queue short groups of launches between CPU waits.
     let d_accumulation: Option<CudaSlice<f32>> = if render_settings.spp > 1 {
         Some(stream.alloc_zeros(pixel_count * 4).cuda()?)
     } else {
@@ -1102,7 +1104,7 @@ pub fn render_to_pixels(
     let d_back_face_warn: CudaSlice<u32> = stream.alloc_zeros(1).cuda()?;
     let primary_back_face_skip_exhausted = dptr_u32(&d_back_face_warn, &stream);
 
-    let mut lp = LaunchParams {
+    let lp = LaunchParams {
         query_nodes,
         query_indices,
         query_objects: query_objects_ptr,
@@ -1178,7 +1180,16 @@ pub fn render_to_pixels(
         world_volume: world_volume_ptr,
         primary_back_face_skip_exhausted,
     };
-    let mut d_params = stream.clone_htod(&[lp]).cuda()?;
+    // Distinct parameter slots let consecutive launches run without a host
+    // upload/wait between samples. Reuse the slots only after the batch ends.
+    let mut batch_params = vec![lp; MAX_BATCH_SAMPLES.min(render_settings.spp as usize)];
+    let mut d_params = stream.clone_htod(&batch_params).cuda()?;
+    let batch_start = cuda_ctx
+        .new_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))
+        .cuda()?;
+    let batch_end = cuda_ctx
+        .new_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))
+        .cuda()?;
     stream.synchronize().cuda()?;
     progress.log(&format!(
         "GPU preparation: {:.2?} (context={:.2?}, PTX={:.2?}, pipeline={:.2?}, scene={:.2?}, buffers={:.2?})",
@@ -1189,41 +1200,83 @@ pub fn render_to_pixels(
     progress.log("Rendering...");
     let t0 = std::time::Instant::now();
     let interval = std::time::Duration::from_millis(opts.preview_interval_ms.unwrap_or(100));
+    let every_sample = progressive && interval.is_zero();
+    let mut batches = SampleBatches::new(progressive.then_some(interval));
     let mut last_preview = None;
-    while lp.sample_start < render_settings.spp {
-        anyhow::ensure!(!progress.cancelled(), "render cancelled");
-        stream.memcpy_htod(&[lp], &mut d_params).cuda()?;
-        let (params_ptr, _record_params) = d_params.device_ptr(&stream);
-        pipeline
-            .launch(
-                cu_stream,
-                params_ptr,
-                mem::size_of::<LaunchParams>(),
-                &sbt,
-                render_settings.width,
-                render_settings.height,
-                1,
-            )
-            .context("launch")?;
-        stream.synchronize().cuda()?;
-        let completed = lp.sample_start + lp.sample_count;
-        if progressive
-            && (completed == render_settings.spp
-                || last_preview.is_none_or(|t: std::time::Instant| t.elapsed() >= interval))
-        {
-            let pixels = stream.clone_dtoh(&d_image).cuda()?;
-            progress.preview(
-                pixels,
-                render_settings.width,
-                render_settings.height,
-                completed,
-                render_settings.spp,
-            )?;
-            last_preview = Some(std::time::Instant::now());
+    let mut queue_batch = |start: u32, count: u32| -> Result<()> {
+        for (i, params) in batch_params[..count as usize].iter_mut().enumerate() {
+            params.sample_start = start + i as u32;
         }
-        lp.sample_start = completed;
-    }
-    anyhow::ensure!(!progress.cancelled(), "render cancelled");
+        stream
+            .memcpy_htod(&batch_params[..count as usize], &mut d_params)
+            .cuda()?;
+        if !every_sample {
+            batch_start.record(&stream).cuda()?;
+        }
+        let (params_ptr, _record_params) = d_params.device_ptr(&stream);
+        for i in 0..count {
+            pipeline
+                .launch(
+                    cu_stream,
+                    params_ptr + i as u64 * mem::size_of::<LaunchParams>() as u64,
+                    mem::size_of::<LaunchParams>(),
+                    &sbt,
+                    render_settings.width,
+                    render_settings.height,
+                    1,
+                )
+                .context("launch")?;
+        }
+        if !every_sample {
+            batch_end.record(&stream).cuda()?;
+        }
+        Ok(())
+    };
+    let sampling = (|| -> Result<()> {
+        let mut completed = 0;
+        let mut pending = 0;
+        while completed < render_settings.spp {
+            anyhow::ensure!(!progress.cancelled(), "render cancelled");
+            if pending == 0 {
+                pending = batches.next_count(render_settings.spp - completed);
+                queue_batch(completed, pending)?;
+            }
+            stream.synchronize().cuda()?;
+            if !every_sample {
+                batches.record_gpu_time(pending, batch_start.elapsed_ms(&batch_end).cuda()?);
+            }
+            completed += pending;
+            pending = 0;
+            anyhow::ensure!(!progress.cancelled(), "render cancelled");
+            if progressive
+                && (completed == render_settings.spp
+                    || last_preview.is_none_or(|t: std::time::Instant| t.elapsed() >= interval))
+            {
+                let pixels = stream.clone_dtoh(&d_image).cuda()?;
+                if !every_sample && completed < render_settings.spp {
+                    // The snapshot owns its host memory. Let the GPU work on
+                    // the next batch while Blender displays this completed one.
+                    pending = batches.next_count(render_settings.spp - completed);
+                    queue_batch(completed, pending)?;
+                }
+                progress.preview(
+                    pixels,
+                    render_settings.width,
+                    render_settings.height,
+                    completed,
+                    render_settings.spp,
+                )?;
+                last_preview = Some(std::time::Instant::now());
+            }
+        }
+        anyhow::ensure!(!progress.cancelled(), "render cancelled");
+        Ok(())
+    })();
+    // A callback/cancel/launch error may leave the next batch in flight. Drain
+    // it before dropping parameters, scene buffers, SBT or the OptiX pipeline.
+    let drained = stream.synchronize().cuda();
+    sampling?;
+    drained?;
     progress.log(&format!("Render: {:.2?}", t0.elapsed()));
 
     // Read back the camera-ray back-face skip counter. Non-zero means the

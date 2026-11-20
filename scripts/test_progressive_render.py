@@ -6,6 +6,7 @@ Optional -- --save-baseline records the old extension's output before rebuilding
 
 from pathlib import Path
 import sys
+import time
 
 import bpy
 import numpy as np
@@ -30,9 +31,12 @@ def render(options=None, **callbacks):
 
 reference, reference_depth = render()
 denoised, denoised_depth = render(dict(opts, denoise=True))
+many_opts = dict(opts, spp=130, preview_interval_ms=100)
+many, many_depth = render(many_opts)
 if "--save-baseline" in sys.argv:
     np.savez(output / "baseline.npz", pixels=reference, depth=reference_depth,
-             denoised=denoised, denoised_depth=denoised_depth)
+             denoised=denoised, denoised_depth=denoised_depth,
+             many=many, many_depth=many_depth)
     print("[progressive-test] saved pre-change baseline", flush=True)
     raise SystemExit(0)
 
@@ -42,6 +46,10 @@ if baseline.exists():
         np.testing.assert_array_equal(reference, old["pixels"])
         np.testing.assert_array_equal(reference_depth, old["depth"])
         np.testing.assert_array_equal(denoised, old["denoised"])
+        np.testing.assert_array_equal(denoised_depth, old["denoised_depth"])
+        if "many" in old:
+            np.testing.assert_array_equal(many, old["many"])
+            np.testing.assert_array_equal(many_depth, old["many_depth"])
         print("[progressive-test] pre-change image/depth/denoise exact", flush=True)
 
 frames = []
@@ -75,6 +83,36 @@ pixels, _ = render(dict(opts, preview_interval_ms=60000), preview_cb=preview)
 assert [sample for sample, _ in frames] == [1, 8]
 np.testing.assert_array_equal(pixels, reference)
 
+# Cross the bounded parameter-buffer capacity, including a partial last batch.
+# Retained snapshots must stay unchanged while the next batch runs on the GPU.
+batched_frames = []
+
+
+def slow_preview(pixels, samples, total):
+    assert total == many_opts["spp"]
+    saved = pixels.copy()
+    time.sleep(0.01)
+    np.testing.assert_array_equal(pixels, saved)
+    batched_frames.append((samples, pixels))
+
+
+pixels, depth = render(many_opts, preview_cb=slow_preview)
+completed = [samples for samples, _ in batched_frames]
+assert completed[0] == 1 and completed[-1] == many_opts["spp"]
+assert completed == sorted(set(completed))
+assert len(completed) < many_opts["spp"], "fast samples should skip intermediate displays"
+np.testing.assert_array_equal(pixels, many)
+np.testing.assert_array_equal(depth, many_depth)
+for samples, snapshot in batched_frames:
+    expected, _ = render(dict(many_opts, spp=samples))
+    np.testing.assert_array_equal(snapshot, expected)
+
+frames.clear()
+pixels, depth = render(dict(opts, denoise=True, preview_interval_ms=60000), preview_cb=preview)
+np.testing.assert_array_equal(pixels, denoised)
+np.testing.assert_array_equal(depth, denoised_depth)
+np.testing.assert_array_equal(frames[-1][1], reference)
+
 frames.clear()
 try:
     render(preview_cb=preview, cancel_cb=lambda: bool(frames and frames[-1][0] >= 3))
@@ -83,6 +121,17 @@ except KeyboardInterrupt:
 else:
     raise AssertionError("cancellation was ignored")
 assert [sample for sample, _ in frames] == [1, 2, 3]
+
+# Cancellation can happen inside a display callback with GPU work queued ahead.
+frames.clear()
+try:
+    render(dict(opts, preview_interval_ms=100), preview_cb=preview,
+           cancel_cb=lambda: bool(frames))
+except KeyboardInterrupt:
+    pass
+else:
+    raise AssertionError("batched cancellation was ignored")
+assert [sample for sample, _ in frames] == [1]
 
 
 class CallbackFailure(Exception):
@@ -93,12 +142,18 @@ def fail(*args):
     raise CallbackFailure("preview failed")
 
 
-try:
-    render(preview_cb=fail)
-except CallbackFailure as error:
-    assert str(error) == "preview failed"
-else:
-    raise AssertionError("callback error was swallowed")
+for interval in (0, 100):
+    try:
+        render(dict(opts, preview_interval_ms=interval), preview_cb=fail)
+    except CallbackFailure as error:
+        assert str(error) == "preview failed"
+    else:
+        raise AssertionError("callback error was swallowed")
+
+# Error/cancel paths must drain pending work and leave subsequent renders usable.
+pixels, depth = render(many_opts)
+np.testing.assert_array_equal(pixels, many)
+np.testing.assert_array_equal(depth, many_depth)
 
 for options in (dict(opts, spp=0), dict(opts, width=0), dict(opts, height=0)):
     try:
@@ -107,4 +162,31 @@ for options in (dict(opts, spp=0), dict(opts, width=0), dict(opts, height=0)):
         assert "positive" in str(error)
     else:
         raise AssertionError("invalid render dimensions/sample count accepted")
-print("[progressive-test] PASS: exact samples, denoise, snapshots, throttling, cancellation, errors", flush=True)
+
+# Named AOVs accumulate separately from the display image. Exercise varying
+# procedural values over enough samples to reuse the launch-parameter slots.
+aov = bpy.context.view_layer.aovs.add()
+aov.name = "Progressive Noise"
+aov.type = "COLOR"
+tree = bpy.data.objects["Cube"].active_material.node_tree
+noise = tree.nodes.new("ShaderNodeTexNoise")
+aov_node = tree.nodes.new("ShaderNodeOutputAOV")
+aov_node.aov_name = aov.name
+tree.links.new(noise.outputs["Color"], aov_node.inputs["Color"])
+scene, blobs, textures = exporter.export_scene_to_memory(
+    bpy.context.evaluated_depsgraph_get(), serialize=False
+)
+blobs = [array.view(np.uint8) for array in blobs]
+serial_aovs = {}
+serial_pixels, serial_depth = render(
+    dict(many_opts, preview_interval_ms=0), preview_cb=lambda *_: None,
+    aov_outputs=serial_aovs,
+)
+assert np.ptp(serial_aovs[aov.name][:, :, :3]) > 0.01
+for callback in (None, lambda *_: None):
+    batched_aovs = {}
+    pixels, depth = render(many_opts, preview_cb=callback, aov_outputs=batched_aovs)
+    np.testing.assert_array_equal(pixels, serial_pixels)
+    np.testing.assert_array_equal(depth, serial_depth)
+    np.testing.assert_array_equal(batched_aovs[aov.name], serial_aovs[aov.name])
+print("[progressive-test] PASS: exact samples, batching, denoise, snapshots, AOVs, throttling, cancellation, errors", flush=True)

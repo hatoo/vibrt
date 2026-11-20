@@ -53,8 +53,12 @@ for shipping the source layout.
 
 The first completed sample is displayed immediately. Further samples
 accumulate on the GPU, and Render Result and the sample counter update up to
-10 times per second. The final sample is always displayed. Esc stops between
-samples and keeps the latest preview; optional denoising runs once at the end.
+10 times per second. Fast samples run in short batches, and only the latest
+completed image is transferred for display. The GPU can continue sampling while
+Blender displays a snapshot. Batches target at most 50 ms of measured GPU work
+(up to 64 one-sample launches); a single slow sample can take longer.
+The final sample is always displayed. Esc stops between batches and keeps the
+latest preview; optional denoising runs once at the end.
 Scene export, compilation, and GPU setup still finish before sampling starts.
 
 On Blender 5.1 with the default Linear Rec.709 working space, procedural skies
@@ -95,12 +99,14 @@ supported sky never starts a Cycles worker. The native-sky test compares sky
 models, sun discs, color processing and camera-ray splits against Cycles.
 
 The progressive GPU test compares preview-enabled and preview-disabled renders,
-normalization of the first sample, final denoising, snapshot lifetime,
-cancellation, and callback errors. The render-job test inspects actual Blender
-passes while F12 is still running.
+normalization of the first sample, final denoising, batched accumulation,
+snapshot lifetime, named AOVs, cancellation, and callback errors. The render-job
+test inspects actual Blender passes while F12 is still running.
 
-Both modes launch one sample at a time. Omitting a preview callback avoids
-intermediate pixel readback; it does not combine samples into one launch.
+Both modes queue one-sample launches without waiting for each sample on the CPU.
+Omitting a preview callback avoids intermediate pixel readback. The native
+`preview_interval_ms=0` option explicitly requests every-sample display and waits
+after each sample when a preview callback is supplied.
 
 ## Supported features
 

@@ -46,8 +46,9 @@ def run_render_inproc(
     side indexes them via fields such as `MeshDesc.vertices` and `.indices`.
     `texture_arrays` is the parallel list for `TextureDesc.array_index`.
     `preview_cb(pixels, samples, total)` receives normalized, owned RGBA
-    snapshots while sampling. Omitting it disables intermediate readback and
-    callbacks; both paths launch one sample at a time. If supplied,
+    snapshots up to 10 times per second, plus the first/final sample.
+    Both paths queue short batches of one-sample launches; omitting the callback
+    disables intermediate readback. If supplied,
     `aov_outputs` receives the named final AOV arrays.
     """
     import numpy as np

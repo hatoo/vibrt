@@ -3,6 +3,8 @@ use anyhow::{bail, ensure, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+mod fold;
+
 pub const MAX_NODES: usize = 256;
 // Packed op: opcode in bits 0..7, evaluation groups in 8..15, result slot in 16..23.
 // Keep these groups in sync with native/shader.h.
@@ -509,6 +511,7 @@ fn evaluate_with_textures_selected(
     requested: u32,
     textures: &[(&[f32], usize, usize)],
 ) -> Result<Vec<[[f32; 4]; 64]>> {
+    let graph = graph.optimized()?;
     ensure!(
         !graph.nodes.iter().any(|n| matches!(
             n.op.as_str(),

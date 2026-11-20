@@ -270,7 +270,7 @@ fn precompile_shaders<'py>(
         #[serde(default)]
         world_volume: Option<crate::scene_format::VolumeParams>,
     }
-    let scene: ShaderScene = crate::python_scene::from_python(description)?;
+    let mut scene: ShaderScene = crate::python_scene::from_python(description)?;
     let mut progress = PyProgress {
         log_cb,
         cancel_cb,
@@ -280,6 +280,7 @@ fn precompile_shaders<'py>(
     };
     let result = py.allow_threads(|| -> anyhow::Result<_> {
         let started = std::time::Instant::now();
+        shader_compile::optimize_materials(&mut scene.materials)?;
         let requirements = ShaderRequirements::new(
             &scene.materials,
             scene.aov_names.len(),
