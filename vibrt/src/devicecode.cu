@@ -80,7 +80,7 @@ static __forceinline__ __device__ void build_frame(float3 n, float3 &t,
 
 // ---------- Texture sampling (bilinear) ----------
 static __device__ float3 sample_rgba(const float *data, int w, int h,
-                                     int /*channels*/, float2 uv) {
+                                     int channels, float2 uv) {
   if (data == nullptr || w <= 0 || h <= 0)
     return make_float3(1, 1, 1);
   float u = uv.x - floorf(uv.x);
@@ -103,8 +103,9 @@ static __device__ float3 sample_rgba(const float *data, int w, int h,
   x0 = wrap(x0, w);
   y0 = wrap(y0, h);
   auto fetch = [&](int x, int y) {
-    const float *p = &data[(y * w + x) * 4];
-    return make_float3(p[0], p[1], p[2]);
+    const float *p = &data[(y * w + x) * channels];
+    return channels <= 2 ? make_float3(p[0], p[0], p[0])
+                         : make_float3(p[0], p[1], p[2]);
   };
   float3 c00 = fetch(x0, y0);
   float3 c10 = fetch(x1, y0);
@@ -3736,10 +3737,16 @@ extern "C" __global__ void __anyhit__ah() {
   x0 = wrap(x0, w);
   y0 = wrap(y0, h);
   const float *data = m->base_color_tex;
-  float a00 = data[(y0 * w + x0) * 4 + 3];
-  float a10 = data[(y0 * w + x1) * 4 + 3];
-  float a01 = data[(y1 * w + x0) * 4 + 3];
-  float a11 = data[(y1 * w + x1) * 4 + 3];
+  int channels = m->base_color_tex_channels;
+  auto fetch_alpha = [&](int x, int y) {
+    return channels == 2 || channels == 4
+               ? data[(y * w + x) * channels + channels - 1]
+               : 1.0f;
+  };
+  float a00 = fetch_alpha(x0, y0);
+  float a10 = fetch_alpha(x1, y0);
+  float a01 = fetch_alpha(x0, y1);
+  float a11 = fetch_alpha(x1, y1);
   float a0 = a00 * (1.0f - dx) + a10 * dx;
   float a1 = a01 * (1.0f - dx) + a11 * dx;
   float alpha = a0 * (1.0f - dy) + a1 * dy;

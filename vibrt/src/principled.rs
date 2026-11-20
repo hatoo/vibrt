@@ -1,11 +1,13 @@
 //! Host-side material upload for Principled BSDF.
 
-use crate::gpu_types::{PrincipledGpu, VolumeGpu};
+use crate::gpu_types::{PrincipledGpu, TextureBinding, VolumeGpu};
 use crate::scene_format::{ColorGraph, ColorNode, PrincipledMaterial, VolumeParams};
 use crate::scene_loader::LoadedTexture;
 use crate::CudaResultExt;
 use anyhow::{anyhow, Result};
 use cudarc::driver::{CudaSlice, CudaStream, DevicePtr};
+use rayon::prelude::*;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -41,6 +43,24 @@ fn shader_has_alpha(mat: &PrincipledMaterial) -> bool {
             .map_or_else(leaf_alpha, shader_has_alpha)
 }
 
+/// Only transparent/cutout/volume surfaces need the intersection filter.
+/// Be conservative for dynamic transmission and nested material trees.
+pub fn needs_any_hit(mat: &PrincipledMaterial) -> bool {
+    shader_has_alpha(mat)
+        || mat.transmission > 0.0
+        || mat.transmission_tex.is_some()
+        || mat
+            .shader_graph
+            .as_ref()
+            .is_some_and(|g| g.outputs.contains_key("transmission"))
+        || mat.volume.is_some()
+        || (mat.alpha_threshold > 0.0 && mat.base_color_tex.is_some())
+        || [&mat.left_subtree, &mat.secondary]
+            .into_iter()
+            .flatten()
+            .any(|child| needs_any_hit(child))
+}
+
 /// Surface attributes used anywhere in a Mix/Add tree, including its factor.
 /// The legacy color evaluator also accepts vertex color and object randomness.
 pub fn surface_requirements(mat: &PrincipledMaterial) -> Result<(u32, bool)> {
@@ -72,17 +92,60 @@ pub fn surface_requirements(mat: &PrincipledMaterial) -> Result<(u32, bool)> {
     Ok((contexts, bump))
 }
 
-/// Upload all textures once; returns parallel vector of device slices + dims.
+/// Remove only bit-identical channels; keep the original f32 samples and size.
+/// Layouts are luminance, luminance/alpha, RGB and RGBA (1..=4 channels).
+fn compact_texture(rgba: &[f32]) -> (Cow<'_, [f32]>, i32) {
+    let flags = rgba
+        .par_chunks(16_384)
+        .map(|chunk| {
+            chunk.as_chunks::<4>().0.iter().fold(0, |flags, p| {
+                flags
+                    | u32::from(
+                        p[0].to_bits() != p[1].to_bits() || p[0].to_bits() != p[2].to_bits(),
+                    )
+                    | (u32::from(p[3].to_bits() != 1.0f32.to_bits()) << 1)
+            })
+        })
+        .reduce(|| 0, |a, b| a | b);
+    let channels = match flags {
+        0 => 1,
+        1 => 3,
+        2 => 2,
+        _ => return (Cow::Borrowed(rgba), 4),
+    };
+    let mut pixels = vec![0.0; rgba.len() / 4 * channels];
+    pixels
+        .par_chunks_mut(4096 * channels)
+        .zip(rgba.par_chunks(4096 * 4))
+        .for_each(|(dst, src)| {
+            for (dst, src) in dst.chunks_exact_mut(channels).zip(src.as_chunks::<4>().0) {
+                if channels == 2 {
+                    dst.copy_from_slice(&[src[0], src[3]]);
+                } else {
+                    dst.copy_from_slice(&src[..channels]);
+                }
+            }
+        });
+    (Cow::Owned(pixels), channels as i32)
+}
+
+/// Upload all textures once; retain allocations until the render completes.
 pub fn upload_textures(
     textures: &[LoadedTexture],
     stream: &Arc<CudaStream>,
     bufs: &mut Vec<CudaSlice<f32>>,
-) -> Result<Vec<(optix_sys::CUdeviceptr, i32, i32)>> {
+) -> Result<Vec<TextureBinding>> {
     let mut out = Vec::with_capacity(textures.len());
     for tex in textures {
-        let slice = stream.clone_htod(&tex.data[..]).cuda()?;
+        let (pixels, channels) = compact_texture(&tex.data);
+        let slice = stream.clone_htod(&pixels[..]).cuda()?;
+        // Packed pixels are temporary host storage. The driver may return from
+        // an async copy before it has consumed them; keep them alive until done.
+        if matches!(pixels, Cow::Owned(_)) {
+            stream.synchronize().cuda()?;
+        }
         let ptr = dptr(&slice, stream);
-        out.push((ptr, tex.width as i32, tex.height as i32));
+        out.push((ptr, tex.width as i32, tex.height as i32, channels));
         bufs.push(slice);
     }
     Ok(out)
@@ -115,7 +178,7 @@ pub struct GraphStorage {
 
 pub fn upload_shader_graph(
     graph: &vibrt_nodes::shader::ShaderGraph,
-    textures: &[(u64, i32, i32)],
+    textures: &[TextureBinding],
     stream: &Arc<CudaStream>,
     storage: &mut GraphStorage,
 ) -> Result<ShaderGraphGpu> {
@@ -165,7 +228,7 @@ pub fn upload_shader_graph(
 /// upload it. Returns a descriptor the material upload can splice in.
 pub fn upload_color_graph(
     graph: &ColorGraph,
-    textures: &[(optix_sys::CUdeviceptr, i32, i32)],
+    textures: &[TextureBinding],
     stream: &Arc<CudaStream>,
     bufs: &mut Vec<CudaSlice<u32>>,
     f_bufs: &mut Vec<CudaSlice<f32>>,
@@ -299,7 +362,7 @@ pub fn make_volume_gpu(v: &VolumeParams) -> VolumeGpu {
 /// slice plumbing inside this helper.
 pub fn make_material_data(
     mat: &PrincipledMaterial,
-    textures: &[(optix_sys::CUdeviceptr, i32, i32)],
+    textures: &[TextureBinding],
     graph: ColorGraphGpu,
     volume_ptr: optix_sys::CUdeviceptr,
     secondary_ptr: optix_sys::CUdeviceptr,
@@ -308,7 +371,7 @@ pub fn make_material_data(
     let lookup = |id: Option<u32>| -> (optix_sys::CUdeviceptr, i32, i32, i32) {
         match id {
             Some(i) => match textures.get(i as usize).copied() {
-                Some(t) => (t.0, t.1, t.2, 4),
+                Some(t) => t,
                 None => {
                     eprintln!(
                         "[vibrt] warn: material texture index {} out of range \
@@ -427,6 +490,77 @@ pub fn make_material_data(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn opaque_materials_do_not_need_intersection_filtering() {
+        let opaque = json!({"base_color":[0.5,0.5,0.5]});
+        let mut mat: PrincipledMaterial = serde_json::from_value(opaque.clone()).unwrap();
+        assert!(!needs_any_hit(&mat));
+        // A base-color image alone does not enable alpha cutout.
+        mat.base_color_tex = Some(0);
+        assert!(!needs_any_hit(&mat));
+        mat.alpha_threshold = 0.5;
+        assert!(needs_any_hit(&mat));
+        for transparent in [
+            json!({"base_color":[1,1,1],"alpha_blend":0.5}),
+            json!({"base_color":[1,1,1],"transmission":1.0}),
+            json!({"base_color":[1,1,1],"transmission_tex":0}),
+            json!({"base_color":[1,1,1],"volume":{},"volume_only":true}),
+            json!({"base_color":[1,1,1],"shader_graph":{
+                "nodes":[{"op":"context"}],"outputs":{"alpha":0}}}),
+            json!({"base_color":[1,1,1],"shader_graph":{
+                "nodes":[{"op":"context"}],"outputs":{"transmission":0}}}),
+        ] {
+            assert!(needs_any_hit(
+                &serde_json::from_value(transparent.clone()).unwrap()
+            ));
+            for child in ["left_subtree", "secondary"] {
+                let mut tree = opaque.clone();
+                tree[child] = opaque.clone();
+                assert!(!needs_any_hit(
+                    &serde_json::from_value(tree.clone()).unwrap()
+                ));
+                tree[child] = transparent.clone();
+                assert!(needs_any_hit(&serde_json::from_value(tree).unwrap()));
+            }
+        }
+    }
+
+    #[test]
+    fn texture_compaction_preserves_float_bits_and_alpha() {
+        for (rgba, expected_channels) in [
+            (vec![0.25, 0.25, 0.25, 1.0], 1),
+            (vec![0.25, 0.25, 0.25, 0.4], 2),
+            (vec![0.25, 0.5, 8.0, 1.0], 3),
+            (vec![0.25, 0.5, 8.0, 0.4], 4),
+            (vec![-0.0, 0.0, -0.0, 1.0], 3),
+            (vec![f32::INFINITY, 1.0, f32::NAN, 0.0], 4),
+        ] {
+            let expected = [rgba[0], rgba[1], rgba[2], rgba[3]].map(f32::to_bits);
+            // Exercise the boundary between parallel chunks as well as small inputs.
+            for repeat in [1, 4097] {
+                let source = rgba.repeat(repeat);
+                let (packed, channels) = compact_texture(&source);
+                assert_eq!(channels, expected_channels);
+                assert_eq!(packed.len(), repeat * channels as usize);
+                for pixel in packed.chunks_exact(channels as usize) {
+                    let restored = match channels {
+                        1 => [pixel[0], pixel[0], pixel[0], 1.0],
+                        2 => [pixel[0], pixel[0], pixel[0], pixel[1]],
+                        3 => [pixel[0], pixel[1], pixel[2], 1.0],
+                        _ => [pixel[0], pixel[1], pixel[2], pixel[3]],
+                    };
+                    assert_eq!(restored.map(f32::to_bits), expected);
+                }
+            }
+        }
+        let mut mixed = vec![0.0, 0.0, 0.0, 1.0].repeat(8193);
+        mixed[4096 * 4 + 1] = 0.25;
+        mixed[8192 * 4 + 3] = 0.5;
+        let (packed, channels) = compact_texture(&mixed);
+        assert_eq!(channels, 4);
+        assert!(matches!(packed, Cow::Borrowed(_)));
+    }
 
     #[test]
     fn surface_inputs_include_factors_nested_leaves_and_legacy_colors() {

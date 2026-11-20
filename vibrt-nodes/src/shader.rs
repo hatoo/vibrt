@@ -397,7 +397,7 @@ impl ShaderGraph {
 
     pub fn pack(
         &self,
-        textures: &[(u64, i32, i32)],
+        textures: &[crate::types::TextureBinding],
         tables: &[u64],
     ) -> Result<Vec<ShaderInstruction>> {
         let packed = self.pack_general(textures, tables)?;
@@ -409,7 +409,7 @@ impl ShaderGraph {
 
     fn pack_general(
         &self,
-        textures: &[(u64, i32, i32)],
+        textures: &[crate::types::TextureBinding],
         tables: &[u64],
     ) -> Result<Vec<ShaderInstruction>> {
         self.validate()?;
@@ -437,7 +437,9 @@ impl ShaderGraph {
                 *operand = slots[input as usize];
             }
             if n.op == "image" {
-                let Some(&(data, w, h)) = n.texture.and_then(|id| textures.get(id as usize)) else {
+                let Some(&(data, w, h, channels)) =
+                    n.texture.and_then(|id| textures.get(id as usize))
+                else {
                     bail!("Missing image binding at shader node {i}")
                 };
                 ensure!(
@@ -447,6 +449,9 @@ impl ShaderGraph {
                 r.data = data;
                 r.width = w;
                 r.height = h;
+                ensure!((1..=4).contains(&channels), "Invalid texture channel count");
+                // Images do not use LUTs; this field carries their pixel stride.
+                r.table_len = channels as u32;
             } else if n.op == "attribute" {
                 r.data = attribute_key(&n.attribute);
             } else if !n.table.is_empty() {
@@ -539,7 +544,7 @@ fn evaluate_with_textures_selected(
                     && w.checked_mul(h).and_then(|n| n.checked_mul(4)) == Some(data.len()),
                 "Invalid CPU texture dimensions"
             );
-            Ok((data.as_ptr() as u64, w as i32, h as i32))
+            Ok((data.as_ptr() as u64, w as i32, h as i32, 4))
         })
         .collect::<Result<Vec<_>>>()?;
     let instructions = graph.pack(&textures, &tables)?;
@@ -587,6 +592,65 @@ mod tests {
     }
 
     #[test]
+    fn compact_images_match_rgba_for_filters_extensions_and_alpha() {
+        for channels in 1..=4 {
+            let mut rgba = Vec::new();
+            let mut compact = Vec::new();
+            for i in 0..6 {
+                let r = i as f32 * 0.25;
+                let (g, b) = if channels <= 2 {
+                    (r, r)
+                } else {
+                    (1.0 - r, 2.0 * r)
+                };
+                let a = if channels % 2 == 0 {
+                    i as f32 * 0.2
+                } else {
+                    1.0
+                };
+                rgba.extend([r, g, b, a]);
+                compact.extend(match channels {
+                    1 => vec![r],
+                    2 => vec![r, a],
+                    3 => vec![r, g, b],
+                    _ => vec![r, g, b, a],
+                });
+            }
+            for interpolation in 0..4 {
+                for extension in 0..4 {
+                    for alpha_flags in 0..8 {
+                        let graph: ShaderGraph = serde_json::from_value(json!({
+                            "nodes":[{"op":"context"},
+                                     {"op":"image","inputs":[0],"texture":0,
+                                      "modes":[interpolation,extension,0,alpha_flags & 1],
+                                      "params":[0,0,(alpha_flags >> 1) & 1,alpha_flags >> 2]}],
+                            "outputs":{"base_color":1}
+                        }))
+                        .unwrap();
+                        let reference = graph
+                            .pack(&[(rgba.as_ptr() as u64, 3, 2, 4)], &[0; 2])
+                            .unwrap();
+                        let packed = [(compact.as_ptr() as u64, 3, 2, channels)];
+                        for actual in [
+                            graph.pack(&packed, &[0; 2]).unwrap(),
+                            graph.pack_general(&packed, &[0; 2]).unwrap(),
+                        ] {
+                            for uv in [[-1.3, 2.7], [0.0, 1.0], [0.37, 0.61], [1.4, -0.2]] {
+                                let mut context = [0.0; 128];
+                                context[..4].copy_from_slice(&[uv[0], uv[1], 0.0, 1.0]);
+                                assert_eq!(
+                                    run_program(&actual, &context, EVAL_ALL),
+                                    run_program(&reference, &context, EVAL_ALL)
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn specialized_images_match_vm_filtering_alpha_conversion_and_output_groups() {
         for (width, height) in [(3, 5), (4, 2)] {
             let pixels: Vec<f32> = (0..width * height)
@@ -610,7 +674,7 @@ mod tests {
                                 "outputs":{"mix_fac":nodes.len()-1},"nodes":nodes,
                             }))
                             .unwrap();
-                            let textures = [(pixels.as_ptr() as u64, width, height)];
+                            let textures = [(pixels.as_ptr() as u64, width, height, 4)];
                             let tables = vec![0; graph.nodes.len()];
                             let specialized = graph.pack(&textures, &tables).unwrap();
                             let general = graph.pack_general(&textures, &tables).unwrap();
@@ -646,7 +710,7 @@ mod tests {
             .unwrap();
             assert_eq!(
                 graph
-                    .pack(&[(pixels.as_ptr() as u64, 2, 2)], &[0, 0])
+                    .pack(&[(pixels.as_ptr() as u64, 2, 2, 4)], &[0, 0])
                     .unwrap()
                     .len(),
                 3
@@ -684,7 +748,7 @@ mod tests {
             {"op":"convert","inputs":[1],"modes":[0,0,0,0]}
         ],"outputs":{"base_color":2}}))
         .unwrap();
-        let textures = [(pixels.as_ptr() as u64, 1, 1)];
+        let textures = [(pixels.as_ptr() as u64, 1, 1, 4)];
         let specialized = graph.pack(&textures, &[0; 3]).unwrap();
         let general = graph.pack_general(&textures, &[0; 3]).unwrap();
         let mut context = [0.0; 128];
@@ -708,7 +772,7 @@ mod tests {
                 ],"outputs":{"base_color":1}}))
                 .unwrap();
                 let packed = graph
-                    .pack(&[(pixels.as_ptr() as u64, width, height)], &[0, 0])
+                    .pack(&[(pixels.as_ptr() as u64, width, height, 4)], &[0, 0])
                     .unwrap();
                 let wrap = |i: i32, n: i32| match extension {
                     0 => i.rem_euclid(n),

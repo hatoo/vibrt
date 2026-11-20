@@ -51,7 +51,7 @@ VN_INLINE float luminance(float3 c) {
 }
 
 VN_DEVICE float3 sample_rgba(const float *data, int w, int h,
-                                     int /*channels*/, float2 uv) {
+                                     int channels, float2 uv) {
   if (data == nullptr || w <= 0 || h <= 0)
     return make_float3(1, 1, 1);
   float u = uv.x - floorf(uv.x);
@@ -74,8 +74,9 @@ VN_DEVICE float3 sample_rgba(const float *data, int w, int h,
   x0 = wrap(x0, w);
   y0 = wrap(y0, h);
   auto fetch = [&](int x, int y) {
-    const float *p = &data[(y * w + x) * 4];
-    return make_float3(p[0], p[1], p[2]);
+    const float *p = &data[(y * w + x) * channels];
+    return channels <= 2 ? make_float3(p[0], p[0], p[0])
+                         : make_float3(p[0], p[1], p[2]);
   };
   float3 c00 = fetch(x0, y0);
   float3 c10 = fetch(x1, y0);

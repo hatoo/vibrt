@@ -31,26 +31,6 @@ import numpy as np
 from ._log import log as _emit
 
 
-def _strand_axes(points: np.ndarray) -> np.ndarray:
-    """Per-key tangent direction along a strand of shape (N, 3).
-
-    Forward/backward difference at the endpoints, central difference in the
-    middle. Always unit-length (degenerate keys fall back to +Z so the ribbon
-    has a sane orientation rather than collapsing to a point).
-    """
-    n = points.shape[0]
-    if n < 2:
-        return np.tile(np.array([0.0, 0.0, 1.0], dtype=np.float32), (n, 1))
-    t = np.empty_like(points)
-    t[0] = points[1] - points[0]
-    t[-1] = points[-1] - points[-2]
-    if n > 2:
-        t[1:-1] = (points[2:] - points[:-2]) * 0.5
-    norms = np.linalg.norm(t, axis=1, keepdims=True)
-    norms = np.where(norms < 1e-12, 1.0, norms)
-    return (t / norms).astype(np.float32)
-
-
 def _initial_perp(axis: np.ndarray, seed: int) -> np.ndarray:
     """Random unit vector perpendicular to `axis` (per-strand reproducible)."""
     rng = random.Random(seed)
@@ -71,96 +51,113 @@ def _initial_perp(axis: np.ndarray, seed: int) -> np.ndarray:
     return (cross / max(np.linalg.norm(cross), 1e-12)).astype(np.float32)
 
 
-def _strand_to_ribbon(
-    points: np.ndarray, root_w: float, tip_w: float, seed: int
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
-    """Build per-corner (positions, normals, tangents, uvs) for one strand.
+def _strands_to_ribbons(points, root_w, tip_w, seeds):
+    """Tessellate (B, N, 3) points with six corners per segment, strand first.
 
-    Output layout: 3 corners per triangle, 2 triangles per segment, (N-1)
-    segments per strand → 6*(N-1) corners. Caller concatenates across strands.
-
-    UVs are laid out so a leaf-card / petal texture stretches across the
-    full ribbon: U sweeps along the strand width (0 = left edge, 1 =
-    right edge), V along the strand length (0 at root, 1 at tip). This
-    matches Cycles' default "Generated" hair UVs and is what artists
-    paint their alpha-cutout decals against (lone_monk's bush ribbons,
-    grass blades).
-
-    Returns None for degenerate strands.
+    Transport frames along each strand; batch independent strands and segments
+    to avoid thousands of small NumPy calls. Keep the scalar reduction order,
+    random seeds, winding and UVs (U across width, V from root to tip).
     """
-    n = points.shape[0]
-    if n < 2:
-        return None
-    axes = _strand_axes(points)
-
-    # Parallel-transport the perpendicular: project the previous "up" onto the
-    # plane perpendicular to the new tangent. Sharp bends (cos < ~0) collapse
-    # the projection — fall back to a fresh random perp at the offending key.
+    count, n, _ = points.shape
+    axes = np.empty_like(points)
+    axes[:, 0] = points[:, 1] - points[:, 0]
+    axes[:, -1] = points[:, -1] - points[:, -2]
+    axes[:, 1:-1] = (points[:, 2:] - points[:, :-2]) * 0.5
+    norms = np.linalg.norm(axes, axis=2, keepdims=True)
+    axes /= np.where(norms < 1e-12, 1.0, norms)
     perps = np.empty_like(axes)
-    perps[0] = _initial_perp(axes[0], seed)
-    up = perps[0]
+    perps[:, 0] = [_initial_perp(a, int(seed)) for a, seed in zip(axes[:, 0], seeds)]
+    up = perps[:, 0]
     for i in range(1, n):
-        a = axes[i]
-        candidate = up - a * float(np.dot(up, a))
-        l2 = float(np.dot(candidate, candidate))
-        if l2 < 1e-6:
-            candidate = _initial_perp(a, seed + i * 1009)
-        else:
-            candidate = candidate / math.sqrt(l2)
-        perps[i] = candidate.astype(np.float32)
+        a = axes[:, i]
+        # Batched dot preserves the scalar np.dot reduction order.
+        projection = (up[:, None, :] @ a[:, :, None]).reshape(-1, 1)
+        candidate = up - a * projection
+        l2 = (candidate[:, None, :] @ candidate[:, :, None]).reshape(-1)
+        fallback = l2 < 1e-6
+        length = np.sqrt(np.where(fallback, 1.0, l2).astype(np.float64))
+        candidate /= length.astype(np.float32)[:, None]
+        for j in np.flatnonzero(fallback):
+            candidate[j] = _initial_perp(a[j], int(seeds[j]) + i * 1009)
+        perps[:, i] = candidate
         up = candidate
-
     t_param = np.linspace(0.0, 1.0, n, dtype=np.float32)
-    half = (root_w * (1.0 - t_param) + tip_w * t_param) * 0.5
-    half = half.astype(np.float32)
-    half_v = perps * half[:, None]
-    L = points + half_v
-    R = points - half_v
-
-    n_segs = n - 1
-    n_corners = n_segs * 6
-    positions = np.empty((n_corners, 3), dtype=np.float32)
-    normals = np.empty((n_corners, 3), dtype=np.float32)
-    tangents = np.empty((n_corners, 3), dtype=np.float32)
-    uvs = np.empty((n_corners, 2), dtype=np.float32)
-
-    for i in range(n_segs):
-        seg_axis = axes[i] + axes[i + 1]
-        seg_perp = perps[i] + perps[i + 1]
-        seg_norm = np.cross(seg_axis, seg_perp)
-        l = float(np.linalg.norm(seg_norm))
-        if l > 1e-12:
-            seg_norm = (seg_norm / l).astype(np.float32)
-        else:
-            seg_norm = np.array([0.0, 0.0, 1.0], dtype=np.float32)
-        base = i * 6
-        # Triangle 1: L[i], L[i+1], R[i]
-        positions[base + 0] = L[i]
-        positions[base + 1] = L[i + 1]
-        positions[base + 2] = R[i]
-        # Triangle 2: R[i], L[i+1], R[i+1]
-        positions[base + 3] = R[i]
-        positions[base + 4] = L[i + 1]
-        positions[base + 5] = R[i + 1]
-        normals[base : base + 6] = seg_norm
-        tangents[base + 0] = axes[i]
-        tangents[base + 1] = axes[i + 1]
-        tangents[base + 2] = axes[i]
-        tangents[base + 3] = axes[i]
-        tangents[base + 4] = axes[i + 1]
-        tangents[base + 5] = axes[i + 1]
-        # U sweeps strand width (0 left, 1 right), V sweeps length
-        # (root → tip). The ribbon's L corner is U=0, R is U=1; v[i]
-        # parameterises the segment's start, v[i+1] its end.
-        v0 = float(t_param[i])
-        v1 = float(t_param[i + 1])
-        uvs[base + 0] = (0.0, v0)
-        uvs[base + 1] = (0.0, v1)
-        uvs[base + 2] = (1.0, v0)
-        uvs[base + 3] = (1.0, v0)
-        uvs[base + 4] = (0.0, v1)
-        uvs[base + 5] = (1.0, v1)
+    half = (root_w[:, None] * (1.0 - t_param) + tip_w[:, None] * t_param) * 0.5
+    half_v = perps * half[:, :, None]
+    left = points + half_v
+    right = points - half_v
+    segments = np.arange(n - 1)
+    keys = np.stack(
+        (segments, segments + 1, segments, segments, segments + 1, segments + 1),
+        axis=1,
+    ).ravel()
+    sides = np.tile([False, False, True, True, False, True], n - 1)
+    positions = np.where(
+        sides[None, :, None], right[:, keys], left[:, keys]
+    ).reshape(-1, 3)
+    tangents = axes[:, keys].reshape(-1, 3)
+    seg_norm = np.cross(axes[:, :-1] + axes[:, 1:], perps[:, :-1] + perps[:, 1:])
+    length = np.sqrt((seg_norm[..., None, :] @ seg_norm[..., :, None])[..., 0, 0])
+    regular = length > 1e-12
+    seg_norm /= np.where(regular, length, 1.0)[..., None]
+    seg_norm[~regular] = [0.0, 0.0, 1.0]
+    normals = np.repeat(seg_norm, 6, axis=1).reshape(-1, 3)
+    uv = np.stack((sides.astype(np.float32), t_param[keys]), axis=1)
+    uvs = np.tile(uv, (count, 1))
     return positions, normals, tangents, uvs
+
+
+def _strand_to_ribbon(points, root_w, tip_w, seed):
+    """Single-strand entry point, with the same layout as batched export."""
+    if len(points) < 2:
+        return None
+    return _strands_to_ribbons(
+        points[None, ...], np.array([root_w], np.float32),
+        np.array([tip_w], np.float32), [seed],
+    )
+
+
+def _strand_batches(strands, seed_base):
+    """Bound temporary geometry and keep consecutive, equal-length strands together."""
+    batch = []
+    key_count = 0
+    for strand_i, (points, root_w, tip_w) in enumerate(strands):
+        if len(points) < 2:
+            continue
+        if batch and (
+            len(points) != key_count or len(batch) >= 256
+            or (len(batch) + 1) * key_count > 65536
+        ):
+            yield batch
+            batch = []
+        key_count = len(points)
+        seed = (seed_base ^ (strand_i * 49157)) & 0xFFFFFFFF
+        batch.append((points, root_w, tip_w, seed))
+    if batch:
+        yield batch
+
+
+def _hair_info(points, roots, tips, seeds, uv):
+    """Arc length, width and deterministic random value in ribbon corner order."""
+    lengths = np.linalg.norm(np.diff(points, axis=1), axis=2)
+    total = lengths.sum(axis=1)
+    intercepts = np.concatenate(
+        (np.zeros((len(points), 1)), np.cumsum(lengths, axis=1)), axis=1
+    ) / np.maximum(total.astype(np.float64), 1e-20)[:, None]
+    segments = np.arange(points.shape[1] - 1)
+    keys = np.stack(
+        (segments, segments + 1, segments, segments, segments + 1, segments + 1),
+        axis=1,
+    ).ravel()
+    data = np.empty((len(points), len(keys), 4), np.float32)
+    data[:, :, 0] = intercepts[:, keys]
+    data[:, :, 1] = total[:, None]
+    v = uv.reshape(len(points), -1, 2)[:, :, 1]
+    data[:, :, 2] = roots[:, None] * (1 - v) + tips[:, None] * v
+    data[:, :, 3] = np.array(
+        [(seed & 0xFFFFFF) / 16777216.0 for seed in seeds], np.float32
+    )[:, None]
+    return data.reshape(-1, 4)
 
 
 def _strand_widths(settings) -> tuple[float, float]:
@@ -416,44 +413,20 @@ def export_hair(
     psys_seed_base = abs(hash(log_tag)) & 0xFFFFFFFF
     for psys_i, psys in enumerate(hair_psys):
         sub_tag = f"{log_tag}.{psys.name}"
-        for strand_i, (points, root_w, tip_w) in enumerate(
-            _iter_strands(psys, scene_eval, obj_eval, sub_tag)
-        ):
-            seed = (psys_seed_base ^ (psys_i * 999983) ^ (strand_i * 49157)) & 0xFFFFFFFF
-            ribbon = _strand_to_ribbon(points, root_w, tip_w, seed)
-            if ribbon is None:
-                continue
-            p, n, t, uv = ribbon
+        strands = _iter_strands(psys, scene_eval, obj_eval, sub_tag)
+        seed_base = psys_seed_base ^ (psys_i * 999983)
+        for batch in _strand_batches(strands, seed_base):
+            points = np.stack([s[0] for s in batch])
+            roots = np.array([s[1] for s in batch], np.float32)
+            tips = np.array([s[2] for s in batch], np.float32)
+            seeds = [s[3] for s in batch]
+            p, n, t, uv = _strands_to_ribbons(points, roots, tips, seeds)
             pos_chunks.append(p)
             nrm_chunks.append(n)
             tan_chunks.append(t)
             uv_chunks.append(uv)
-            # Curve intercept follows arc length, matching Cycles' curve key u.
             if need_info:
-                lengths = np.linalg.norm(np.diff(points, axis=0), axis=1)
-                total = float(lengths.sum())
-                intercepts = np.concatenate(([0.0], np.cumsum(lengths))) / max(
-                    total, 1e-20
-                )
-                segments = np.arange(len(points) - 1)
-                keys = np.stack(
-                    (
-                        segments,
-                        segments + 1,
-                        segments,
-                        segments,
-                        segments + 1,
-                        segments + 1,
-                    ),
-                    axis=1,
-                ).ravel()
-                data = np.empty((len(p), 4), np.float32)
-                data[:, 0] = intercepts[keys]
-                data[:, 1] = total
-                # Hair Info Thickness is diameter, matching the ribbon width.
-                data[:, 2] = root_w * (1 - uv[:, 1]) + tip_w * uv[:, 1]
-                data[:, 3] = (seed & 0xFFFFFF) / 16777216.0
-                info_chunks.append(data)
+                info_chunks.append(_hair_info(points, roots, tips, seeds, uv))
 
     for psys in hair_psys:
         try:

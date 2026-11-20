@@ -43,3 +43,7 @@ pub const COLOR_NODE_BRIGHT_CONTRAST: u32 = 7;
 pub const COLOR_NODE_VERTEX_COLOR: u32 = 8;
 pub const COLOR_NODE_OBJECT_RANDOM: u32 = 9;
 pub const COLOR_NODE_COLOR_RAMP: u32 = 10;
+
+/// Texture address, width, height and f32 channel count: L, LA, RGB or RGBA.
+/// L replicates into RGB; layouts without alpha reconstruct alpha exactly as 1.
+pub type TextureBinding = (u64, i32, i32, i32);

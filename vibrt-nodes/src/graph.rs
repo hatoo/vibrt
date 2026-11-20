@@ -156,7 +156,7 @@ fn identity_uv_transform() -> [f32; 6] {
 
 pub fn pack(
     graph: &ColorGraph,
-    textures: &[(u64, i32, i32)],
+    textures: &[crate::types::TextureBinding],
     lut_ptrs: &[u64],
     lut_lens: &[u32],
 ) -> Result<Vec<ColorGraphNode>> {
@@ -180,7 +180,7 @@ pub fn pack(
 fn flatten_one(
     node: &ColorNode,
     self_idx: usize,
-    textures: &[(u64, i32, i32)],
+    textures: &[crate::types::TextureBinding],
     lut_ptrs: &[u64],
     lut_lens: &[u32],
     out: &mut ColorGraphNode,
@@ -206,7 +206,7 @@ fn flatten_one(
             p[2] = rgb[2].to_bits();
         }
         ColorNode::ImageTex { tex, uv } => {
-            let (ptr, w, h) = *textures
+            let (ptr, w, h, channels) = *textures
                 .get(*tex as usize)
                 .ok_or_else(|| anyhow!("color_graph ImageTex.tex = {} out of range", tex))?;
             out.tag = COLOR_NODE_IMAGE_TEX;
@@ -214,7 +214,8 @@ fn flatten_one(
             p[1] = (ptr >> 32) as u32;
             p[2] = w as u32;
             p[3] = h as u32;
-            p[4] = 4; // RGBA f32 — every loaded texture is padded to 4 channels
+            ensure!((1..=4).contains(&channels), "Invalid texture channel count");
+            p[4] = channels as u32;
             for k in 0..6 {
                 p[5 + k] = uv[k].to_bits();
             }

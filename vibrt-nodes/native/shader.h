@@ -247,9 +247,13 @@ VN_INLINE float4 texel(const ShaderInstruction &n, int x, int y) {
     return make_float4(0);
   x = tex_index(x, n.width, n.modes[1]);
   y = tex_index(y, n.height, n.modes[1]);
-  const float *p = (const float *)n.data + 4 * (y * n.width + x);
-  float a = n.params[2] != 0 ? p[3] : 1;
-  return make_float4(p[0] * a, p[1] * a, p[2] * a, p[3]);
+  // Image instructions store the channel count in the unused LUT length.
+  int channels = (int)n.table_len;
+  const float *p = (const float *)n.data + channels * (y * n.width + x);
+  float alpha = channels == 4 ? p[3] : (channels == 2 ? p[1] : 1);
+  float a = n.params[2] != 0 ? alpha : 1;
+  return make_float4(p[0] * a, (channels <= 2 ? p[0] : p[1]) * a,
+                     (channels <= 2 ? p[0] : p[2]) * a, alpha);
 }
 VN_INLINE float4 image_sample_raw(const ShaderInstruction &n, float3 v) {
   if (n.modes[0] == 1)

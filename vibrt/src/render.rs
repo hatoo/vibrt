@@ -200,6 +200,7 @@ struct GasEntry {
     transform: [f32; 12],
     cast_shadow: bool,
     camera_visible: bool,
+    opaque: bool,
 }
 
 fn build_rect_light_cdf(rects: &[AreaRectLight]) -> Vec<f32> {
@@ -309,6 +310,13 @@ pub fn render_to_pixels(
     // --- Upload textures (shared across materials) ---
     let mut _tex_buffers: Vec<CudaSlice<f32>> = Vec::new();
     let tex_slots = principled::upload_textures(&scene.textures, &stream, &mut _tex_buffers)?;
+    let texture_bytes: usize = _tex_buffers.iter().map(|b| b.len() * 4).sum();
+    let source_bytes: usize = scene.textures.iter().map(|t| t.data.len() * 4).sum();
+    progress.log(&format!(
+        "GPU textures: {:.2} MiB (source {:.2} MiB)",
+        texture_bytes as f64 / 1_048_576.0,
+        source_bytes as f64 / 1_048_576.0,
+    ));
 
     // --- Upload materials ---
     // Colour-graph buffers (node records + per-node LUT data) live for the
@@ -327,7 +335,7 @@ pub fn render_to_pixels(
     // recurses 3 levels deep, so >8 is well past any artist intent.
     fn upload_one_mat(
         mat: &scene_format::PrincipledMaterial,
-        tex_slots: &[(optix_sys::CUdeviceptr, i32, i32)],
+        tex_slots: &[TextureBinding],
         stream: &Arc<CudaStream>,
         graph_storage: &mut principled::GraphStorage,
         uploads: &UploadArena,
@@ -759,6 +767,18 @@ pub fn render_to_pixels(
             transform: obj.transform,
             cast_shadow: scene.file.objects[obj_idx].cast_shadow,
             camera_visible: scene.file.objects[obj_idx].camera_visible,
+            // An instance can share a GAS with differently shaded instances.
+            // Inspect every slot, including the fallback for invalid face IDs.
+            opaque: std::iter::once(obj.material)
+                .chain(obj_materials.iter().copied())
+                .all(|id| {
+                    let material = scene
+                        .file
+                        .materials
+                        .get(id as usize)
+                        .unwrap_or(&scene.file.materials[obj.material as usize]);
+                    !principled::needs_any_hit(material)
+                }),
         });
     }
 
@@ -790,7 +810,11 @@ pub fn render_to_pixels(
                 instanceId: i as u32,
                 sbtOffset: e.sbt_offset,
                 visibilityMask: mask,
-                flags: optix_sys::OptixInstanceFlags::OPTIX_INSTANCE_FLAG_NONE.0 as u32,
+                flags: if e.opaque {
+                    InstanceFlags::DISABLE_ANYHIT.bits()
+                } else {
+                    InstanceFlags::NONE.bits()
+                },
                 traversableHandle: e.handle,
                 pad: [0; 2],
             }
@@ -905,14 +929,7 @@ pub fn render_to_pixels(
             .iter()
             .map(|t| {
                 let (tex_ptr, tex_w, tex_h, tex_c) = match t.emission_tex_idx {
-                    Some(idx) => match tex_slots.get(idx as usize).copied() {
-                        // tex_slots returns (CUdeviceptr, w, h); channels
-                        // are always 4 in vibrt's texture pipeline (RGBA
-                        // f32). Mirrors how `make_material_data` resolves
-                        // texture slots in principled.rs.
-                        Some((p, w, h)) => (p, w, h, 4),
-                        None => (0, 0, 0, 0),
-                    },
+                    Some(idx) => tex_slots.get(idx as usize).copied().unwrap_or_default(),
                     None => (0, 0, 0, 0),
                 };
                 MeshLightTri {
@@ -1054,7 +1071,10 @@ pub fn render_to_pixels(
         )
     };
     let progressive = progress.wants_preview();
-    let d_accumulation: Option<CudaSlice<f32>> = if progressive && render_settings.spp > 1 {
+    // Keep sample scheduling independent of preview readback. A single long
+    // per-pixel sample loop leaves the GPU waiting for the slowest paths;
+    // bounded launches also let headless renders observe cancellation promptly.
+    let d_accumulation: Option<CudaSlice<f32>> = if render_settings.spp > 1 {
         Some(stream.alloc_zeros(pixel_count * 4).cuda()?)
     } else {
         None
@@ -1098,7 +1118,7 @@ pub fn render_to_pixels(
         height: render_settings.height,
         samples_per_pixel: render_settings.spp,
         sample_start: 0,
-        sample_count: if progressive { 1 } else { render_settings.spp },
+        sample_count: 1,
         film_transparent: render_settings.film_transparent as u32,
         max_depth: render_settings.max_depth,
         max_diffuse_bounces: render_settings.max_diffuse_bounces,
