@@ -16,6 +16,13 @@ pub fn optimize_materials(materials: &mut [PrincipledMaterial]) -> Result<()> {
         if let Some(graph) = &mut material.shader_graph {
             *graph = graph.optimized()?;
         }
+        if let Some(graph) = material
+            .volume
+            .as_mut()
+            .and_then(|v| v.emission_graph.as_mut())
+        {
+            *graph = graph.optimized()?;
+        }
         for aov in &mut material.aov_graphs {
             aov.graph = aov.graph.optimized()?;
         }
@@ -50,6 +57,22 @@ impl ShaderRequirements {
         aov_count: usize,
         world_volume: Option<&VolumeParams>,
     ) -> Result<Self> {
+        fn validate_volume(v: &VolumeParams, stack: &mut usize) -> Result<()> {
+            anyhow::ensure!(
+                v.phase <= 4 && v.phase_params.iter().all(|x| x.is_finite()),
+                "Invalid volume phase parameters"
+            );
+            if let Some(graph) = &v.emission_graph {
+                *stack = (*stack).max(graph.required_stack_size()?);
+                anyhow::ensure!(graph.required_contexts()? & !((1 << 20) | (1 << 21)) == 0,
+                    "Homogeneous volume emission supports ray flags; spatial/depth-dependent emission requires heterogeneous volume transport");
+                anyhow::ensure!(
+                    graph.outputs.len() == 1 && graph.outputs.contains_key("emission"),
+                    "Volume graph must output emission"
+                );
+            }
+            Ok(())
+        }
         fn validate_shader_tree(
             material: &PrincipledMaterial,
             depth: usize,
@@ -72,10 +95,7 @@ impl ShaderRequirements {
                 *shader_stack_size = (*shader_stack_size).max(aov.graph.required_stack_size()?);
             }
             if let Some(volume) = &material.volume {
-                anyhow::ensure!(
-                    volume.phase <= 4 && volume.phase_params.iter().all(|v| v.is_finite()),
-                    "Invalid volume phase parameters"
-                );
+                validate_volume(volume, shader_stack_size)?;
             }
             let leaves = match (&material.left_subtree, &material.secondary) {
                 (None, None) => 1,
@@ -107,10 +127,7 @@ impl ShaderRequirements {
             )?);
         }
         if let Some(volume) = &world_volume {
-            anyhow::ensure!(
-                volume.phase <= 4 && volume.phase_params.iter().all(|v| v.is_finite()),
-                "Invalid world volume phase parameters"
-            );
+            validate_volume(volume, &mut shader_stack_size)?;
         }
         fn shader_operations(material: &PrincipledMaterial) -> u64 {
             let mut flags = 0;
@@ -118,6 +135,12 @@ impl ShaderRequirements {
                 .shader_graph
                 .iter()
                 .chain(material.aov_graphs.iter().map(|a| &a.graph))
+                .chain(
+                    material
+                        .volume
+                        .iter()
+                        .filter_map(|v| v.emission_graph.as_ref()),
+                )
             {
                 for node in &graph.nodes {
                     if let Some(index) = vibrt_nodes::shader::OPS
@@ -136,9 +159,19 @@ impl ShaderRequirements {
             }
             flags
         }
-        let shader_ops = materials
+        let mut shader_ops = materials
             .iter()
             .fold(0, |mask, m| mask | shader_operations(m));
+        if let Some(graph) = world_volume.and_then(|v| v.emission_graph.as_ref()) {
+            for node in &graph.nodes {
+                if let Some(i) = vibrt_nodes::shader::OPS
+                    .iter()
+                    .position(|(op, _)| *op == node.op)
+                {
+                    shader_ops |= 1u64 << i;
+                }
+            }
+        }
         fn extended_requirements(m: &PrincipledMaterial) -> Result<(u32, usize)> {
             anyhow::ensure!(
                 m.closure_type <= 7 && m.closure_type != 6,
@@ -151,6 +184,11 @@ impl ShaderRequirements {
                 1 << m.closure_type
             };
             let mut outputs = 32;
+            anyhow::ensure!(m.sss_method <= 3, "Unsupported subsurface method");
+            if m.sss_method != 0 {
+                kinds |= 1 << 7;
+                outputs = 64;
+            }
             for graph in m
                 .shader_graph
                 .iter()
@@ -307,6 +345,37 @@ pub fn compile(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn volume_emission_contributes_shader_requirements_and_rejects_spatial_context() {
+        let graph = json!({"nodes":[
+            {"op":"context","modes":[20,0,0,0]},
+            {"op":"separate","inputs":[0],"modes":[0,0,0,0]}
+        ],"outputs":{"emission":1}});
+        let mut volume: VolumeParams =
+            serde_json::from_value(json!({"emission_graph":graph})).unwrap();
+        let world = ShaderRequirements::new(&[], 0, Some(&volume)).unwrap();
+        let material: PrincipledMaterial = serde_json::from_value(json!({
+            "base_color":[0,0,0], "volume":{"emission_graph":graph}
+        }))
+        .unwrap();
+        let bounded = ShaderRequirements::new(&[material], 0, None).unwrap();
+        assert_ne!(world.shader_ops, 0);
+        assert_eq!(world.shader_ops, bounded.shader_ops);
+        volume.emission_graph.as_mut().unwrap().nodes[0].modes[0] = 3;
+        assert!(ShaderRequirements::new(&[], 0, Some(&volume)).is_err());
+    }
+
+    #[test]
+    fn principled_subsurface_enables_queries_without_a_standalone_closure() {
+        let material: PrincipledMaterial = serde_json::from_value(json!({
+            "base_color":[0.2,0.4,0.7],"sss_weight":1,"sss_method":2
+        }))
+        .unwrap();
+        let requirements = ShaderRequirements::new(&[material], 0, None).unwrap();
+        assert!(requirements.scene_queries());
+        assert_eq!(requirements.shader_output_count, 64);
+    }
 
     #[test]
     fn optimization_reaches_closure_children_and_aovs_before_requirements() {

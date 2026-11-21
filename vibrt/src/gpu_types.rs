@@ -62,6 +62,10 @@ pub struct PrincipledGpu {
     pub sheen_tint: [f32; 3],
     pub sss_weight: f32,
     pub sss_radius: [f32; 3],
+    pub sss_method: u32,
+    pub sss_scale: f32,
+    pub sss_ior: f32,
+    pub sss_anisotropy: f32,
     /// Cycles Translucent BSDF weight. Lambertian on the back hemisphere;
     /// shares budget with `w_diffuse` (translucent_weight=1 → all diffuse
     /// energy goes to the back lobe instead of the front).
@@ -149,6 +153,9 @@ pub struct PrincipledGpu {
 #[repr(C)]
 #[derive(Copy, Clone, Default)]
 pub struct VolumeGpu {
+    pub emission_nodes: optix_sys::CUdeviceptr,
+    pub emission_len: i32,
+    pub emission_contexts: u32,
     pub phase: u32,
     pub phase_params: [f32; 4],
     /// σ_t per channel (extinction = scattering + absorption).
@@ -235,10 +242,11 @@ pub struct AovShader {
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct PointLight {
+    pub shader: optix_sys::CUdeviceptr,
     pub position: [f32; 3],
     pub radius: f32,
     pub emission: [f32; 3],
-    pub _pad: f32,
+    pub sphere: u32,
     /// Optional IES profile attached to this light. `ies_data` points
     /// to a CUDA buffer of `ies_n_v * max(1, ies_n_h) * 1` floats laid
     /// out as `[h * n_v + v]` (matching `IesProfile.candelas`), already
@@ -271,8 +279,9 @@ pub struct SunLight {
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct SpotLight {
+    pub shader: optix_sys::CUdeviceptr,
     pub position: [f32; 3],
-    pub _pad0: f32,
+    pub radius: f32,
     pub direction: [f32; 3],
     pub cos_outer: f32,
     pub emission: [f32; 3],
@@ -284,11 +293,14 @@ pub struct SpotLight {
     pub ies_n_v: u32,
     pub ies_n_h: u32,
     pub light_rotation: [f32; 9],
+    pub sphere: u32,
 }
 
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct AreaRectLight {
+    pub shader: optix_sys::CUdeviceptr,
+    pub disk: u32,
     /// Corner in world space (center - 0.5*size_u*u - 0.5*size_v*v)
     pub corner: [f32; 3],
     pub size_u: f32,
@@ -377,6 +389,8 @@ pub struct LaunchParams {
     pub query_nodes: optix_sys::CUdeviceptr,
     pub query_indices: optix_sys::CUdeviceptr,
     pub query_objects: optix_sys::CUdeviceptr,
+    pub initial_volumes: optix_sys::CUdeviceptr,
+    pub num_initial_volumes: u32,
     pub aov_data: optix_sys::CUdeviceptr,
     pub num_aovs: u32,
     /// float4 image buffer (normalized linear RGB + alpha).
@@ -398,6 +412,7 @@ pub struct LaunchParams {
     pub max_diffuse_bounces: u32,
     pub max_glossy_bounces: u32,
     pub max_transmission_bounces: u32,
+    pub max_transparent_bounces: u32,
 
     pub cam_eye: [f32; 3],
     pub cam_u: [f32; 3],
@@ -416,6 +431,7 @@ pub struct LaunchParams {
     /// the sensor — applied as an NDC offset in raygen.
     pub cam_shift_x: f32,
     pub cam_shift_y: f32,
+    pub cam_orthographic: u32,
 
     pub traversable: optix_sys::OptixTraversableHandle,
 

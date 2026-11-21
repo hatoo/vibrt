@@ -278,7 +278,8 @@ pub fn render_to_pixels(
         scene.file.aov_names.len(),
         scene.file.world_volume.as_ref(),
     )?;
-    let scene_queries = requirements.scene_queries();
+    let scene_queries =
+        requirements.scene_queries() || scene.file.materials.iter().any(|m| m.volume.is_some());
     let shaders = crate::shader_compile::compile(&ctx, requirements, progress)?;
     let pipeline = &shaders.pipeline;
     let raygen_pg = &shaders.raygen;
@@ -342,7 +343,14 @@ pub fn render_to_pixels(
         };
         let volume_ptr = match &mat.volume {
             Some(v) => {
-                let vg = principled::make_volume_gpu(v);
+                let mut vg = principled::make_volume_gpu(v);
+                if let Some(graph) = &v.emission_graph {
+                    let binding =
+                        principled::upload_shader_graph(graph, tex_slots, stream, graph_storage)?;
+                    vg.emission_nodes = binding.nodes;
+                    vg.emission_len = binding.len;
+                    vg.emission_contexts = binding.contexts;
+                }
                 uploads.copy(&vg)?
             }
             None => 0,
@@ -401,7 +409,21 @@ pub fn render_to_pixels(
     // World volume sits in LaunchParams and is shared by every ray that
     // doesn't enter a tighter mesh-bounded volume. Allocated once.
     let world_volume_ptr: optix_sys::CUdeviceptr = match &scene.file.world_volume {
-        Some(v) => uploads.copy(&principled::make_volume_gpu(v))?,
+        Some(v) => {
+            let mut vg = principled::make_volume_gpu(v);
+            if let Some(graph) = &v.emission_graph {
+                let binding = principled::upload_shader_graph(
+                    graph,
+                    &tex_slots,
+                    &stream,
+                    &mut graph_storage,
+                )?;
+                vg.emission_nodes = binding.nodes;
+                vg.emission_len = binding.len;
+                vg.emission_contexts = binding.contexts;
+            }
+            uploads.copy(&vg)?
+        }
         None => 0,
     };
 
@@ -866,17 +888,43 @@ pub fn render_to_pixels(
         (0, 0, 0)
     };
 
+    // Only bounded media need per-camera containment queries. Reuse their
+    // geometry BVHs; do not trace every object for every camera sample.
+    let initial_volumes: Vec<_> = query_objects
+        .iter()
+        .enumerate()
+        .filter_map(|(i, q)| {
+            let object = &scene.file.objects[i];
+            std::iter::once(&object.material)
+                .chain(object.materials.iter())
+                .any(|m| {
+                    scene
+                        .file
+                        .materials
+                        .get(*m as usize)
+                        .is_some_and(|m| m.volume.is_some())
+                })
+                .then_some(*q)
+        })
+        .collect();
+    let initial_volumes_ptr = uploads.copy_slice(&initial_volumes)?;
+
     let sbt_builder = ShaderBindingTableBuilder::new(d_rg)
         .miss_records(d_miss, miss_stride as u32, 2)
         .hitgroup_records(d_hg, hg_stride as u32, tri_hg_records.len() as u32);
     let sbt = sbt_builder.build()?;
 
     // --- Camera ---
-    let aspect = render_settings.width as f32 / render_settings.height as f32;
+    let aspect = if scene.file.camera.frame_aspect > 0.0 {
+        scene.file.camera.frame_aspect
+    } else {
+        render_settings.width as f32 / render_settings.height as f32
+    };
     let (eye, cam_u, cam_v, cam_w) = camera::compute_camera(
         &scene.file.camera.transform,
         scene.file.camera.fov_y_rad,
         aspect,
+        scene.file.camera.ortho_height,
     );
 
     // --- Lights ---
@@ -888,7 +936,25 @@ pub fn render_to_pixels(
     // lifetime of the render — drop on render exit.
     let mut point_lights = scene.point_lights.clone();
     let mut spot_lights = scene.spot_lights.clone();
+    for shader in point_lights
+        .iter_mut()
+        .map(|l| &mut l.shader)
+        .chain(spot_lights.iter_mut().map(|l| &mut l.shader))
+    {
+        if *shader != 0 {
+            *shader = *mat_device_ptrs
+                .get((*shader - 1) as usize)
+                .context("light shader material index out of range")?;
+        }
+    }
     let mut rect_lights = scene.rect_lights.clone();
+    for light in &mut rect_lights {
+        if light.shader != 0 {
+            light.shader = *mat_device_ptrs
+                .get((light.shader - 1) as usize)
+                .context("area-light shader material index out of range")?;
+        }
+    }
     let _d_ies_point = upload_ies_buffers(&uploads, &mut point_lights, &scene.point_ies)?;
     let _d_ies_spot = upload_ies_buffers(&uploads, &mut spot_lights, &scene.spot_ies)?;
     let _d_ies_rect = upload_ies_buffers(&uploads, &mut rect_lights, &scene.rect_ies)?;
@@ -1090,6 +1156,8 @@ pub fn render_to_pixels(
         query_nodes,
         query_indices,
         query_objects: query_objects_ptr,
+        initial_volumes: initial_volumes_ptr,
+        num_initial_volumes: initial_volumes.len() as u32,
         aov_data: d_aovs.as_ref().map_or(0, |s| dptr_f32(s, &stream)),
         num_aovs: scene.file.aov_names.len() as u32,
         image: dptr_f32(&d_image, &stream),
@@ -1104,6 +1172,7 @@ pub fn render_to_pixels(
         max_diffuse_bounces: render_settings.max_diffuse_bounces,
         max_glossy_bounces: render_settings.max_glossy_bounces,
         max_transmission_bounces: render_settings.max_transmission_bounces,
+        max_transparent_bounces: render_settings.max_transparent_bounces,
         cam_eye: eye,
         cam_u,
         cam_v,
@@ -1114,6 +1183,7 @@ pub fn render_to_pixels(
         cam_clip_end: scene.file.camera.clip_end,
         cam_shift_x: scene.file.camera.shift_x,
         cam_shift_y: scene.file.camera.shift_y,
+        cam_orthographic: u32::from(scene.file.camera.ortho_height > 0.0),
         traversable,
         num_point_lights: scene.point_lights.len() as i32,
         point_lights: d_points,

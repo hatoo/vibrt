@@ -73,6 +73,11 @@ class Compiler:
             if default is None:
                 raise UnsupportedNode("Missing node input")
             return self.constant(default)
+        if (socket.name == "Normal" and socket.type == "VECTOR"
+                and self._unlinked_hidden_input(socket, groups)):
+            # Flattening a group leaves an unconnected hidden Normal input
+            # implicit. Its stored (0, 0, 0) is not a world-space normal.
+            return self.context(4)
         if not socket.is_linked:
             return self.constant(socket.default_value if default is None else default)
         source = socket.links[0].from_socket
@@ -81,6 +86,33 @@ class Compiler:
             if source.type in {"RGBA", "VECTOR"}:
                 result = self.add("convert", [result], [0 if source.type == "RGBA" else 1])
         return result
+
+    @staticmethod
+    def _unlinked_hidden_input(socket, groups):
+        """Follow only wiring proxies, preserving implicit socket defaults."""
+        for _ in range(64):
+            if socket is None:
+                return False
+            if not socket.is_linked:
+                return bool(socket.hide_value)
+            source = socket.links[0].from_socket
+            node = source.node
+            if node.mute:
+                link = next((l for l in node.internal_links if l.to_socket == source), None)
+                socket = link.from_socket if link else None
+            elif node.bl_idname == "NodeReroute":
+                socket = node.inputs[0]
+            elif node.bl_idname == "NodeGroupInput" and groups:
+                socket = next((s for s in groups[-1].inputs if s.identifier == source.identifier), None)
+                groups = groups[:-1]
+            elif node.bl_idname == "ShaderNodeGroup" and node.node_tree:
+                output = next((n for n in node.node_tree.nodes
+                               if n.bl_idname == "NodeGroupOutput" and n.is_active_output), None)
+                socket = next((s for s in output.inputs if s.identifier == source.identifier), None) if output else None
+                groups = groups + (node,)
+            else:
+                return False
+        raise UnsupportedNode("Cyclic or excessively nested socket wiring")
 
     def output(self, socket, groups=None):
         groups = self.groups if groups is None else groups
@@ -301,8 +333,19 @@ class Compiler:
         if kind in {"ShaderNodeBlackbody", "ShaderNodeWavelength"}:
             return self.add("blackbody" if kind.endswith("Blackbody") else "wavelength", ins(0))
         if kind == "ShaderNodeTexCoord":
-            if n.object is not None or n.from_instancer:
-                raise UnsupportedNode("Explicit coordinate object / instancer coordinates")
+            if n.from_instancer and name in {"Object", "Generated", "UV"}:
+                raise UnsupportedNode("Instancer coordinates")
+            if n.object is not None and name == "Object":
+                # Preserve the full inverse affine transform, including shear.
+                # World Position also carries the offset used by bump derivatives.
+                position = self.context(3)
+                components = []
+                for row in n.object.matrix_world.inverted_safe()[:3]:
+                    zero = self.constant(0)
+                    dot = self.add("vector_math", [position, self.constant(row[:3]), zero, zero],
+                                   [VECTOR_MATH.index("DOT_PRODUCT"), 1])
+                    components.append(self.add("math", [dot, self.constant(row[3]), zero], [0]))
+                return self.add("combine", components, [0])
             contexts = {"UV": 0, "Generated": 1, "Object": 2, "Normal": 13, "Camera": 12, "Window": 14, "Reflection": 15}
             return self.context(contexts[name])
         if kind == "ShaderNodeBump":
@@ -374,6 +417,8 @@ class Compiler:
                 3 if kind == "ShaderNodeParticleInfo" and name == "Random" else 0,
             )
         if kind == "ShaderNodeNewGeometry":
+            if name == "Pointiness":
+                return self.attribute("geometry:pointiness")
             contexts = {"Position": 3, "Normal": 4, "True Normal": 5, "Incoming": 6, "Tangent": 7, "Backfacing": 16}
             if name not in contexts:
                 raise UnsupportedNode(f"Geometry output {name} needs extra mesh data")
@@ -429,6 +474,8 @@ PRINCIPLED_INPUTS = {
     "Coat Weight": "coat_weight", "Coat Roughness": "coat_roughness", "Coat IOR": "coat_ior",
     "Sheen Weight": "sheen_weight", "Sheen Roughness": "sheen_roughness", "Sheen Tint": "sheen_tint",
     "Subsurface Weight": "sss_weight", "Subsurface Radius": "sss_radius",
+    "Subsurface Scale": "sss_scale", "Subsurface IOR": "sss_ior",
+    "Subsurface Anisotropy": "sss_anisotropy",
     "Normal": "normal", "Tangent": "tangent",
 }
 
@@ -480,10 +527,6 @@ def compile_leaf(node, writer, textures, group_stack=()):
     """Fast path: compile sockets before the legacy image-baking traversal."""
     kind = node.bl_idname
     if kind == "ShaderNodeSubsurfaceScattering":
-        if node.falloff != "BURLEY":
-            raise UnsupportedNode(
-                "Subsurface random-walk requires interior volume transport; use Burley"
-            )
         compiler = Compiler(writer, textures, group_stack)
         outputs = {
             field: compiler.input(node.inputs[socket])
@@ -493,10 +536,20 @@ def compile_leaf(node, writer, textures, group_stack=()):
                 ("Radius", "sss_radius"),
             )
         }
+        for socket, field in (("IOR", "sss_ior"), ("Anisotropy", "sss_anisotropy")):
+            if socket in node.inputs:
+                outputs[field] = compiler.input(node.inputs[socket])
+        if "Roughness" in node.inputs:
+            # The standalone BSSRDF's socket is GGX alpha, unlike Principled's
+            # perceptual roughness (squared by material evaluation).
+            value, zero = compiler.input(node.inputs["Roughness"]), compiler.constant(0)
+            outputs["roughness"] = compiler.add("math", [value, zero, zero], [MATH.index("SQRT")])
         if node.inputs["Normal"].is_linked:
             outputs["normal"] = compiler.input(node.inputs["Normal"])
         params = {
             "closure_type": 7,
+            "sss_method": _enum(node.falloff, ["BURLEY", "RANDOM_WALK", "RANDOM_WALK_SKIN"]) + 1,
+            "sss_weight": 1.0,
             "base_color": [1.0] * 3,
             "pure_diffuse": True,
             "specular_ior_level": 0.0,
@@ -591,6 +644,10 @@ def compile_leaf(node, writer, textures, group_stack=()):
     if kind not in {"ShaderNodeBsdfPrincipled", "ShaderNodeBsdfDiffuse", "ShaderNodeBsdfAnisotropic", "ShaderNodeBsdfGlossy", "ShaderNodeBsdfGlass", "ShaderNodeBsdfRefraction", "ShaderNodeBsdfTranslucent", "ShaderNodeBsdfTransparent", "ShaderNodeEmission", "ShaderNodeBsdfMetallic"}:
         return None
     params = {"base_color": [0.8]*3, "metallic": 0.0, "roughness": 0.5, "ior": 1.45, "transmission": 0.0, "emission": [0.0]*3}
+    if kind == "ShaderNodeBsdfPrincipled":
+        socket = node.inputs.get("Subsurface Weight")
+        if socket and (socket.is_linked or socket.default_value > 0):
+            params["sss_method"] = _enum(node.subsurface_method, ["BURLEY", "RANDOM_WALK", "RANDOM_WALK_SKIN"]) + 1
     mapping = PRINCIPLED_INPUTS if kind == "ShaderNodeBsdfPrincipled" else {"Color": "emission" if kind == "ShaderNodeEmission" else "base_color", "Roughness": "roughness", "IOR": "ior", "Anisotropy": "anisotropy", "Rotation": "tangent_rotation"}
     for name, field in mapping.items():
         socket = node.inputs.get(name)
@@ -619,6 +676,49 @@ def compile_leaf(node, writer, textures, group_stack=()):
     if strength is not None:
         params["emission"] = [c*float(strength.default_value) for c in params["emission"]]
     return attach(node, params, writer, textures, group_stack)
+
+
+def compile_emission(socket, writer, textures):
+    """Compile an emission-only closure tree for analytic light evaluation."""
+    compiler = Compiler(writer, textures)
+
+    def emission(sock, groups=(), depth=0):
+        if depth > 32:
+            raise UnsupportedNode("Recursive light shader")
+        if sock is None or not sock.is_linked:
+            return compiler.constant((0, 0, 0))
+        source = sock.links[0].from_socket
+        node = source.node
+        kind = node.bl_idname
+        if node.mute:
+            internal = next((link for link in node.internal_links if link.to_socket == source), None)
+            return emission(internal.from_socket if internal else None, groups, depth + 1)
+        if kind == "NodeReroute":
+            return emission(node.inputs[0], groups, depth + 1)
+        if kind == "ShaderNodeGroup":
+            output = next(n for n in node.node_tree.nodes
+                          if n.bl_idname == "NodeGroupOutput" and n.is_active_output)
+            inner = next(s for s in output.inputs if s.identifier == source.identifier)
+            return emission(inner, groups + (node,), depth + 1)
+        if kind == "NodeGroupInput":
+            outer = next(s for s in groups[-1].inputs if s.identifier == source.identifier)
+            return emission(outer, groups[:-1], depth + 1)
+        if kind == "ShaderNodeEmission":
+            color = compiler.input(node.inputs['Color'], groups)
+            strength = compiler.input(node.inputs['Strength'], groups)
+            zero = compiler.constant(0)
+            return compiler.add('vector_math', [color, zero, zero, strength], [10, 0])
+        if kind in {"ShaderNodeMixShader", "ShaderNodeAddShader"}:
+            children = [emission(s, groups, depth + 1) for s in list(node.inputs)[-2:]]
+            if kind == "ShaderNodeAddShader":
+                zero = compiler.constant(0)
+                return compiler.add('vector_math', [*children, zero, zero], [0, 0])
+            factor = compiler.input(node.inputs[0], groups)
+            return compiler.add('mix', [factor, *children], [0, 0, 1, 0])
+        raise UnsupportedNode(f"Unsupported light closure: {kind}")
+
+    value = emission(socket)
+    return compiler.graph({'emission': value})
 
 
 def compile_aovs(tree, params, writer, textures, passes):

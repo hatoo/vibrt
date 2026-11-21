@@ -6,6 +6,9 @@
 
 /// Homogeneous volume parameters. Mirrors `gpu_types::VolumeGpu`.
 struct Volume {
+  unsigned long long emission_nodes;
+  int emission_len;
+  unsigned int emission_contexts;
   unsigned int phase;
   float phase_params[4];
   float sigma_t[3];
@@ -73,6 +76,10 @@ struct PrincipledGpu {
   float sheen_tint[3];
   float sss_weight;
   float sss_radius[3];
+  unsigned int sss_method;
+  float sss_scale;
+  float sss_ior;
+  float sss_anisotropy;
   // Cycles Translucent BSDF weight. Back-hemisphere Lambertian — shares
   // budget with the forward diffuse lobe.
   float translucent_weight;
@@ -173,10 +180,11 @@ struct HitGroupData {
 };
 
 struct PointLight {
+  PrincipledGpu *shader;
   float position[3];
   float radius;
   float emission[3];
-  float _pad;
+  unsigned int sphere;
   // Optional IES (Illuminating Engineering Society) profile: directional
   // intensity multiplier in [0, 1] sampled in the light's local frame.
   // `ies_data` is a CUDA pointer to a candela table laid out as
@@ -202,8 +210,9 @@ struct SunLight {
 };
 
 struct SpotLight {
+  PrincipledGpu *shader;
   float position[3];
-  float _pad0;
+  float radius;
   float direction[3]; // emission direction
   float cos_outer;
   float emission[3];
@@ -214,9 +223,12 @@ struct SpotLight {
   unsigned int ies_n_v;
   unsigned int ies_n_h;
   float light_rotation[9];
+  unsigned int sphere;
 };
 
 struct AreaRectLight {
+  PrincipledGpu *shader;
+  unsigned int disk;
   float corner[3];
   float size_u;
   float u_axis[3];
@@ -293,6 +305,8 @@ struct LaunchParams {
   QueryNode *query_nodes;
   unsigned int *query_indices;
   QueryObject *query_objects;
+  QueryObject *initial_volumes;
+  unsigned int num_initial_volumes;
   float *aov_data;
   unsigned int num_aovs;
   float *image; // float4 per pixel
@@ -313,6 +327,7 @@ struct LaunchParams {
   unsigned int max_diffuse_bounces;
   unsigned int max_glossy_bounces;
   unsigned int max_transmission_bounces;
+  unsigned int max_transparent_bounces;
 
   float cam_eye[3];
   float cam_u[3];
@@ -329,6 +344,7 @@ struct LaunchParams {
   // the projection centre on the sensor.
   float cam_shift_x;
   float cam_shift_y;
+  unsigned int cam_orthographic;
 
   OptixTraversableHandle traversable;
 

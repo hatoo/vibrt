@@ -79,6 +79,19 @@ fn main() {
     let end = bssrdf.find("/* Setup */").unwrap();
     source.push_str("\nnamespace vibrt_cycles {\n#define BURLEY_TRUNCATE 16.0f\n#define BURLEY_TRUNCATE_CDF 0.9963790093708328f\n#define FOREACH_SPECTRUM_CHANNEL(i) for(int i=0;i<3;i++)\n#define GET_SPECTRUM_CHANNEL(v,i) ((v)[i])\n");
     source.push_str(&bssrdf[start..end]);
+    let walk = std::fs::read_to_string("third_party/cycles/subsurface_random_walk.h").unwrap();
+    let start = walk
+        .find("ccl_device void subsurface_random_walk_remap")
+        .unwrap();
+    let end = walk
+        .find("ccl_device void subsurface_random_walk_coefficients")
+        .unwrap();
+    source.push_str(&walk[start..end]);
+    let start = bssrdf
+        .find("ccl_device float bssrdf_dipole_compute_Rd")
+        .unwrap();
+    let end = bssrdf.find("ccl_device void bssrdf_setup_radius").unwrap();
+    source.push_str(&bssrdf[start..end]);
     source.push_str("\n#undef FOREACH_SPECTRUM_CHANNEL\n#undef GET_SPECTRUM_CHANNEL\n}\n");
     std::fs::write(out.join("cycles_nodes.h"), source).unwrap();
     println!("cargo:rerun-if-changed=native");

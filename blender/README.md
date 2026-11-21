@@ -153,12 +153,12 @@ render-job check above after modifying the memory reader.
 
 ### Rendering
 
-- Camera: perspective, lens shift, and circular-aperture depth of field.
+- Camera: perspective/orthographic, pixel aspect, lens shift, and circular-aperture depth of field.
 - Meshes: triangulated, per-corner normals and UVs, multi-material slots (per-triangle material index).
-- Materials: linked Principled inputs, image/procedural textures, normal/bump mapping, displacement and Mix/Add closure trees. Supported graphs run on the GPU; legacy conversion may bake textures or approximate unsupported inputs. Standalone Chiang Hair and Burley Subsurface Scattering have dedicated closures; Principled SSS remains approximate.
-- Lights: Point, Sun, Spot, Area (square/rectangle), IES profiles, and emissive-mesh NEE.
+- Materials: linked Principled inputs, image/procedural textures, normal/bump mapping, Pointiness, displacement and Mix/Add closure trees. Supported graphs run on the GPU; legacy conversion may bake textures or approximate unsupported inputs. Standalone Chiang Hair and Burley/Random Walk/Random Walk Skin scattering have dedicated closures; Principled uses the same SSS transport.
+- Lights: Point, Sun, Spot, Area (square/rectangle/disk/ellipse), IES profiles, and emissive-mesh NEE. Point/Spot radius controls soft shadows, using sphere or legacy disk sampling. Point/Spot/Area Emission/Mix/Add graphs evaluate at sampled light points, including authored Light Falloff.
 - World: constant background, importance-sampled Environment Texture, or supported native Sky Texture graphs; other world graphs use the isolated Cycles preparation path.
-- Volumes: homogeneous Principled / Absorption / Scatter (mesh-bounded and world-volume).
+- Volumes: homogeneous Principled / Absorption / Scatter (mesh-bounded and world-volume), plus Emission graphs driven by ray flags. Camera rays initialize their medium stack inside bounded volumes.
 - Transparent shadows through transmissive / alpha-cutout surfaces.
 - Output: linear Combined, depth/Mist and named Color/Value AOV passes; Blender manages display and file output.
 
@@ -166,4 +166,4 @@ render-job check above after modifying the memory reader.
 
 - Viewport IPR (live preview).
 - Motion blur, heterogeneous volumes (OpenVDB), and modern Curves geometry.
-- Thin film, Huang Hair and random-walk SSS. See the support matrix for other partial node modes.
+- Thin film and Huang Hair. See the support matrix for other partial node modes.

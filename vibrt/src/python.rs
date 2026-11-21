@@ -340,6 +340,7 @@ fn vibrt_native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(render, m)?)?;
     m.add_function(wrap_pyfunction!(precompile_shaders, m)?)?;
     m.add_function(wrap_pyfunction!(crate::blender_mesh::read_mesh, m)?)?;
+    m.add_function(wrap_pyfunction!(crate::blender_mesh::mesh_pointiness, m)?)?;
     m.add_function(wrap_pyfunction!(crate::python_pixels::srgb_to_linear, m)?)?;
     m.add_function(wrap_pyfunction!(
         crate::python_pixels::resample_bilinear,

@@ -515,7 +515,18 @@ def _export_mesh_attributes(mesh, requested, writer):
     mesh.loop_triangles.foreach_get("polygon_index", fi)
     for key in sorted(requested):
         prefix, name = key.split(":", 1)
-        if prefix == "tangent":
+        if key == "geometry:pointiness":
+            from .runner import find_native_module
+            positions = np.empty((len(mesh.vertices), 3), np.float32)
+            normals = np.empty_like(positions)
+            edges = np.empty((len(mesh.edges), 2), np.uint32)
+            mesh.vertices.foreach_get("co", positions.reshape(-1))
+            mesh.vertex_normals.foreach_get("vector", normals.reshape(-1))
+            mesh.edges.foreach_get("vertices", edges.reshape(-1))
+            curvature = find_native_module().mesh_pointiness(positions, normals, edges)
+            values = np.ones((len(vi), 4), np.float32)
+            values[:, :3] = curvature[vi, None]
+        elif prefix == "tangent":
             layer = mesh.uv_layers.get(name) if name else mesh.uv_layers.active
             if layer is None:
                 continue
@@ -678,9 +689,9 @@ def _mesh_arrays_python(mesh, num_slots, vc_attr_name=None, uv_map_name=None):
 
 def _export_camera(scene, cam_obj, aspect: float) -> dict:
     cam = cam_obj.data
-    if cam.type != "PERSP":
+    if cam.type not in {"PERSP", "ORTHO"}:
         raise ValueError(
-            f"vibrt only supports perspective cameras (got {cam.type})"
+            f"vibrt supports perspective and orthographic cameras (got {cam.type})"
         )
     # Derive the actual visible frame from Blender's view_frame(), which
     # already folds in sensor_fit (AUTO/HORIZONTAL/VERTICAL), sensor size,
@@ -696,7 +707,9 @@ def _export_camera(scene, cam_obj, aspect: float) -> dict:
     # which avoids re-deriving Blender's "shift is fraction of the larger
     # sensor dimension" convention by hand (off by sw/sh on lone_monk).
     frame = cam.view_frame(scene=scene)
-    norm = [(p.x / -p.z, p.y / -p.z) for p in frame]
+    orthographic = cam.type == "ORTHO"
+    norm = [(p.x, p.y) if orthographic else (p.x / -p.z, p.y / -p.z)
+            for p in frame]
     xs = [n[0] for n in norm]
     ys = [n[1] for n in norm]
     half_w = (max(xs) - min(xs)) * 0.5
@@ -735,6 +748,8 @@ def _export_camera(scene, cam_obj, aspect: float) -> dict:
     return {
         "transform": matrix,
         "fov_y_rad": fov_y,
+        "ortho_height": 2.0 * half_h if orthographic else 0.0,
+        "frame_aspect": half_w / half_h,
         "lens_radius": lens_radius,
         "focal_distance": focal_distance,
         # Cycles' "Clip Start" — primary rays don't intersect anything
@@ -1153,9 +1168,27 @@ def _material_output_light_emission(mat):
     return None
 
 
-def _export_light(obj, writer, textures: list) -> dict | None:
+def _export_light(obj, writer, textures: list, materials=None) -> dict | None:
     light = obj.data
-    node_strength, node_color, ies_table = _light_node_emission(light)
+    light_shader = None
+    # Keep the existing IES path; other finite-light trees are evaluated at the
+    # sampled light point so Ray Length / Mix Shader retain their meaning.
+    if light.type in {"AREA", "POINT", "SPOT"} and light.use_nodes and light.node_tree and materials is not None:
+        from .shader_graph import compile_emission, UnsupportedNode
+        output = next((n for n in light.node_tree.nodes
+                       if n.bl_idname == "ShaderNodeOutputLight" and n.is_active_output), None)
+        if output is not None:
+            try:
+                graph = compile_emission(output.inputs['Surface'], writer, textures)
+                light_shader = len(materials)
+                materials.append({"name": "Light:" + light.name,
+                                  "base_color": [0.0] * 3, "emission": [1.0] * 3,
+                                  "pure_diffuse": True, "shader_graph": graph})
+            except UnsupportedNode:
+                pass
+    node_strength, node_color, ies_table = (
+        (1.0, (1.0, 1.0, 1.0), None) if light_shader is not None
+        else _light_node_emission(light))
     energy = float(light.energy) * node_strength
     col = [light.color[0] * node_color[0],
            light.color[1] * node_color[1],
@@ -1175,10 +1208,12 @@ def _export_light(obj, writer, textures: list) -> dict | None:
         ]
         out = {
             "type": "point",
+            "shader_material": light_shader,
             "position": position,
             "color": col,
             "power": energy,
-            "radius": max(light.shadow_soft_size, 0.005),
+            "radius": max(float(light.shadow_soft_size), 0.0),
+            "sphere": not light.use_soft_falloff,
             "light_rotation": light_rotation,
         }
         if ies_table is not None:
@@ -1200,19 +1235,22 @@ def _export_light(obj, writer, textures: list) -> dict | None:
     if light.type == "SPOT":
         out = {
             "type": "spot",
+            "shader_material": light_shader,
             "transform": mw,
             "color": col,
             "power": energy,
             "cone_rad": float(light.spot_size) * 0.5,
             "blend": float(light.spot_blend),
+            "radius": max(float(light.shadow_soft_size), 0.0),
+            "sphere": not light.use_soft_falloff,
         }
         if ies_table is not None:
             out["ies"] = ies_table
         return out
     if light.type == "AREA":
-        if light.shape == "SQUARE":
+        if light.shape in {"SQUARE", "DISK"}:
             size = [float(light.size), float(light.size)]
-        elif light.shape == "RECTANGLE":
+        elif light.shape in {"RECTANGLE", "ELLIPSE"}:
             size = [float(light.size), float(light.size_y)]
         else:
             _emit(
@@ -1247,6 +1285,8 @@ def _export_light(obj, writer, textures: list) -> dict | None:
             "size": size,
             "color": col,
             "power": energy,
+            "disk": light.shape in {"DISK", "ELLIPSE"},
+            "shader_material": light_shader,
             # Cycles' Ray Visibility → Camera flag. Junk Shop authors area
             # lights that are supposed to illuminate the scene but never
             # appear as bright rectangles in the final frame (e.g. `Area.027`,
@@ -3467,7 +3507,7 @@ def _export_into(
                             hair_obj["mesh"] = hair_mesh_id
                             objects.append(hair_obj)
                 elif obj_eval.type == "LIGHT":
-                    light = _export_light(obj_eval, writer, textures)
+                    light = _export_light(obj_eval, writer, textures, materials)
                     if light is not None:
                         if light.get("type") == "portal":
                             portals_json.append(light)
@@ -3567,6 +3607,7 @@ def _export_into(
             "max_diffuse_bounces": max_diffuse,
             "max_glossy_bounces": max_glossy,
             "max_transmission_bounces": max_transmission,
+            "max_transparent_bounces": int(getattr(cy, "transparent_max_bounces", 8)),
             "clamp_indirect": clamp_indirect,
             "clamp_direct": cy_clamp_direct,
             "filter_glossy": cy_filter_glossy,

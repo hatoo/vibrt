@@ -36,6 +36,11 @@ color/vector math, radial tiling, image projection, normal maps, Fresnel
 and tangent evaluation use or adapt these sources. Provenance and hashes
 are recorded in vibrt-nodes/third_party/cycles/.
 
+Subsurface scattering uses the Cycles Burley profiles, random-walk coefficient
+fit and dipole radius fit (Apache-2.0). The renderer supplies BVH traversal and
+free-flight sampling. Pointiness is adapted from intern/cycles/blender/mesh.cpp
+(Apache-2.0); vibrt/src/pointiness.rs supplies the welded mesh attribute.
+
 Perlin noise (BSD-3-Clause):
 Copyright (c) 2009-2010 Sony Pictures Imageworks Inc., et al.
 All Rights Reserved.

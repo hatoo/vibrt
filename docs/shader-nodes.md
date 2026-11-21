@@ -62,20 +62,26 @@ tables, so narrow/discontinuous features can differ from analytical Cycles.
 Principled graph outputs include Base Color, Roughness, Metallic, IOR,
 Transmission Weight, Emission Color/Strength, Alpha, Specular IOR Level,
 Anisotropy/Rotation, Coat Weight/Roughness/IOR, Sheen Weight/Roughness/Tint,
-Subsurface Weight/Radius, Normal and Tangent. Extra Principled inputs such as
-coat/specular tint, coat normal, thin film and detailed SSS controls remain
-unsupported. Diffuse roughness, exact sheen, the legacy Hair BSDF, Principled SSS,
-refraction-only closure behavior and colored transparency are not Cycles-equivalent.
-Standalone Chiang Hair and Burley SSS use the additional closures described below.
+Subsurface Weight/Radius/Scale/IOR/Anisotropy, Normal and Tangent. Extra Principled
+inputs such as coat/specular tint, coat normal and thin film remain unsupported.
+Diffuse roughness, exact sheen, the legacy Hair BSDF, refraction-only closure
+behavior and colored transparency are not Cycles-equivalent. Standalone and
+Principled SSS support Burley, Random Walk and Random Walk Skin. Random walks
+use Cycles coefficient/radius fits and entry sampling, with spectral free flights
+and Russian roulette (1,024-event cap); Dwivedi guiding is not implemented.
 
 Image textures are sampled at hits and graph-driven emission also participates
 in mesh-light importance sampling. Named UV/color/scalar/vector attributes are exported only when requested, and
 several layers can coexist. Animated image users and UDIM tiles still require a
 texture manager. Default UV images reuse the existing coordinate buffer.
+Unconnected hidden Normal inputs retain the surface normal through groups and
+reroutes. Finite Point/Spot lights use sphere or facing-disk sampling for soft
+shadows; these lights are still NEE-only, so direct visibility and delta-mirror
+light hits remain unsupported.
 
 ## Scene-dependent additions
 
-AO, Bevel, Raycast and Burley SSS use compact per-mesh/instance software BVHs;
+AO, Bevel, Raycast, SSS and initial volume containment use compact software BVHs;
 ordinary path tracing continues to use OptiX. These extra BVHs are allocated only
 when needed. AOV and extended volume-phase kernels are also compiled only for
 scenes using them. Device uploads are owned by each render and released on
@@ -91,13 +97,13 @@ normal; Geometry Normal read elsewhere in the graph is still undisplaced.
 
 The remaining unsupported node types are **Point Info, Volume Info and Script
 (OSL)**. They need point-cloud geometry, a volume-grid backend and an OSL runtime,
-respectively. Huang Hair and random-walk SSS remain unsupported modes; Huang's
+respectively. Huang Hair remains an unsupported mode; its
 prototype failed roughness-dependent Cycles comparisons and is not enabled.
 Warnings/fallbacks do not count as implementation of these features.
 
 ## Complete inventory
 
-Native: **52**, Partial: **32**, Legacy: **7**, Unsupported: **3**, Outside Cycles surface scope: **5**.
+Native: **52**, Partial: **33**, Legacy: **6**, Unsupported: **3**, Outside Cycles surface scope: **5**.
 
 | Blender node | Status | Scope |
 |---|---|---|
@@ -128,30 +134,30 @@ Native: **52**, Partial: **32**, Legacy: **7**, Unsupported: **3**, Outside Cycl
 | `ShaderNodeCombineXYZ` | Native | Shared C++ CPU/CUDA evaluator; socket conversions are explicit. |
 | `ShaderNodeDisplacement` | Partial | Shared C++ evaluator for geometric DISPLACEMENT/BOTH on evaluated mesh vertices and BUMP shading. No adaptive subdivision; see limits below. |
 | `ShaderNodeEeveeSpecular` | Outside Cycles surface scope | EEVEE, Freestyle or legacy node; not claimed as Cycles-compatible. |
-| `ShaderNodeEmission` | Native | Dynamic color and strength on hits and mesh-light samples. |
+| `ShaderNodeEmission` | Native | Dynamic color and strength on hits, mesh/area-light samples, and homogeneous volume emission driven by ray flags. Spatial volume graphs are unsupported. |
 | `ShaderNodeFloatCurve` | Native | Shared C++ CPU/CUDA evaluator; socket conversions are explicit. |
 | `ShaderNodeFresnel` | Native | Shared C++ CPU/CUDA evaluator; socket conversions are explicit. |
 | `ShaderNodeGamma` | Native | Shared C++ CPU/CUDA evaluator; socket conversions are explicit. |
-| `ShaderNodeGroup` | Native | Nested groups and instance defaults; reroutes and muted value nodes are followed. |
+| `ShaderNodeGroup` | Native | Nested groups, shader sockets and instance defaults; reroutes and muted nodes are followed. |
 | `ShaderNodeHairInfo` | Partial | Is Strand, Intercept, Length, Thickness, Random and Tangent Normal on exported legacy particle-hair ribbons. Modern Curves geometry is not exported. |
 | `ShaderNodeHoldout` | Native | Black contribution and holdout alpha with transparent film; weighted Mix/Add support. |
 | `ShaderNodeHueSaturation` | Native | Shared C++ CPU/CUDA evaluator; socket conversions are explicit. |
 | `ShaderNodeInvert` | Native | Shared C++ CPU/CUDA evaluator; socket conversions are explicit. |
 | `ShaderNodeLayerWeight` | Native | Shared C++ CPU/CUDA evaluator; socket conversions are explicit. |
-| `ShaderNodeLightFalloff` | Partial | Surface-context ray length; light datablock graphs still use the existing light exporter. |
-| `ShaderNodeLightPath` | Partial | Common ray flags, length, total/diffuse/glossy/transmission depth. Shadow/light-sample depth and volume/transparent/portal path state are incomplete. |
+| `ShaderNodeLightFalloff` | Partial | Surface and finite-light shader ray length, including Linear/Constant falloff and Smooth. Sun uses the legacy light exporter. |
+| `ShaderNodeLightPath` | Partial | Common ray flags, length, total/diffuse/glossy/transmission depth. Transparent transmission preserves the original ray flags and has a separate bounce budget. Shadow/light-sample depth and volume/transparent/portal counters are incomplete. |
 | `ShaderNodeMapRange` | Native | Shared C++ CPU/CUDA evaluator; socket conversions are explicit. |
 | `ShaderNodeMapping` | Native | Shared C++ CPU/CUDA evaluator; socket conversions are explicit. |
 | `ShaderNodeMath` | Native | Shared C++ CPU/CUDA evaluator; socket conversions are explicit. |
 | `ShaderNodeMix` | Native | Shared C++ CPU/CUDA evaluator; socket conversions are explicit. |
 | `ShaderNodeMixRGB` | Native | Shared C++ CPU/CUDA evaluator; socket conversions are explicit. |
 | `ShaderNodeMixShader` | Native | Separate weighted closures, including dynamic factors; 16 leaves / 8 levels maximum. |
-| `ShaderNodeNewGeometry` | Partial | Position, shading/geometric normal, incoming, tangent, backfacing. No pointiness or random-per-island attributes. |
+| `ShaderNodeNewGeometry` | Partial | Position, shading/geometric normal, incoming, tangent, backfacing and welded-mesh Pointiness. Random-per-island is unsupported. |
 | `ShaderNodeNormal` | Native | Shared C++ CPU/CUDA evaluator; socket conversions are explicit. |
 | `ShaderNodeNormalMap` | Partial | Multiple explicitly named UV maps use exported MikkTSpace tangents. The default unnamed UV retains triangle-derivative tangents; object/world and OpenGL/DirectX are supported. |
 | `ShaderNodeObjectInfo` | Partial | Location, color, alpha, object/material pass indices; Random uses vibrt instance hashing, not Cycles hash identity. |
 | `ShaderNodeOutputAOV` | Native | Color/Value roots, including nested groups, written to registered Blender view-layer passes on render completion. |
-| `ShaderNodeOutputLight` | Legacy | Existing light/IES exporter and photometric sampling; no general light shader DAG. |
+| `ShaderNodeOutputLight` | Partial | Point/Spot/Area Emission/Mix/Add trees run at NEE samples (and area-light hits), including Ray Length. Sun and IES use the existing exporter. Full light-object attributes and shadow-sample path depths are incomplete. |
 | `ShaderNodeOutputLineStyle` | Outside Cycles surface scope | EEVEE, Freestyle or legacy node; not claimed as Cycles-compatible. |
 | `ShaderNodeOutputMaterial` | Native | Surface and AOV dispatch; Volume and Displacement follow the limitations documented for those nodes. |
 | `ShaderNodeOutputWorld` | Legacy | World export and native sky / bake fallback; not the surface interpreter. |
@@ -167,11 +173,11 @@ Native: **52**, Partial: **32**, Legacy: **7**, Unsupported: **3**, Outside Cycl
 | `ShaderNodeSeparateXYZ` | Native | Shared C++ CPU/CUDA evaluator; socket conversions are explicit. |
 | `ShaderNodeShaderToRGB` | Outside Cycles surface scope | EEVEE, Freestyle or legacy node; not claimed as Cycles-compatible. |
 | `ShaderNodeSqueeze` | Outside Cycles surface scope | EEVEE, Freestyle or legacy node; not claimed as Cycles-compatible. |
-| `ShaderNodeSubsurfaceScattering` | Partial | Burley disk scattering with Cycles radial profiles and three-axis MIS. Random Walk and Random Walk Skin are rejected; intersection enumeration is capped at 64. |
+| `ShaderNodeSubsurfaceScattering` | Partial | Burley disk scattering (64-intersection cap), Random Walk and Random Walk Skin interior transport; see sampling and closure limitations above. |
 | `ShaderNodeTangent` | Partial | Named/active UV MikkTSpace tangents and radial tangents on meshes. Curve tangent semantics retain the ribbon approximation. |
 | `ShaderNodeTexBrick` | Native | Spatial evaluation with linked inputs; Cycles 5.1.1 numerical helpers. |
 | `ShaderNodeTexChecker` | Native | Spatial evaluation with linked inputs; Cycles 5.1.1 numerical helpers. |
-| `ShaderNodeTexCoord` | Partial | Generated, UV, object, normal, camera, window, reflection. No explicit reference object or instancer coordinates; generated coordinates use evaluated mesh bounds. |
+| `ShaderNodeTexCoord` | Partial | Generated, UV, object, normal, camera, window, reflection. Explicit reference objects use their inverse world transform; instancer coordinates remain unsupported. Generated coordinates use evaluated mesh bounds. |
 | `ShaderNodeTexEnvironment` | Partial | Flat/box/sphere/tube or environment projection, RGBA, extension and interpolation. No UDIM texture manager; animated image frames are not synchronized per image-user. |
 | `ShaderNodeTexGabor` | Native | Spatial evaluation with linked inputs; Cycles 5.1.1 numerical helpers. |
 | `ShaderNodeTexGradient` | Native | Spatial evaluation with linked inputs; Cycles 5.1.1 numerical helpers. |
@@ -280,3 +286,9 @@ different launch schedule.
 `--without-graphs` and `--without-bump` are diagnostic ablations that change
 materials. Likewise, versions predating graph support can omit material detail;
 their timings do not represent equivalent rendering quality.
+
+`scripts/test_scene_parity.py` compares orthographic cameras and pixel aspect,
+explicit object coordinates, Pointiness, missing images, shader group inputs,
+implicit group normals, elliptical light shader graphs, camera-inside emission volumes,
+transparent bounce budgets, Point/Spot falloff and soft shadows, and all three
+SSS methods against Cycles. Outputs are ignored under `target/scene-parity-tests/`.

@@ -24,7 +24,7 @@ The [`blender/vibrt_blender/`](blender/vibrt_blender/) addon registers `vibrt` a
 - Right-handed Z-up (no axis conversion from Blender)
 - Perspective camera with lens shift and circular-aperture depth of field
 - Native Preetham, Hosek/Wilkie and single/multiple scattering sky models on Blender 5.1
-- Homogeneous volumes, legacy particle-hair ribbons, Chiang hair and Burley SSS closures
+- Homogeneous volumes, legacy particle-hair ribbons, Chiang hair, Burley and Random Walk SSS
 - Progressive sample previews, cancellation, and optional final OptiX denoising
 - Output: linear RGBA, depth and named AOV buffers delivered to Blender; Blender handles color management and image-file output
 

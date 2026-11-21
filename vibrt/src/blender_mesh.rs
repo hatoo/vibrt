@@ -14,6 +14,33 @@ use pyo3::types::PyDict;
 use std::marker::PhantomData;
 use std::mem::{align_of, size_of};
 
+#[pyfunction]
+pub fn mesh_pointiness<'py>(
+    py: Python<'py>,
+    positions: numpy::PyReadonlyArray2<'py, f32>,
+    normals: numpy::PyReadonlyArray2<'py, f32>,
+    edges: numpy::PyReadonlyArray2<'py, u32>,
+) -> PyResult<Bound<'py, PyArray1<f32>>> {
+    let shape = positions.as_array().dim();
+    if shape.1 != 3 || normals.as_array().dim() != shape || edges.as_array().dim().1 != 2 {
+        return Err(PyValueError::new_err(
+            "expected matching Nx3 positions/normals and Mx2 edges",
+        ));
+    }
+    let p = positions.as_slice()?;
+    let n = normals.as_slice()?;
+    let e = edges.as_slice()?;
+    if p.iter().chain(n).any(|x| !x.is_finite()) || e.iter().any(|&i| i as usize >= shape.0) {
+        return Err(PyValueError::new_err("invalid pointiness mesh data"));
+    }
+    Ok(crate::pointiness::compute(
+        p.as_chunks::<3>().0,
+        n.as_chunks::<3>().0,
+        e.as_chunks::<2>().0,
+    )
+    .into_pyarray_bound(py))
+}
+
 /// An RNA-owned primitive span, deliberately not Send/Sync and never exposed
 /// as an arbitrary integer-address API. Constructors only receive collections
 /// obtained below from a real bpy.types.Mesh on a supported Blender version.

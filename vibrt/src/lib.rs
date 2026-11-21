@@ -11,6 +11,8 @@
 pub mod camera;
 pub mod gpu_types;
 pub mod pipeline;
+#[cfg(any(feature = "python", test))]
+mod pointiness;
 pub mod principled;
 mod query_bvh;
 pub mod render;

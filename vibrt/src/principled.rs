@@ -337,6 +337,9 @@ pub fn make_volume_gpu(v: &VolumeParams) -> VolumeGpu {
         sigma_s[2] + sigma_a[2],
     ];
     VolumeGpu {
+        emission_nodes: 0,
+        emission_len: 0,
+        emission_contexts: 0,
         phase: v.phase,
         phase_params: v.phase_params,
         sigma_t,
@@ -446,6 +449,10 @@ pub fn make_material_data(
         sheen_tint: mat.sheen_tint,
         sss_weight: mat.sss_weight.clamp(0.0, 1.0),
         sss_radius: mat.sss_radius,
+        sss_method: mat.sss_method,
+        sss_scale: mat.sss_scale.max(0.0),
+        sss_ior: mat.sss_ior.clamp(1.01, 3.8),
+        sss_anisotropy: mat.sss_anisotropy.clamp(0.0, 0.9),
         translucent_weight: mat.translucent_weight.clamp(0.0, 1.0),
         hair_weight: mat.hair_weight.clamp(0.0, 1.0),
         hair_offset: mat.hair_offset,

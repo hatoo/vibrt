@@ -58,8 +58,11 @@ pub struct SceneFile {
 ///   blackbody_intensity`, all scaled by `density`. The exporter folds the
 ///   blackbody term in before serialising; the renderer just sees one
 ///   pre-multiplied RGB.
-#[derive(Deserialize, Default, Copy, Clone)]
+#[derive(Deserialize, Default, Clone)]
 pub struct VolumeParams {
+    /// Homogeneous emission may depend on ray flags, but not spatial coordinates.
+    #[serde(default)]
+    pub emission_graph: Option<vibrt_nodes::shader::ShaderGraph>,
     #[serde(default)]
     pub phase: u32,
     #[serde(default)]
@@ -104,6 +107,8 @@ pub struct RenderSettings {
     pub max_glossy_bounces: u32,
     #[serde(default = "default_lobe_bounces")]
     pub max_transmission_bounces: u32,
+    #[serde(default = "default_transparent_bounces")]
+    pub max_transparent_bounces: u32,
     /// Clamp for indirect (bounce>=1) contributions using |R|+|G|+|B|.
     /// Non-positive values disable clamping.
     #[serde(default)]
@@ -125,12 +130,21 @@ pub struct RenderSettings {
 fn default_lobe_bounces() -> u32 {
     32
 }
+fn default_transparent_bounces() -> u32 {
+    8
+}
 
 #[derive(Deserialize)]
 pub struct CameraDesc {
     /// 4x4 row-major matrix_world from Blender. Camera looks down local -Z.
     pub transform: [f32; 16],
     pub fov_y_rad: f32,
+    /// Full vertical extent of an orthographic frame; zero selects perspective.
+    #[serde(default)]
+    pub ortho_height: f32,
+    /// Blender view-frame aspect, including non-square pixels. Zero uses resolution.
+    #[serde(default)]
+    pub frame_aspect: f32,
     #[serde(default)]
     pub lens_radius: f32,
     #[serde(default = "one_f32")]
@@ -332,6 +346,15 @@ pub struct PrincipledMaterial {
     pub sss_weight: f32,
     #[serde(default = "default_sss_radius")]
     pub sss_radius: [f32; 3],
+    /// 0 = local diffuse, 1 = Burley, 2 = Random Walk, 3 = Random Walk Skin.
+    #[serde(default)]
+    pub sss_method: u32,
+    #[serde(default = "one_f32")]
+    pub sss_scale: f32,
+    #[serde(default = "default_coat_ior")]
+    pub sss_ior: f32,
+    #[serde(default)]
+    pub sss_anisotropy: f32,
     /// Cycles `ShaderNodeBsdfTranslucent` weight in [0,1]. A real Translucent
     /// lobe — Lambertian on the *back* hemisphere — that lights paper /
     /// lampshade / leaf surfaces from the side opposite the viewer. Replaces
@@ -584,11 +607,15 @@ pub struct IesProfile {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum LightDesc {
     Point {
+        #[serde(default)]
+        shader_material: Option<u32>,
         position: [f32; 3],
         color: [f32; 3],
         power: f32,
         #[serde(default = "default_point_radius")]
         radius: f32,
+        #[serde(default = "default_true")]
+        sphere: bool,
         /// Object→world rotation 3×3 (row-major). Identity when no IES
         /// is attached. With IES, `wi_local = transpose(rotation) * wi_world`
         /// gives the direction in light-local frame for table lookup.
@@ -607,6 +634,8 @@ pub enum LightDesc {
         angle_rad: f32,
     },
     Spot {
+        #[serde(default)]
+        shader_material: Option<u32>,
         /// 4x4 row-major. Light shines along local -Z.
         transform: [f32; 16],
         color: [f32; 3],
@@ -614,6 +643,10 @@ pub enum LightDesc {
         cone_rad: f32,
         #[serde(default)]
         blend: f32,
+        #[serde(default)]
+        radius: f32,
+        #[serde(default = "default_true")]
+        sphere: bool,
         /// IES profile attached to this spot. Sampled in the same
         /// local frame the cone uses (axis = local -Z = "down");
         /// see `IesProfile`.
@@ -621,6 +654,10 @@ pub enum LightDesc {
         ies: Option<IesProfile>,
     },
     AreaRect {
+        #[serde(default)]
+        disk: bool,
+        #[serde(default)]
+        shader_material: Option<u32>,
         /// 4x4 row-major. Area plane is local XY, emission along local +Z.
         transform: [f32; 16],
         size: [f32; 2],

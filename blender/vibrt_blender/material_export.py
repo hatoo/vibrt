@@ -211,6 +211,28 @@ class _PreBakedTexture:
         self.cache_key = cache_key
 
 
+def _read_image_pixels(image):
+    """Read a fresh RGBA buffer; missing images use Cycles' magenta sentinel."""
+    import numpy as np
+    try:
+        width, height = map(int, image.size)
+        if width == 0 or height == 0:
+            image.update()
+            width, height = map(int, image.size)
+        if width <= 0 or height <= 0:
+            raise ValueError("empty image")
+        pixels = np.empty(width * height * 4, np.float32)
+        started = time.perf_counter()
+        image.pixels.foreach_get(pixels)
+        _STATS["pixel_read_s"] += time.perf_counter() - started
+        _STATS["pixel_bytes"] += pixels.nbytes
+        return width, height, pixels
+    except (RuntimeError, ValueError) as exc:
+        _warn(f"missing-image:{image.name}",
+              f"image {image.name!r} has no readable pixels ({exc}); using magenta")
+        return 1, 1, np.array([1.0, 0.0, 1.0, 1.0], np.float32)
+
+
 def export_image_texture(
     image,
     writer,
@@ -236,25 +258,7 @@ def export_image_texture(
     t_enter = time.perf_counter()
     pixel_before = _STATS["pixel_read_s"]
     bake_before = _STATS["bake_chain_s"]
-    if image.size[0] == 0 or image.size[1] == 0:
-        image.update()
-    width, height = image.size[0], image.size[1]
-    if width == 0 or height == 0:
-        width, height = 1, 1
-        pixels = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
-    else:
-        # Allocate a fresh per-texture buffer. The pixels travel across PyO3
-        # into Rust as a `PyBuffer<f32>`, so the numpy array must outlive
-        # this function — sharing a module-level scratch buffer would make
-        # every appended `texture_arrays` entry alias the LAST texture's
-        # data (visible as e.g. every render texture-sampling normal-map
-        # values 0.5/0.5/1.0).
-        n = width * height * 4
-        pixels = np.empty(n, dtype=np.float32)
-        t_px = time.perf_counter()
-        image.pixels.foreach_get(pixels)
-        _STATS["pixel_read_s"] += time.perf_counter() - t_px
-        _STATS["pixel_bytes"] += pixels.nbytes
+    width, height, pixels = _read_image_pixels(image)
     if colorspace is None:
         colorspace = (
             "srgb"
@@ -346,20 +350,7 @@ def _image_to_linear_rgb(image):
         _STATS["linear_rgb_cache_hits"] += 1
         return hit
     _STATS["linear_rgb_cache_misses"] += 1
-    if image.size[0] == 0 or image.size[1] == 0:
-        image.update()
-    w, h = int(image.size[0]), int(image.size[1])
-    if w == 0 or h == 0:
-        rgb = np.ones((1, 1, 3), dtype=np.float32)
-        rgb.setflags(write=False)
-        result = (rgb, 1, 1)
-        _LINEAR_RGB_CACHE[ptr] = result
-        return result
-    px = np.empty(w * h * 4, dtype=np.float32)
-    t_px = time.perf_counter()
-    image.pixels.foreach_get(px)
-    _STATS["pixel_read_s"] += time.perf_counter() - t_px
-    _STATS["pixel_bytes"] += px.nbytes
+    w, h, px = _read_image_pixels(image)
     px = px.reshape((h, w, 4))
     rgb = np.ascontiguousarray(px[..., :3], dtype=np.float32)
     if image.colorspace_settings.name.lower().startswith("srgb"):
@@ -1127,6 +1118,10 @@ def _resolve_volume_coeffs(node):
     second density field. Returns None for unsupported nodes.
     """
     bl = node.bl_idname
+    if bl == "ShaderNodeEmission":
+        color = _vol_color_input(node.inputs.get("Color"))
+        strength = _vol_scalar_input(node.inputs.get("Strength"), 1.0)
+        return [0.0] * 3, [0.0] * 3, [c * strength for c in color], 0.0
     if bl == "ShaderNodeVolumePrincipled":
         color = _vol_color_input(node.inputs.get("Color"))
         density = _vol_scalar_input(node.inputs.get("Density"), 1.0)
@@ -1290,6 +1285,16 @@ def _resolve_volume(volume_socket) -> dict | None:
     if not volume_socket.is_linked:
         return None
     src = volume_socket.links[0].from_node
+    # Emission in a Volume socket is a medium, including when Surface is empty.
+    # Preserve ray-dependent emission (e.g. camera-only fog) in the shader VM.
+    from .shader_graph import compile_emission, UnsupportedNode
+    try:
+        emission_graph = compile_emission(volume_socket, None, None)
+    except UnsupportedNode:
+        emission_graph = None
+    if emission_graph is not None:
+        return {"color": [0.0] * 3, "density": 1.0,
+                "emission_graph": emission_graph}
     coeffs = _resolve_volume_coeffs(src)
     if coeffs is None:
         return None
@@ -3051,19 +3056,45 @@ def _default_params() -> dict:
     }
 
 
+def _resolve_shader_input(socket, writer, textures, mat_name: str, depth=0) -> dict:
+    """Follow shader sockets across groups without losing the selected output."""
+    if depth > 32:
+        raise ValueError("Recursive shader socket graph")
+    socket = _follow_reroutes(socket)
+    if socket is None or not socket.is_linked:
+        return dict(_default_params(), base_color=[0.0]*3,
+                    pure_diffuse=True, specular_ior_level=0.0)
+    source = socket.links[0].from_socket
+    node = source.node
+    if node.mute:
+        link = next((link for link in node.internal_links if link.to_socket == source), None)
+        return _resolve_shader_input(link.from_socket if link else None, writer, textures, mat_name, depth+1)
+    if node.bl_idname == "NodeGroupInput" and _GROUP_STACK:
+        group = _GROUP_STACK.pop()
+        try:
+            outer = next((s for s in group.inputs if s.identifier == source.identifier), None)
+            return _resolve_shader_input(outer, writer, textures, mat_name, depth+1)
+        finally:
+            _GROUP_STACK.append(group)
+    if node.bl_idname == "ShaderNodeGroup" and node.node_tree:
+        output = next((n for n in node.node_tree.nodes
+                       if n.bl_idname == "NodeGroupOutput" and n.is_active_output), None)
+        inner = next((s for s in output.inputs if s.identifier == source.identifier), None) if output else None
+        _GROUP_STACK.append(node)
+        try:
+            return _resolve_shader_input(inner, writer, textures, mat_name, depth+1)
+        finally:
+            _GROUP_STACK.pop()
+    return _resolve_shader(node, writer, textures, mat_name)
+
+
 def _resolve_shader(node, writer, textures, mat_name: str) -> dict:
     from .shader_graph import compile_leaf, UnsupportedNode
     if node.bl_idname in {"ShaderNodeMixShader", "ShaderNodeAddShader"}:
         from .shader_graph import Compiler
         is_add = node.bl_idname == "ShaderNodeAddShader"
         inputs = list(node.inputs)[0 if is_add else 1:]
-        children = []
-        for socket in inputs:
-            socket = _follow_reroutes(socket)
-            if socket.is_linked:
-                children.append(_resolve_shader(socket.links[0].from_node, writer, textures, mat_name))
-            else:
-                children.append(dict(_default_params(), base_color=[0.0]*3, pure_diffuse=True, specular_ior_level=0.0))
+        children = [_resolve_shader_input(socket, writer, textures, mat_name) for socket in inputs]
         params = dict(_default_params(), left_subtree=children[0], secondary=children[1], add_shader=is_add)
         if not is_add:
             params["mix_fac"] = float(node.inputs[0].default_value)
@@ -4624,11 +4655,11 @@ def export_material(
 
         if not surface_linked:
             if volume is None:
-                _warn(
-                    "no-surface",
-                    "output Surface is not connected and no Volume — using default params",
-                )
-                return _default_params()
+                # An unconnected Surface is a transparent boundary, including
+                # zero-density volumes. Never turn a vacuum into an opaque wall.
+                params = _default_params()
+                params["alpha_blend"] = 0.0
+                return params
             # Pure-volume material: the boundary mesh acts only as a volume
             # container (e.g. junk_shop's `Smoke`). The renderer skips
             # surface shading on hits because `volume_only=True`.
@@ -4638,7 +4669,7 @@ def export_material(
             return params
 
         surface = surface_sock.links[0].from_node
-        params = _resolve_shader(surface, writer, textures, mat.name)
+        params = _resolve_shader_input(surface_sock, writer, textures, mat.name)
         from .shader_graph import compile_aovs
 
         compile_aovs(

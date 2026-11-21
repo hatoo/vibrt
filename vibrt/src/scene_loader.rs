@@ -247,20 +247,18 @@ pub fn load_scene<'a>(
     for light in &file.lights {
         match light {
             LightDesc::Point {
+                shader_material,
                 position,
                 color,
                 power,
                 radius,
+                sphere,
                 light_rotation,
                 ies,
             } => {
-                // Blender point light: total emitted power Φ W. The device samples
-                // this as a delta point, so `emission` must be intensity I = Φ/(4π)
-                // (W/sr) — the shader then computes irradiance as I/d². The old
-                // formula Φ/(4π²r²) was the outgoing radiance on the sphere
-                // surface, which only applies if we sample the surface (we don't);
-                // using it as I made pendants ~1/(πr²) times too bright.
-                let r = radius.max(1e-3);
+                // Store intensity I = Φ/(4π). The GPU sampler applies either
+                // the delta inverse-square factor or finite-radius L/pdf.
+                let r = radius.max(0.0);
                 // Without IES: isotropic, divide by 4π so ∫ I dΩ = power.
                 // With IES: Cycles convention — `coeff = power ×
                 // peak_absolute_candela / (4π)`. Reasoning from
@@ -295,10 +293,11 @@ pub fn load_scene<'a>(
                 };
                 let emission = [color[0] * coeff, color[1] * coeff, color[2] * coeff];
                 point_lights.push(PointLight {
+                    shader: shader_material.map_or(0, |i| i as u64 + 1),
                     position: *position,
                     radius: r,
                     emission,
-                    _pad: 0.0,
+                    sphere: *sphere as u32,
                     ies_data: 0,
                     ies_n_v: 0,
                     ies_n_h: 0,
@@ -328,11 +327,14 @@ pub fn load_scene<'a>(
                 });
             }
             LightDesc::Spot {
+                shader_material,
                 transform: t4,
                 color,
                 power,
                 cone_rad,
                 blend,
+                radius,
+                sphere,
                 ies,
             } => {
                 let t = transform::from_4x4_row_major(t4);
@@ -379,8 +381,9 @@ pub fn load_scene<'a>(
                     t4[0], t4[1], t4[2], t4[4], t4[5], t4[6], t4[8], t4[9], t4[10],
                 ];
                 spot_lights.push(SpotLight {
+                    shader: shader_material.map_or(0, |i| i as u64 + 1),
                     position,
-                    _pad0: 0.0,
+                    radius: radius.max(0.0),
                     direction: dir,
                     cos_outer,
                     emission,
@@ -389,10 +392,13 @@ pub fn load_scene<'a>(
                     ies_n_v: 0,
                     ies_n_h: 0,
                     light_rotation,
+                    sphere: *sphere as u32,
                 });
                 spot_ies.push(ies.clone());
             }
             LightDesc::AreaRect {
+                disk,
+                shader_material,
                 transform: t4,
                 size,
                 color,
@@ -412,7 +418,14 @@ pub fn load_scene<'a>(
                     center[1] - 0.5 * size[0] * u_axis[1] - 0.5 * size[1] * v_axis[1],
                     center[2] - 0.5 * size[0] * u_axis[2] - 0.5 * size[1] * v_axis[2],
                 ];
-                let area = (size[0] * size[1]).max(1e-6);
+                let area = (size[0]
+                    * size[1]
+                    * if *disk {
+                        std::f32::consts::PI * 0.25
+                    } else {
+                        1.0
+                    })
+                .max(1e-6);
                 // Without IES: legacy area-light radiance (W/m²/sr) =
                 //   power / (area × π).
                 // With IES (Cycles convention): the kernel multiplies by
@@ -446,6 +459,8 @@ pub fn load_scene<'a>(
                     t4[0], t4[1], t4[2], t4[4], t4[5], t4[6], t4[8], t4[9], t4[10],
                 ];
                 rect_lights.push(AreaRectLight {
+                    shader: shader_material.map_or(0, |i| i as u64 + 1),
+                    disk: u32::from(*disk),
                     corner,
                     size_u: size[0],
                     u_axis,

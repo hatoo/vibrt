@@ -3,18 +3,19 @@
 //! Blender camera convention: local `-Z` is forward, local `+Y` is up, local `+X` is right.
 //! The world-space transform is a 4x4 row-major matrix.
 
-/// Compute the OptiX pinhole camera basis from a Blender `matrix_world` (4x4 row-major),
-/// vertical FOV (radians), and image aspect (width/height).
+/// Compute the camera basis from a Blender `matrix_world` (4x4 row-major),
+/// vertical FOV (radians), and frame aspect, including pixel aspect.
+/// A positive `ortho_height` selects an orthographic frame in world units.
 ///
 /// Returns `(eye, cam_u, cam_v, cam_w)` where:
 /// - `eye`: world-space camera origin
-/// - `cam_u`: right vector scaled by `tan(fov_x/2)`
-/// - `cam_v`: up vector scaled by `tan(fov_y/2)`
+/// - `cam_u`, `cam_v`: half-frame extents (angles for perspective, lengths for orthographic)
 /// - `cam_w`: unit forward vector
 pub fn compute_camera(
     transform: &[f32; 16],
     fov_y_rad: f32,
     aspect: f32,
+    ortho_height: f32,
 ) -> ([f32; 3], [f32; 3], [f32; 3], [f32; 3]) {
     // row-major: element (i,j) = transform[i*4 + j]
     // Column 0 = right (+X), column 1 = up (+Y), column 2 = back (+Z), column 3 = translation.
@@ -28,7 +29,11 @@ pub fn compute_camera(
     let up = normalize(up);
     let forward = normalize(forward);
 
-    let half_h = (fov_y_rad * 0.5).tan();
+    let half_h = if ortho_height > 0.0 {
+        ortho_height * 0.5
+    } else {
+        (fov_y_rad * 0.5).tan()
+    };
     let half_w = half_h * aspect;
 
     let cam_u = [right[0] * half_w, right[1] * half_w, right[2] * half_w];
