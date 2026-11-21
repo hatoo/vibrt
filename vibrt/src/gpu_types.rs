@@ -427,7 +427,6 @@ pub struct LaunchParams {
     pub spot_lights: optix_sys::CUdeviceptr,
     pub num_rect_lights: i32,
     pub rect_lights: optix_sys::CUdeviceptr,
-    pub rect_light_cdf: optix_sys::CUdeviceptr,
 
     /// Mesh-light NEE: `mesh_lights` is a `MeshLight[num_mesh_lights]`,
     /// `mesh_light_cdf` is `f32[num_mesh_lights + 1]` normalised over

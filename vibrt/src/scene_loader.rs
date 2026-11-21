@@ -721,10 +721,9 @@ fn build_mesh_lights(
             );
             continue;
         }
-        // Per-triangle CDF weighted by area × luminance(emission). Same
-        // pattern as `build_rect_light_cdf` in render.rs but lives here so
-        // the loader is the sole place that knows how to convert the
-        // exporter's MeshLightDesc into device-ready data.
+        // Per-triangle CDF weighted by area × luminance(emission).
+        // Unlike analytic rects' point-dependent GPU selection, mesh-light
+        // selection uses these scene-wide distributions.
         let n = tris.len();
         let mut cdf = vec![0.0f32; n + 1];
         for (i, t) in tris.iter().enumerate() {

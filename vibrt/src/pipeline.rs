@@ -49,6 +49,7 @@ pub fn compile_ptx(
         ),
         cu_src
             .replace("#include \"devicecode.h\"", "// (inlined above)")
+            .replace("#include \"rect_light_sampling.h\"", include_str!("rect_light_sampling.h"))
             .replace("#include \"vibrt_nodes_core.h\"", vibrt_nodes::DEVICE_CORE)
             .replace("#include \"vibrt_shader.h\"", &vibrt_nodes::DEVICE_SHADER
                 .replace("#include \"cycles_nodes.h\"", &vibrt_nodes::DEVICE_CYCLES

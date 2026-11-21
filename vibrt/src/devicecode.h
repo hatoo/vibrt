@@ -340,7 +340,6 @@ struct LaunchParams {
   SpotLight *spot_lights;
   int num_rect_lights;
   AreaRectLight *rect_lights;
-  float *rect_light_cdf;
 
   // Mesh-light NEE: a MeshLight per emissive mesh group, each with its
   // own per-triangle CDF. `mesh_light_cdf` is the outer CDF (num+1

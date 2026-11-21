@@ -1,5 +1,6 @@
 #include "devicecode.h"
 #include <optix.h>
+#include "rect_light_sampling.h"
 
 #ifndef M_PIf
 #define M_PIf 3.14159265358979323846f
@@ -2447,6 +2448,88 @@ static __device__ float power_heuristic_3(float pdf_self,
   return (denom > 0.0f) ? a / denom : 0.0f;
 }
 
+// Rectangular lights are selected at each shading point, rather than by
+// global wattage: a distant, large panel must not starve nearby small lights.
+// This is a positive importance estimate, not a visibility/BSDF test. The
+// normal floor preserves support for transmission and mixed/bumped closures.
+static __device__ float rect_light_importance(const AreaRectLight &ar,
+                                              float3 P, float3 N) {
+  float area = ar.size_u * ar.size_v;
+  float brightness = fmaxf(luminance(make_f3(ar.emission)), 0.0f);
+  if (area <= 0 || brightness <= 0)
+    return 0;
+  float3 delta = make_f3(ar.corner) + make_f3(ar.u_axis) * (0.5f * ar.size_u) +
+                 make_f3(ar.v_axis) * (0.5f * ar.size_v) - P;
+  float plane = -dot3(make_f3(ar.normal), delta);
+  if (ar.two_sided == 0u && plane <= 0)
+    return 0;
+  float d2 = fmaxf(dot3(delta, delta), 1e-20f);
+  float inv_d = rsqrtf(d2);
+  float cosine = fabsf(plane) * inv_d;
+  // Finite-area regularization limits the near-field estimate to 2*pi.
+  float omega = area * cosine / (d2 + area * (0.5f * INV_PIf));
+  float normal_factor = dot3(N, N) > 0 ?
+      0.1f + 0.9f * fabsf(dot3(N, delta)) * inv_d : 1.0f;
+  return brightness * omega * normal_factor;
+}
+
+static __device__ int sample_rect_light(float3 P, float3 N, float u, float &pmf) {
+  pmf = 0;
+  float total = 0;
+  for (int i = 0; i < params.num_rect_lights; ++i)
+    total += rect_light_importance(params.rect_lights[i], P, N);
+  if (total <= 0)
+    return -1;
+  float target = u * total;
+  int selected = -1;
+  float weight = 0;
+  for (int i = 0; i < params.num_rect_lights; ++i) {
+    float w = rect_light_importance(params.rect_lights[i], P, N);
+    if (w <= 0)
+      continue;
+    selected = i;
+    weight = w;
+    target -= w;
+    if (target < 0)
+      break;
+  }
+  pmf = weight / total;
+  return selected;
+}
+
+static __device__ float rect_light_pmf(int index, float3 P, float3 N) {
+  float total = 0;
+  for (int i = 0; i < params.num_rect_lights; ++i)
+    total += rect_light_importance(params.rect_lights[i], P, N);
+  return total > 0 ? rect_light_importance(params.rect_lights[index], P, N) / total : 0;
+}
+
+static __device__ vibrt_rect::Distribution rect_distribution(const AreaRectLight &ar,
+                                                             float3 P) {
+  float3 corner = make_f3(ar.corner) - P;
+  return vibrt_rect::prepare(dot3(corner, make_f3(ar.u_axis)),
+                             dot3(corner, make_f3(ar.v_axis)),
+                             dot3(corner, make_f3(ar.normal)), ar.size_u, ar.size_v);
+}
+
+static __device__ float3 sample_rect_position(const AreaRectLight &ar, float3 P,
+                                               float u, float v, float &pdf) {
+  auto distribution = rect_distribution(ar, P);
+  float x, y;
+  vibrt_rect::sample(distribution, u, v, x, y);
+  pdf = vibrt_rect::pdf(distribution, x, y);
+  return make_f3(ar.corner) + make_f3(ar.u_axis) * (x - distribution.x0) +
+         make_f3(ar.v_axis) * (y - distribution.y0);
+}
+
+static __device__ float rect_direction_pdf(const AreaRectLight &ar, float3 P,
+                                            float3 light_position) {
+  auto distribution = rect_distribution(ar, P);
+  float3 delta = light_position - P;
+  return vibrt_rect::pdf(distribution, dot3(delta, make_f3(ar.u_axis)),
+                         dot3(delta, make_f3(ar.v_axis)));
+}
+
 // ---------- Direct lighting (NEE) ----------
 //
 // `vstack` is the shadow ray's starting volume stack. For surface NEE this is
@@ -2459,7 +2542,7 @@ static __device__ float power_heuristic_3(float pdf_self,
 // short-circuits to the legacy binary `shadow_visible` path.
 static __device__ __noinline__ float3 direct_light(const MaterialEvalGroup &e, float3 P,
                                       float3 wo, RNG &rng,
-                                      const VolumeStack &vstack) {
+                                      const VolumeStack &vstack, bool rect_mis) {
   float3 L = make_float3(0, 0, 0);
 
   // Point lights: sample centre (simple)
@@ -2549,18 +2632,16 @@ static __device__ __noinline__ float3 direct_light(const MaterialEvalGroup &e, f
                 fmaxf(d * d, 1e-6f);
   }
 
-  // Area rect lights: sample one proportional to power
+  // Area rect lights: point-dependent selection and solid-angle sampling.
   if (params.num_rect_lights > 0) {
-    float u = rng.next();
-    int idx = cdf_search(params.rect_light_cdf, params.num_rect_lights, u);
-    AreaRectLight &ar = params.rect_lights[idx];
-    float pmf_light =
-        (params.rect_light_cdf[idx + 1] - params.rect_light_cdf[idx]);
-    if (pmf_light > 0.0f) {
+    float pmf_light;
+    int idx = sample_rect_light(P, e.slots[0].Ns, rng.next(), pmf_light);
+    if (idx >= 0 && pmf_light > 0.0f) {
+      AreaRectLight &ar = params.rect_lights[idx];
       float su = rng.next();
       float sv = rng.next();
-      float3 Pl = make_f3(ar.corner) + make_f3(ar.u_axis) * (su * ar.size_u) +
-                  make_f3(ar.v_axis) * (sv * ar.size_v);
+      float pdf_solid;
+      float3 Pl = sample_rect_position(ar, P, su, sv, pdf_solid);
       float3 ld = Pl - P;
       float d2 = dot3(ld, ld);
       float d = sqrtf(d2);
@@ -2575,9 +2656,6 @@ static __device__ __noinline__ float3 direct_light(const MaterialEvalGroup &e, f
           float3 vis = shadow_transmittance(P, wi, d, vstack);
           if (luminance(vis) > 0.0f) {
             BsdfEval b = eval_bsdf(e, wo, wi);
-            float area = ar.size_u * ar.size_v;
-            float pdf_area = 1.0f / fmaxf(area, 1e-8f);
-            float pdf_solid = pdf_area * d2 / cos_light;
             float pdf = pdf_solid * pmf_light;
             if (pdf > 0.0f) {
               // Area rects emit along local +Z, but `ies_lookup` measures
@@ -2595,7 +2673,9 @@ static __device__ __noinline__ float3 direct_light(const MaterialEvalGroup &e, f
               // them would drop energy with nothing to compensate. For a
               // visible rect a sharp glossy lobe's reflection is delivered by
               // the BSDF-side branch, which NEE can't importance-sample.
-              float w_light = (ar.camera_visible != 0u)
+              // At the path-length limit no BSDF ray will be traced, so
+              // NEE is the only strategy and must retain its full weight.
+              float w_light = (ar.camera_visible != 0u && rect_mis)
                                   ? power_heuristic(pdf, b.pdf)
                                   : 1.0f;
               L = L + b.f * vis * make_f3(ar.emission) * ies * (w_light / pdf);
@@ -2764,12 +2844,12 @@ static __device__ __noinline__ float3 direct_light(const MaterialEvalGroup &e, f
 // "outgoing" direction back toward the scatter event's predecessor); the
 // phase function depends on the angle between wi_world and the chosen
 // shadow direction. Environment NEE uses MIS against phase sampling, paired
-// with the miss-path weight. The explicit-light and mesh-light blocks below
-// do not apply that phase-sampling MIS weight.
+// with the miss-path weight. Rect lights also pair NEE with phase-sampled
+// light hits; the other explicit-light and mesh-light blocks do not.
 static __device__ __noinline__ float3 direct_light_volume(float3 P, float3 wi_world,
                                               const Volume *vol,
                                               const VolumeStack &vstack,
-                                              RNG &rng) {
+                                              RNG &rng, bool rect_mis) {
   float3 L = make_float3(0, 0, 0);
   float g = vol->anisotropy;
 
@@ -2831,16 +2911,14 @@ static __device__ __noinline__ float3 direct_light_volume(float3 P, float3 wi_wo
     add(wi, make_f3(sp.emission) * falloff / fmaxf(d * d, 1e-6f), vis);
   }
   if (params.num_rect_lights > 0) {
-    float u = rng.next();
-    int idx = cdf_search(params.rect_light_cdf, params.num_rect_lights, u);
-    AreaRectLight &ar = params.rect_lights[idx];
-    float pmf_light =
-        (params.rect_light_cdf[idx + 1] - params.rect_light_cdf[idx]);
-    if (pmf_light > 0.0f) {
+    float pmf_light;
+    int idx = sample_rect_light(P, make_float3(0, 0, 0), rng.next(), pmf_light);
+    if (idx >= 0 && pmf_light > 0.0f) {
+      AreaRectLight &ar = params.rect_lights[idx];
       float su = rng.next();
       float sv = rng.next();
-      float3 Pl = make_f3(ar.corner) + make_f3(ar.u_axis) * (su * ar.size_u) +
-                  make_f3(ar.v_axis) * (sv * ar.size_v);
+      float pdf_solid;
+      float3 Pl = sample_rect_position(ar, P, su, sv, pdf_solid);
       float3 ld = Pl - P;
       float d2 = dot3(ld, ld);
       float d = sqrtf(d2);
@@ -2852,16 +2930,16 @@ static __device__ __noinline__ float3 direct_light_volume(float3 P, float3 wi_wo
         if (cos_light > 0.0f) {
           float3 vis = shadow_transmittance(P, wi, d, vstack);
           if (luminance(vis) > 0.0f) {
-            float area = ar.size_u * ar.size_v;
-            float pdf_area = 1.0f / fmaxf(area, 1e-8f);
-            float pdf_solid = pdf_area * d2 / cos_light;
             float pdf = pdf_solid * pmf_light;
             if (pdf > 0.0f) {
               // See the radiance-path area block: -wi lands on the profile's
               // zero backside because the rect emits along +Z; pass `wi`.
               float ies = ies_lookup(ar.ies_data, ar.ies_n_v, ar.ies_n_h,
                                      ar.light_rotation, wi);
-              add(wi, make_f3(ar.emission) * ies / pdf, vis);
+              float phase_pdf = volume_phase_eval(vol, dot3(wi_world, wi));
+              float w = ar.camera_visible != 0u && rect_mis ?
+                  power_heuristic(pdf, phase_pdf) : 1;
+              add(wi, make_f3(ar.emission) * ies * (w / pdf), vis);
             }
           }
         }
@@ -3830,12 +3908,12 @@ static __device__ __noinline__ float3 trace_path(float3 origin, float3 dir,
   bool camera_path = true;
   transparency = 0;
   float prev_bsdf_pdf = 0.0f;
-  // Last BSDF-sampled vertex's shading normal. Used by the
-  // constant-world (`world_type==0`) branch in the envmap-miss block to
-  // MIS-weight against the cosine-weighted hemisphere NEE that
-  // `direct_light` adds for constant worlds. Initial value never read
-  // (gated by `bounce > 0`); kept defined to silence uninitialised-
-  // read complaints.
+  // Evaluate the matching NEE PDF at the original scatter point, before
+  // ray offsets or transparent volume boundaries move the ray origin.
+  float3 prev_nee_position = origin;
+  // Last sampled vertex's shading normal: matches rect selection and the
+  // constant-world cosine-hemisphere NEE PDF. Zero after volume scattering
+  // (no receiver normal and no constant-world hemisphere NEE there).
   float3 prev_normal = make_float3(0.0f, 0.0f, 1.0f);
   // Cycles caps diffuse / glossy / transmission bounces independently of
   // the total path-length cap. Track per-lobe counters; once one runs out
@@ -3969,7 +4047,7 @@ static __device__ __noinline__ float3 trace_path(float3 origin, float3 dir,
 
           // In-scatter NEE: phase-weighted contribution from each light.
           float3 nee = throughput * direct_light_volume(P_scatter, dir,
-                                                         cur_vol, vstack, rng);
+              cur_vol, vstack, rng, bounce + 1 < params.max_depth);
           if (bounce > 0)
             nee = clamp_indirect(nee, params.clamp_indirect);
           L = L + nee;
@@ -3989,6 +4067,8 @@ static __device__ __noinline__ float3 trace_path(float3 origin, float3 dir,
           // additional throughput multiplier is needed.
           last_specular = false;
           prev_bsdf_pdf = pdf_phase;
+          prev_nee_position = P_scatter;
+          prev_normal = make_float3(0, 0, 0);
 
           if (bounce >= 3) {
             float q = fminf(fmaxf(luminance(throughput), 0.05f), 0.95f);
@@ -4016,8 +4096,8 @@ static __device__ __noinline__ float3 trace_path(float3 origin, float3 dir,
     if (rect_idx >= 0) {
       // Hit a camera-visible area light in front of any geometry. Hidden
       // rects are pre-filtered by intersect_rect_lights and never reach
-      // here, so they don't occlude primary/specular rays. Add emission
-      // on primary rays and after specular bounces; NEE covers diffuse.
+      // here, so they don't occlude primary/specular rays. Non-delta hits
+      // use the PDF of the matching NEE proposal at the previous vertex.
       AreaRectLight &ar = params.rect_lights[rect_idx];
       // IES applies to direct camera-ray hits too — Cycles' IES Texture
       // multiplies emission for every visibility class, not just NEE.
@@ -4035,16 +4115,12 @@ static __device__ __noinline__ float3 trace_path(float3 origin, float3 dir,
         // bounce. MIS-weight against the NEE sampler (area-light solid-angle
         // pdf × rect-select pmf) — the piece NEE can't capture for a sharp
         // glossy lobe reflecting an area light.
-        float cos_light = fabsf(dot3(make_f3(ar.normal), dir));
-        float area = ar.size_u * ar.size_v;
-        float pmf = params.rect_light_cdf[rect_idx + 1] -
-                    params.rect_light_cdf[rect_idx];
-        if (cos_light > 1e-6f && area > 1e-12f && pmf > 0.0f) {
-          float pdf_light = (t_rect * t_rect) / (area * cos_light) * pmf;
-          float w_bsdf = power_heuristic(prev_bsdf_pdf, pdf_light);
-          em = clamp_indirect(em * w_bsdf, params.clamp_indirect);
-          L = L + em;
-        }
+        float pmf = rect_light_pmf(rect_idx, prev_nee_position, prev_normal);
+        float pdf_light = rect_direction_pdf(ar, prev_nee_position,
+                                              origin + dir * t_rect) * pmf;
+        float w_bsdf = power_heuristic(prev_bsdf_pdf, pdf_light);
+        em = clamp_indirect(em * w_bsdf, params.clamp_indirect);
+        L = L + em;
       }
       break;
     }
@@ -4312,7 +4388,8 @@ static __device__ __noinline__ float3 trace_path(float3 origin, float3 dir,
 
     // NEE
     float3 wo = -dir;
-    float3 nee = throughput * direct_light(e_group, v.P, wo, rng, vstack);
+    float3 nee = throughput * direct_light(e_group, v.P, wo, rng, vstack,
+                                             bounce + 1 < params.max_depth);
     // bounce==0 → camera-ray NEE, clamp via Cycles' sample_clamp_direct.
     // bounce>0 → indirect-bounce NEE, clamp via sample_clamp_indirect.
     // Cycles applies clamping at exactly the same path-vertex layering.
@@ -4341,6 +4418,7 @@ static __device__ __noinline__ float3 trace_path(float3 origin, float3 dir,
     last_specular = bs.specular;
     last_path_flags=(bs.lobe==LOBE_DIFFUSE?4u:bs.lobe==LOBE_GLOSSY?8u:0u)|(bs.specular?16u:0u)|(dot3(bs.wi,v.Ng)*dot3(-dir,v.Ng)>0?32u:64u);
     prev_bsdf_pdf = bs.pdf;
+    prev_nee_position = v.P;
     prev_normal = e_slots[0].Ns;
 
     // Cycles-style per-lobe bounce caps. Cycles' `diffuse_bounces=N`

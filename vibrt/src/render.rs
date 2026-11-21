@@ -202,22 +202,6 @@ struct GasEntry {
     opaque: bool,
 }
 
-fn build_rect_light_cdf(rects: &[AreaRectLight]) -> Vec<f32> {
-    let n = rects.len();
-    let mut cdf = vec![0.0f32; n + 1];
-    for (i, r) in rects.iter().enumerate() {
-        cdf[i + 1] = cdf[i] + r.power.max(0.0);
-    }
-    let total = cdf[n];
-    if total > 0.0 {
-        let inv = 1.0 / total;
-        for v in cdf.iter_mut().skip(1) {
-            *v *= inv;
-        }
-    }
-    cdf
-}
-
 /// Render `scene` to in-memory color, depth, and AOV buffers.
 ///
 /// Applies `opts` without mutating the caller's scene. Each launch completes
@@ -912,8 +896,6 @@ pub fn render_to_pixels(
     let d_suns = uploads.copy_slice(&scene.sun_lights)?;
     let d_spots = uploads.copy_slice(&spot_lights)?;
     let d_rects = uploads.copy_slice(&rect_lights)?;
-    let rect_cdf = build_rect_light_cdf(&rect_lights);
-    let d_rect_cdf = uploads.copy_slice(&rect_cdf)?;
 
     // Mesh lights: convert each host triangle into the GPU `MeshLightTri`
     // POD, resolving `emission_tex_idx` to the device-side texture
@@ -1141,7 +1123,6 @@ pub fn render_to_pixels(
         spot_lights: d_spots,
         num_rect_lights: scene.rect_lights.len() as i32,
         rect_lights: d_rects,
-        rect_light_cdf: d_rect_cdf,
         num_mesh_lights: scene.mesh_lights.len() as i32,
         mesh_lights: d_mesh_lights,
         mesh_light_cdf: d_mesh_light_cdf,
