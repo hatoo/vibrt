@@ -4305,7 +4305,9 @@ static __device__ __noinline__ float3 trace_path(float3 origin, float3 dir,
           prev_nee_position = P_scatter;
           prev_normal = make_float3(0, 0, 0);
 
-          if (bounce >= 3) {
+          // Start roulette at the second scattering event: fewer long
+          // paths, at the cost of higher variance at a fixed sample count.
+          if (bounce >= 1) {
             float q = fminf(fmaxf(luminance(throughput), 0.05f), 0.95f);
             if (rng.next() > q)
               break;
@@ -4731,8 +4733,9 @@ static __device__ __noinline__ float3 trace_path(float3 origin, float3 dir,
       }
     }
 
-    // Russian roulette after a few bounces
-    if (bounce >= 3) {
+    // Start roulette at the second surface event. Survival compensation
+    // preserves expected radiance while trading more noise for less tracing.
+    if (bounce >= 1) {
       float q = fminf(fmaxf(luminance(throughput), 0.05f), 0.95f);
       if (rng.next() > q)
         break;
