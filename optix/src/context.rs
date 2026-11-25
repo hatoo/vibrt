@@ -5,6 +5,25 @@ use std::ffi::CString;
 use std::ptr;
 use std::sync::Arc;
 
+mod acceleration;
+mod resources;
+
+struct LogCallback(Box<dyn Fn(u32, &str, &str) + Send>);
+
+impl LogCallback {
+    unsafe extern "C" fn call(
+        level: std::os::raw::c_uint,
+        tag: *const std::os::raw::c_char,
+        message: *const std::os::raw::c_char,
+        data: *mut std::ffi::c_void,
+    ) {
+        let tag = std::ffi::CStr::from_ptr(tag).to_string_lossy();
+        let message = std::ffi::CStr::from_ptr(message).to_string_lossy();
+        let callback = &*data.cast::<Self>();
+        (callback.0)(level, &tag, &message);
+    }
+}
+
 /// Options for creating a device context.
 #[derive(Debug, Default)]
 pub struct DeviceContextOptions {
@@ -16,16 +35,21 @@ pub struct DeviceContextOptions {
 /// Manages the lifetime of an `OptixDeviceContext`. When dropped,
 /// the underlying context is destroyed.
 pub struct DeviceContext {
-    pub(crate) raw: optix_sys::OptixDeviceContext,
-    pub(crate) table: Arc<FunctionTable>,
-    /// Boxed log callback to keep it alive.
-    _log_callback: Option<Box<dyn Fn(u32, &str, &str) + Send>>,
+    raw: optix_sys::OptixDeviceContext,
+    table: Arc<FunctionTable>,
+    /// OptiX retains a pointer to this allocation until replacement or destruction.
+    log_callback: Option<Box<LogCallback>>,
 }
 
 unsafe impl Send for DeviceContext {}
 unsafe impl Sync for DeviceContext {}
 
 impl DeviceContext {
+    /// Acceleration operations borrow the context for their complete FFI call.
+    pub(crate) fn acceleration(&self) -> acceleration::Acceleration<'_> {
+        acceleration::Acceleration::new(self.raw, &self.table)
+    }
+
     /// Create a new device context from a CUDA context.
     pub fn new(
         optix: &crate::Optix,
@@ -52,7 +76,7 @@ impl DeviceContext {
         Ok(Self {
             raw,
             table: optix.table.clone(),
-            _log_callback: None,
+            log_callback: None,
         })
     }
 
@@ -76,35 +100,21 @@ impl DeviceContext {
     where
         F: Fn(u32, &str, &str) + Send + 'static,
     {
-        // Box the closure, then box the Box to get a stable pointer.
-        // cbdata points to the Box<dyn Fn> on the heap.
-        let boxed: Box<dyn Fn(u32, &str, &str) + Send> = Box::new(callback);
-        let stable = Box::into_raw(Box::new(boxed));
-        let cb_ptr = stable as *mut std::ffi::c_void;
-
-        unsafe extern "C" fn trampoline(
-            level: std::os::raw::c_uint,
-            tag: *const std::os::raw::c_char,
-            message: *const std::os::raw::c_char,
-            cbdata: *mut std::ffi::c_void,
-        ) {
-            let tag = std::ffi::CStr::from_ptr(tag).to_string_lossy();
-            let message = std::ffi::CStr::from_ptr(message).to_string_lossy();
-            let cb = &*(cbdata as *const Box<dyn Fn(u32, &str, &str) + Send>);
-            cb(level, &tag, &message);
-        }
+        let mut callback = Box::new(LogCallback(Box::new(callback)));
+        let cb_ptr = (&mut *callback as *mut LogCallback).cast();
 
         let result = unsafe {
             (self.table.raw.optixDeviceContextSetLogCallback.unwrap())(
                 self.raw,
-                Some(trampoline),
+                Some(LogCallback::call),
                 cb_ptr,
                 level,
             )
         };
         error::check(result)?;
-        // Reclaim ownership so we drop it properly
-        self._log_callback = Some(unsafe { *Box::from_raw(stable) });
+        // Keep the allocation, not just the closure inside it. On failure the
+        // new callback is dropped and the previously registered one stays alive.
+        self.log_callback = Some(callback);
         Ok(())
     }
 
@@ -149,3 +159,6 @@ impl Drop for DeviceContext {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

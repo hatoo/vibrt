@@ -13,7 +13,7 @@ pub fn sky_pixels<'py>(
     height: usize,
 ) -> pyo3::PyResult<pyo3::Bound<'py, numpy::PyArray3<f32>>> {
     use numpy::IntoPyArray;
-    let settings: vibrt_nodes::sky::SkySettings = crate::python_scene::from_python(settings)?;
+    let settings: vibrt_nodes::sky::SkySettings = super::scene::from_python(settings)?;
     // This is a short scene-sync helper, like read_mesh / pixel conversion.
     // Retain the GIL while preparing the sky so Blender's UI callbacks cannot
     // re-enter its shared Python context in the middle of graph export. The
@@ -36,7 +36,7 @@ pub fn color_pixels<'py>(
     b: Option<PyReadonlyArrayDyn<'py, f32>>,
     factors: Option<PyReadonlyArrayDyn<'py, f32>>,
 ) -> PyResult<Bound<'py, numpy::PyArray2<f32>>> {
-    let op: vibrt_nodes::color::ColorOp = crate::python_scene::from_python(operation)?;
+    let op: vibrt_nodes::color::ColorOp = super::scene::from_python(operation)?;
     for input in std::iter::once(&a).chain(b.as_ref()) {
         if input.as_array().shape().last() != Some(&3) {
             return Err(PyValueError::new_err(
@@ -59,7 +59,7 @@ pub fn color_pixels<'py>(
 
 #[pyfunction]
 pub fn fold_color_constants(graph: &Bound<'_, PyAny>) -> PyResult<Vec<Option<[f32; 3]>>> {
-    let graph: vibrt_nodes::graph::ColorGraph = crate::python_scene::from_python(graph)?;
+    let graph: vibrt_nodes::graph::ColorGraph = super::scene::from_python(graph)?;
     Ok(vibrt_nodes::fold::constants(&graph))
 }
 
@@ -71,7 +71,7 @@ pub fn shader_pixels<'py>(
     contexts: PyReadonlyArrayDyn<'py, f32>,
     textures: Option<Vec<(PyReadonlyArrayDyn<'py, f32>, usize, usize)>>,
 ) -> PyResult<Bound<'py, numpy::PyArray3<f32>>> {
-    let graph: vibrt_nodes::shader::ShaderGraph = crate::python_scene::from_python(graph)?;
+    let graph: vibrt_nodes::shader::ShaderGraph = super::scene::from_python(graph)?;
     if contexts.as_array().ndim() != 2 || contexts.as_array().shape()[1] != 128 {
         return Err(PyValueError::new_err(
             "Shader contexts must have shape (N, 128)",

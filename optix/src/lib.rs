@@ -3,6 +3,7 @@
 #![allow(clippy::type_complexity)]
 
 pub mod accel;
+mod compile_options;
 pub mod context;
 pub mod denoiser;
 pub mod error;
@@ -18,10 +19,11 @@ use crate::sys::FunctionTable;
 use std::sync::Arc;
 
 // Re-export commonly used types at the crate root
+pub use compile_options::PipelineCompileOptions;
 pub use context::{DeviceContext, DeviceContextOptions};
 pub use error::WithLog;
 pub use module::{Module, ModuleCompileOptions};
-pub use pipeline::{Pipeline, PipelineCompileOptions, PipelineLinkOptions};
+pub use pipeline::{Pipeline, PipelineLinkOptions};
 pub use program_group::ProgramGroup;
 pub use sbt::{SbtRecord, SbtRecordHeader, ShaderBindingTableBuilder};
 pub use types::*;

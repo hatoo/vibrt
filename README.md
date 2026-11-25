@@ -67,6 +67,10 @@ make test                              # layouts, Rust node tests, Python suites
 make ies_light-preview SPP=32 PCT=50   # vibrt preview
 make ies_light-cycles SPP=32 PCT=50    # Cycles reference
 cargo fmt --all -- --check
+cargo clippy --workspace --features python
+deslop-please --features python       # module boundaries and dependencies
 ```
 
 `make test` uses a POSIX shell and NumPy; native binding tests need a staged extension. `cargo test -p vibrt-nodes` runs the shared CPU core without Blender or CUDA. GPU regression commands are documented in [blender/README.md](blender/README.md) and the [node support matrix](docs/shader-nodes.md).
+
+[deslop-please](https://github.com/deterministic-machines/deslop-please) checks the native workspace's architecture. Python bindings live in `vibrt/src/python/`; the renderer and shader compiler share the independent `Progress` interface in `progress.rs`.

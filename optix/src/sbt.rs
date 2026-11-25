@@ -1,20 +1,6 @@
 use crate::error::{OptixError, Result};
 use crate::program_group::ProgramGroup;
-
-/// The 32-byte SBT record header, packed by OptiX.
-#[repr(C, align(16))]
-#[derive(Clone, Copy)]
-pub struct SbtRecordHeader {
-    pub(crate) data: [u8; optix_sys::OPTIX_SBT_RECORD_HEADER_SIZE],
-}
-
-impl Default for SbtRecordHeader {
-    fn default() -> Self {
-        Self {
-            data: [0u8; optix_sys::OPTIX_SBT_RECORD_HEADER_SIZE],
-        }
-    }
-}
+pub use crate::program_group::SbtRecordHeader;
 
 /// An SBT record combining a 32-byte OptiX header with user data.
 ///
@@ -129,5 +115,31 @@ impl ShaderBindingTableBuilder {
             callablesRecordStrideInBytes: self.callables_record_stride,
             callablesRecordCount: self.callables_record_count,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::mem::{align_of, offset_of, size_of};
+
+    #[test]
+    fn record_layout_matches_optix_abi() {
+        assert_eq!(
+            size_of::<SbtRecordHeader>(),
+            optix_sys::OPTIX_SBT_RECORD_HEADER_SIZE
+        );
+        assert_eq!(
+            align_of::<SbtRecordHeader>(),
+            optix_sys::OPTIX_SBT_RECORD_ALIGNMENT as usize
+        );
+        assert_eq!(
+            offset_of!(SbtRecord<u32>, data),
+            optix_sys::OPTIX_SBT_RECORD_HEADER_SIZE
+        );
+        assert_eq!(
+            size_of::<SbtRecord<u32>>() % optix_sys::OPTIX_SBT_RECORD_ALIGNMENT as usize,
+            0
+        );
     }
 }

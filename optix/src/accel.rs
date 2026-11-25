@@ -1,8 +1,7 @@
 use crate::context::DeviceContext;
-use crate::error::{self, Result};
+use crate::error::Result;
 use crate::types::{BuildFlags, BuildOperation, GeometryFlags, IndicesFormat, VertexFormat};
 use std::mem::MaybeUninit;
-use std::ptr;
 
 /// Options for building an acceleration structure.
 #[derive(Debug, Clone)]
@@ -223,17 +222,9 @@ pub fn accel_compute_memory_usage(
         .map(|bi| build_input_to_raw(bi, &mut raw_flags))
         .collect();
 
-    let mut sizes = optix_sys::OptixAccelBufferSizes::default();
-    let result = unsafe {
-        (ctx.table.raw.optixAccelComputeMemoryUsage.unwrap())(
-            ctx.raw,
-            &raw_options,
-            raw_inputs.as_ptr(),
-            raw_inputs.len() as u32,
-            &mut sizes,
-        )
-    };
-    error::check(result)?;
+    let sizes = ctx
+        .acceleration()
+        .compute_memory_usage(&raw_options, &raw_inputs)?;
 
     Ok(AccelBufferSizes {
         output_size: sizes.outputSizeInBytes,
@@ -265,26 +256,15 @@ pub fn accel_build(
         .map(|bi| build_input_to_raw(bi, &mut raw_flags))
         .collect();
 
-    let mut handle: optix_sys::OptixTraversableHandle = 0;
-    let result = unsafe {
-        (ctx.table.raw.optixAccelBuild.unwrap())(
-            ctx.raw,
-            stream,
-            &raw_options,
-            raw_inputs.as_ptr(),
-            raw_inputs.len() as u32,
-            temp_buffer,
-            temp_buffer_size,
-            output_buffer,
-            output_buffer_size,
-            &mut handle,
-            ptr::null(),
-            0,
-        )
-    };
-    error::check(result)?;
-
-    Ok(handle)
+    ctx.acceleration().build(
+        stream,
+        &raw_options,
+        &raw_inputs,
+        temp_buffer,
+        temp_buffer_size,
+        output_buffer,
+        output_buffer_size,
+    )
 }
 
 /// Compact an acceleration structure.
@@ -295,17 +275,6 @@ pub fn accel_compact(
     output_buffer: optix_sys::CUdeviceptr,
     output_buffer_size: usize,
 ) -> Result<optix_sys::OptixTraversableHandle> {
-    let mut handle: optix_sys::OptixTraversableHandle = 0;
-    let result = unsafe {
-        (ctx.table.raw.optixAccelCompact.unwrap())(
-            ctx.raw,
-            stream,
-            input_handle,
-            output_buffer,
-            output_buffer_size,
-            &mut handle,
-        )
-    };
-    error::check(result)?;
-    Ok(handle)
+    ctx.acceleration()
+        .compact(stream, input_handle, output_buffer, output_buffer_size)
 }

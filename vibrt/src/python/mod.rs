@@ -13,6 +13,11 @@
 //! is released for the entire render. Progress callbacks reacquire the GIL
 //! briefly via `Python::with_gil`.
 
+mod mesh;
+mod nodes;
+mod pixels;
+mod scene;
+
 use crate::{render::RenderOutput, render_to_pixels, Progress, RenderOptions};
 use numpy::ndarray::Array;
 use numpy::{IntoPyArray, PyArray2, PyArray3};
@@ -165,7 +170,7 @@ fn render<'py>(
         serde_json::from_str(text.to_str()?)
             .map_err(|e| PyRuntimeError::new_err(format!("scene JSON: {e}")))?
     } else {
-        crate::python_scene::from_python(scene_json)?
+        scene::from_python(scene_json)?
     };
     let description_time = t_scene.elapsed();
     let mut progress = PyProgress {
@@ -270,7 +275,7 @@ fn precompile_shaders<'py>(
         #[serde(default)]
         world_volume: Option<crate::scene_format::VolumeParams>,
     }
-    let mut scene: ShaderScene = crate::python_scene::from_python(description)?;
+    let mut scene: ShaderScene = scene::from_python(description)?;
     let mut progress = PyProgress {
         log_cb,
         cancel_cb,
@@ -330,21 +335,15 @@ fn precompile_shaders<'py>(
 
 #[pymodule]
 fn vibrt_native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(crate::python_nodes::sky_pixels, m)?)?;
-    m.add_function(wrap_pyfunction!(crate::python_nodes::color_pixels, m)?)?;
-    m.add_function(wrap_pyfunction!(
-        crate::python_nodes::fold_color_constants,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(crate::python_nodes::shader_pixels, m)?)?;
+    m.add_function(wrap_pyfunction!(nodes::sky_pixels, m)?)?;
+    m.add_function(wrap_pyfunction!(nodes::color_pixels, m)?)?;
+    m.add_function(wrap_pyfunction!(nodes::fold_color_constants, m)?)?;
+    m.add_function(wrap_pyfunction!(nodes::shader_pixels, m)?)?;
     m.add_function(wrap_pyfunction!(render, m)?)?;
     m.add_function(wrap_pyfunction!(precompile_shaders, m)?)?;
-    m.add_function(wrap_pyfunction!(crate::blender_mesh::read_mesh, m)?)?;
-    m.add_function(wrap_pyfunction!(crate::blender_mesh::mesh_pointiness, m)?)?;
-    m.add_function(wrap_pyfunction!(crate::python_pixels::srgb_to_linear, m)?)?;
-    m.add_function(wrap_pyfunction!(
-        crate::python_pixels::resample_bilinear,
-        m
-    )?)?;
+    m.add_function(wrap_pyfunction!(mesh::read_mesh, m)?)?;
+    m.add_function(wrap_pyfunction!(mesh::mesh_pointiness, m)?)?;
+    m.add_function(wrap_pyfunction!(pixels::srgb_to_linear, m)?)?;
+    m.add_function(wrap_pyfunction!(pixels::resample_bilinear, m)?)?;
     Ok(())
 }

@@ -1,6 +1,6 @@
+use crate::compile_options::PipelineCompileOptions;
 use crate::context::DeviceContext;
-use crate::error::{self, Result, WithLog};
-use crate::pipeline::PipelineCompileOptions;
+use crate::error::{Result, WithLog};
 use crate::sys::FunctionTable;
 use crate::types::{CompileDebugLevel, CompileOptimizationLevel};
 use std::ptr;
@@ -60,30 +60,13 @@ impl Module {
         let raw_module_opts = module_options.to_raw();
         let raw_pipeline_opts = pipeline_options.to_raw();
 
-        let mut raw: optix_sys::OptixModule = ptr::null_mut();
-        let mut log = [0u8; 2048];
-        let mut log_size = log.len();
-
-        let result = unsafe {
-            (ctx.table.raw.optixModuleCreate.unwrap())(
-                ctx.raw,
-                &raw_module_opts,
-                &raw_pipeline_opts,
-                source.as_ptr() as *const i8,
-                source.len(),
-                log.as_mut_ptr() as *mut i8,
-                &mut log_size,
-                &mut raw,
-            )
-        };
-        error::check(result)?;
-
+        let WithLog {
+            value: (raw, table),
+            log,
+        } = ctx.create_module(&raw_module_opts, &raw_pipeline_opts, source)?;
         Ok(WithLog {
-            value: Self {
-                raw,
-                table: ctx.table.clone(),
-            },
-            log: crate::error::extract_log(&log, log_size),
+            value: Self { raw, table },
+            log,
         })
     }
 
@@ -104,22 +87,9 @@ impl Module {
             curveEndcapFlags: 0,
         };
 
-        let mut raw: optix_sys::OptixModule = ptr::null_mut();
-        let result = unsafe {
-            (ctx.table.raw.optixBuiltinISModuleGet.unwrap())(
-                ctx.raw,
-                &raw_module_opts,
-                &raw_pipeline_opts,
-                &builtin_opts,
-                &mut raw,
-            )
-        };
-        error::check(result)?;
-
-        Ok(Self {
-            raw,
-            table: ctx.table.clone(),
-        })
+        let (raw, table) =
+            ctx.builtin_is_module(&raw_module_opts, &raw_pipeline_opts, &builtin_opts)?;
+        Ok(Self { raw, table })
     }
 }
 

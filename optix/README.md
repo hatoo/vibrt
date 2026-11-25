@@ -101,3 +101,20 @@ This renders a barycentric-colored triangle on a dark blue background and saves 
 - **No CUDA memory ownership** -- the wrapper never allocates or frees GPU memory. Use [cudarc](https://crates.io/crates/cudarc) for CUDA memory management.
 - **No lifetime parameters on resource types** -- `Module`, `Pipeline`, etc. hold an `Arc<FunctionTable>` internally. This lets you store them freely in structs without infectious lifetimes.
 - **Natural drop ordering** -- declare the CUDA context before OptiX resources and Rust's reverse drop order handles cleanup automatically.
+- **Context-owned dispatch** -- resource factories keep context handles and function tables private. Acceleration operations borrow the context; new resources retain the shared function table. Log callbacks remain allocated until successful replacement or context destruction.
+
+Compilation options are shared below modules and pipelines. Program groups own their packed SBT headers; `pipeline::PipelineCompileOptions` and `sbt::SbtRecordHeader` remain available through re-exports.
+
+```mermaid
+graph TD
+    Pipeline --> ProgramGroup
+    ProgramGroup --> Module
+    Module --> CompileOptions
+    Pipeline --> CompileOptions
+    SBT --> ProgramGroup
+    Module --> DeviceContext
+    ProgramGroup --> DeviceContext
+    Pipeline --> DeviceContext
+```
+
+`cargo test -p optix --lib` checks callback lifetimes, module creation, and SBT layout with a mock function table, without a GPU.

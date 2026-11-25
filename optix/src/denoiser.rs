@@ -2,7 +2,6 @@ use crate::context::DeviceContext;
 use crate::error::{self, Result};
 use crate::sys::FunctionTable;
 use crate::types::{DenoiserAlphaMode, DenoiserModelKind, PixelFormat};
-use std::ptr;
 use std::sync::Arc;
 
 /// Denoiser options.
@@ -106,21 +105,8 @@ impl Denoiser {
             denoiseAlpha: options.denoise_alpha.to_raw(),
         };
 
-        let mut raw: optix_sys::OptixDenoiser = ptr::null_mut();
-        let result = unsafe {
-            (ctx.table.raw.optixDenoiserCreate.unwrap())(
-                ctx.raw,
-                model_kind.to_raw(),
-                &raw_options,
-                &mut raw,
-            )
-        };
-        error::check(result)?;
-
-        Ok(Self {
-            raw,
-            table: ctx.table.clone(),
-        })
+        let (raw, table) = ctx.create_denoiser(model_kind.to_raw(), &raw_options)?;
+        Ok(Self { raw, table })
     }
 
     /// Compute memory resources for the denoiser.

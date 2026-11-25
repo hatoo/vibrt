@@ -14,6 +14,7 @@ pub mod pipeline;
 #[cfg(any(feature = "python", test))]
 mod pointiness;
 pub mod principled;
+mod progress;
 mod query_bvh;
 pub mod render;
 pub mod scene_format;
@@ -23,17 +24,10 @@ pub use vibrt_nodes::sky;
 pub mod transform;
 
 #[cfg(feature = "python")]
-mod blender_mesh;
-#[cfg(feature = "python")]
 mod python;
-#[cfg(feature = "python")]
-mod python_nodes;
-#[cfg(feature = "python")]
-mod python_pixels;
-#[cfg(feature = "python")]
-mod python_scene;
 
-pub use render::{render_to_pixels, Progress, RenderOptions, RenderOutput, StdoutProgress};
+pub use progress::{Progress, StdoutProgress};
+pub use render::{render_to_pixels, RenderOptions, RenderOutput};
 pub use scene_loader::{load_scene_from_bytes, LoadedScene};
 
 /// Adapter that turns a `cudarc::driver::DriverError` into our `anyhow::Error`.

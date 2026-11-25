@@ -1,11 +1,25 @@
 use crate::context::DeviceContext;
-use crate::error::{self, Result, WithLog};
+use crate::error::{Result, WithLog};
 use crate::module::Module;
-use crate::sbt::SbtRecordHeader;
 use crate::sys::FunctionTable;
 use std::ffi::{c_void, CString};
 use std::ptr;
 use std::sync::Arc;
+
+/// The 32-byte program-group header packed by OptiX for an SBT record.
+#[repr(C, align(16))]
+#[derive(Clone, Copy)]
+pub struct SbtRecordHeader {
+    data: [u8; optix_sys::OPTIX_SBT_RECORD_HEADER_SIZE],
+}
+
+impl Default for SbtRecordHeader {
+    fn default() -> Self {
+        Self {
+            data: [0u8; optix_sys::OPTIX_SBT_RECORD_HEADER_SIZE],
+        }
+    }
+}
 
 /// RAII wrapper around an OptiX program group.
 pub struct ProgramGroup {
@@ -116,33 +130,13 @@ impl ProgramGroup {
         ctx: &DeviceContext,
         desc: &optix_sys::OptixProgramGroupDesc,
     ) -> Result<WithLog<Self>> {
-        let options = optix_sys::OptixProgramGroupOptions {
-            payloadType: ptr::null(),
-        };
-
-        let mut raw: optix_sys::OptixProgramGroup = ptr::null_mut();
-        let mut log = [0u8; 2048];
-        let mut log_size = log.len();
-
-        let result = unsafe {
-            (ctx.table.raw.optixProgramGroupCreate.unwrap())(
-                ctx.raw,
-                desc,
-                1,
-                &options,
-                log.as_mut_ptr() as *mut i8,
-                &mut log_size,
-                &mut raw,
-            )
-        };
-        error::check(result)?;
-
+        let WithLog {
+            value: (raw, table),
+            log,
+        } = ctx.create_program_group(desc)?;
         Ok(WithLog {
-            value: Self {
-                raw,
-                table: ctx.table.clone(),
-            },
-            log: crate::error::extract_log(&log, log_size),
+            value: Self { raw, table },
+            log,
         })
     }
 }
