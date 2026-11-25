@@ -7,7 +7,6 @@ use crate::CudaResultExt;
 use anyhow::{anyhow, Result};
 use cudarc::driver::{CudaSlice, CudaStream, DevicePtr};
 use rayon::prelude::*;
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -94,7 +93,8 @@ pub fn surface_requirements(mat: &PrincipledMaterial) -> Result<(u32, bool)> {
 
 /// Remove only bit-identical channels; keep the original f32 samples and size.
 /// Layouts are luminance, luminance/alpha, RGB and RGBA (1..=4 channels).
-fn compact_texture(rgba: &[f32]) -> (Cow<'_, [f32]>, i32) {
+/// Reuse initialized storage across uploads; RGBA borrows the source directly.
+fn compact_texture<'a>(rgba: &'a [f32], scratch: &'a mut Vec<f32>) -> (&'a [f32], i32) {
     let flags = rgba
         .par_chunks(16_384)
         .map(|chunk| {
@@ -111,9 +111,13 @@ fn compact_texture(rgba: &[f32]) -> (Cow<'_, [f32]>, i32) {
         0 => 1,
         1 => 3,
         2 => 2,
-        _ => return (Cow::Borrowed(rgba), 4),
+        _ => return (rgba, 4),
     };
-    let mut pixels = vec![0.0; rgba.len() / 4 * channels];
+    let len = rgba.len() / 4 * channels;
+    if scratch.len() < len {
+        scratch.resize(len, 0.0);
+    }
+    let pixels = &mut scratch[..len];
     pixels
         .par_chunks_mut(4096 * channels)
         .zip(rgba.par_chunks(4096 * 4))
@@ -126,7 +130,7 @@ fn compact_texture(rgba: &[f32]) -> (Cow<'_, [f32]>, i32) {
                 }
             }
         });
-    (Cow::Owned(pixels), channels as i32)
+    (pixels, channels as i32)
 }
 
 /// Upload all textures once; retain allocations until the render completes.
@@ -136,12 +140,14 @@ pub fn upload_textures(
     bufs: &mut Vec<CudaSlice<f32>>,
 ) -> Result<Vec<TextureBinding>> {
     let mut out = Vec::with_capacity(textures.len());
+    let mut scratch = Vec::new();
     for tex in textures {
-        let (pixels, channels) = compact_texture(&tex.data);
-        let slice = stream.clone_htod(&pixels[..]).cuda()?;
-        // Packed pixels are temporary host storage. The driver may return from
-        // an async copy before it has consumed them; keep them alive until done.
-        if matches!(pixels, Cow::Owned(_)) {
+        let (pixels, channels) = compact_texture(&tex.data, &mut scratch);
+        let slice = stream.clone_htod(pixels).cuda()?;
+        // The driver may return before consuming the packed pixels. Finish the
+        // copy before scratch can be reused, resized or dropped. RGBA continues
+        // to borrow the scene's original storage for the whole render.
+        if channels != 4 {
             stream.synchronize().cuda()?;
         }
         let ptr = dptr(&slice, stream);
@@ -535,6 +541,7 @@ mod tests {
 
     #[test]
     fn texture_compaction_preserves_float_bits_and_alpha() {
+        let mut scratch = Vec::new();
         for (rgba, expected_channels) in [
             (vec![0.25, 0.25, 0.25, 1.0], 1),
             (vec![0.25, 0.25, 0.25, 0.4], 2),
@@ -547,7 +554,7 @@ mod tests {
             // Exercise the boundary between parallel chunks as well as small inputs.
             for repeat in [1, 4097] {
                 let source = rgba.repeat(repeat);
-                let (packed, channels) = compact_texture(&source);
+                let (packed, channels) = compact_texture(&source, &mut scratch);
                 assert_eq!(channels, expected_channels);
                 assert_eq!(packed.len(), repeat * channels as usize);
                 for pixel in packed.chunks_exact(channels as usize) {
@@ -564,9 +571,61 @@ mod tests {
         let mut mixed = vec![0.0, 0.0, 0.0, 1.0].repeat(8193);
         mixed[4096 * 4 + 1] = 0.25;
         mixed[8192 * 4 + 3] = 0.5;
-        let (packed, channels) = compact_texture(&mixed);
+        let (packed, channels) = compact_texture(&mixed, &mut scratch);
         assert_eq!(channels, 4);
-        assert!(matches!(packed, Cow::Borrowed(_)));
+        assert_eq!(packed.as_ptr(), mixed.as_ptr());
+    }
+
+    #[test]
+    fn texture_scratch_reuse_preserves_pixels_across_sizes_and_layouts() {
+        // Repeatedly grow and reuse the same storage, including smaller images
+        // and a borrowed RGBA image between packed uploads. Vary every pixel so
+        // stale channels, stale tails and parallel chunk boundaries are visible.
+        for threads in [1, 2, 4] {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(|| {
+                    let mut scratch = Vec::new();
+                    for (round, count) in [8193, 3, 12289, 4097, 0, 1, 8192].into_iter().enumerate()
+                    {
+                        for layout in [3, 1, 4, 2, 3, 2, 1] {
+                            let mut rgba = Vec::with_capacity(count * 4);
+                            for i in 0..count {
+                                let value = match i % 5 {
+                                    0 => -0.0,
+                                    1 => f32::INFINITY,
+                                    2 => f32::from_bits(0x7fc0_0001 + round as u32),
+                                    _ => (i + round) as f32 * 0.001,
+                                };
+                                let (g, b) = if layout <= 2 {
+                                    (value, value)
+                                } else {
+                                    (value + 0.25, value + 0.5)
+                                };
+                                let alpha = if layout == 2 || layout == 4 { 0.5 } else { 1.0 };
+                                rgba.extend_from_slice(&[value, g, b, alpha]);
+                            }
+                            let (packed, channels) = compact_texture(&rgba, &mut scratch);
+                            assert_eq!(channels, if count == 0 { 1 } else { layout });
+                            assert_eq!(packed.len(), count * channels as usize);
+                            for (pixel, expected) in packed
+                                .chunks_exact(channels as usize)
+                                .zip(rgba.as_chunks::<4>().0)
+                            {
+                                let restored = match channels {
+                                    1 => [pixel[0], pixel[0], pixel[0], 1.0],
+                                    2 => [pixel[0], pixel[0], pixel[0], pixel[1]],
+                                    3 => [pixel[0], pixel[1], pixel[2], 1.0],
+                                    _ => [pixel[0], pixel[1], pixel[2], pixel[3]],
+                                };
+                                assert_eq!(restored.map(f32::to_bits), expected.map(f32::to_bits));
+                            }
+                        }
+                    }
+                });
+        }
     }
 
     #[test]
