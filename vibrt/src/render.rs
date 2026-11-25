@@ -5,6 +5,7 @@
 //! Final buffers are returned to the caller; Blender handles display, color
 //! management, and file output.
 
+mod mesh_uploads;
 mod sample_batches;
 
 use crate::gpu_types::*;
@@ -422,8 +423,7 @@ pub fn render_to_pixels(
         num_verts: i32,
     }
     let mut _buffers: Vec<CudaSlice<u8>> = Vec::new();
-    let mut _f32_buffers: Vec<CudaSlice<f32>> = Vec::new();
-    let mut _u32_buffers: Vec<CudaSlice<u32>> = Vec::new();
+    let mut mesh_uploads = mesh_uploads::MeshUploads::new(stream.clone())?;
     let mut meshes_gpu: Vec<MeshGpu> = Vec::new();
 
     // CPU query trees are independent per mesh. Prepare a small batch in
@@ -441,10 +441,8 @@ pub fn render_to_pixels(
         meshes.iter().zip(queries)
     });
     for (m, (query_nodes, query_indices)) in meshes_with_queries {
-        let d_verts = stream.clone_htod(&m.vertices[..]).cuda()?;
-        let d_indices = stream.clone_htod(&m.indices[..]).cuda()?;
-        let verts_ptr = dptr_f32(&d_verts, &stream);
-        let idx_ptr = dptr_u32(&d_indices, &stream);
+        let verts_ptr = mesh_uploads.copy_slice(&m.vertices[..])?;
+        let idx_ptr = mesh_uploads.copy_slice(&m.indices[..])?;
 
         let vert_ptrs = [verts_ptr];
         let flags = [GeometryFlags::NONE];
@@ -471,6 +469,10 @@ pub fn render_to_pixels(
         let d_temp: CudaSlice<u8> = unsafe { stream.alloc(sizes.temp_size) }.cuda()?;
         let d_output: CudaSlice<u8> = unsafe { stream.alloc(sizes.output_size) }.cuda()?;
 
+        // The dedicated upload stream may still be copying this mesh.
+        // Only GAS construction needs these two arrays immediately; later
+        // attributes can transfer while this build runs on the render stream.
+        mesh_uploads.wait_on_consumer()?;
         let handle = accel::accel_build(
             &ctx,
             cu_stream,
@@ -483,68 +485,25 @@ pub fn render_to_pixels(
         )
         .context("accel build")?;
 
-        let d_normals = if !m.normals.is_empty() {
-            let s = stream.clone_htod(&m.normals[..]).cuda()?;
-            let p = dptr_f32(&s, &stream);
-            _f32_buffers.push(s);
-            p
-        } else {
-            0
-        };
-        let d_uvs = if !m.uvs.is_empty() {
-            let s = stream.clone_htod(&m.uvs[..]).cuda()?;
-            let p = dptr_f32(&s, &stream);
-            _f32_buffers.push(s);
-            p
-        } else {
-            0
-        };
-        let d_mat_indices = if !m.material_indices.is_empty() {
-            let s = stream.clone_htod(&m.material_indices[..]).cuda()?;
-            let p = dptr_u32(&s, &stream);
-            _u32_buffers.push(s);
-            p
-        } else {
-            0
-        };
-        let d_vertex_colors = if !m.vertex_colors.is_empty() {
-            let s = stream.clone_htod(&m.vertex_colors[..]).cuda()?;
-            let p = dptr_f32(&s, &stream);
-            _f32_buffers.push(s);
-            p
-        } else {
-            0
-        };
-        let d_vertex_alphas = if !m.vertex_alphas.is_empty() {
-            let s = stream.clone_htod(&m.vertex_alphas[..]).cuda()?;
-            let p = dptr_f32(&s, &stream);
-            _f32_buffers.push(s);
-            p
-        } else {
-            0
-        };
-        let d_tangents = if !m.tangents.is_empty() {
-            let s = stream.clone_htod(&m.tangents[..]).cuda()?;
-            let p = dptr_f32(&s, &stream);
-            _f32_buffers.push(s);
-            p
-        } else {
-            0
-        };
+        let d_normals = mesh_uploads.copy_slice(&m.normals[..])?;
+        let d_uvs = mesh_uploads.copy_slice(&m.uvs[..])?;
+        let d_mat_indices = mesh_uploads.copy_slice(&m.material_indices[..])?;
+        let d_vertex_colors = mesh_uploads.copy_slice(&m.vertex_colors[..])?;
+        let d_vertex_alphas = mesh_uploads.copy_slice(&m.vertex_alphas[..])?;
+        let d_tangents = mesh_uploads.copy_slice(&m.tangents[..])?;
 
         let mut attributes = Vec::new();
         for (key, values) in &m.attributes {
-            let data = stream.clone_htod(&values[..]).cuda()?;
+            let data = mesh_uploads.copy_slice(&values[..])?;
             attributes.push(crate::gpu_types::ShaderAttribute {
                 key: *key,
-                data: dptr_f32(&data, &stream),
+                data,
                 count: (values.len() / 4) as u32,
                 _pad: 0,
             });
-            _f32_buffers.push(data);
         }
-        let query_nodes = uploads.copy_slice(&query_nodes)?;
-        let query_indices = uploads.copy_slice(&query_indices)?;
+        let query_nodes = mesh_uploads.copy_slice(&query_nodes)?;
+        let query_indices = mesh_uploads.copy_slice(&query_indices)?;
         meshes_gpu.push(MeshGpu {
             query_nodes,
             query_indices,
@@ -561,12 +520,10 @@ pub fn render_to_pixels(
             num_verts: num_verts as i32,
         });
 
-        _f32_buffers.push(d_verts);
-        _u32_buffers.push(d_indices);
         _buffers.push(d_temp);
         _buffers.push(d_output);
     }
-    stream.synchronize().cuda()?;
+    mesh_uploads.finish()?;
 
     // Reverse mapping object_idx → mesh_light_idx (or -1 when the object
     // isn't registered as a mesh-light). Built before the SBT loop so each
