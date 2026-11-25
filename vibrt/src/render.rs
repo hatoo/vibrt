@@ -19,6 +19,7 @@ use anyhow::{Context, Result};
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DevicePtr};
 use optix::accel::{self, AccelBuildOptions, BuildInput, TriangleArrayInput};
 use optix::*;
+use rayon::prelude::*;
 use std::mem;
 use std::sync::Arc;
 
@@ -425,7 +426,21 @@ pub fn render_to_pixels(
     let mut _u32_buffers: Vec<CudaSlice<u32>> = Vec::new();
     let mut meshes_gpu: Vec<MeshGpu> = Vec::new();
 
-    for m in &scene.meshes {
+    // CPU query trees are independent per mesh. Prepare a small batch in
+    // parallel, then consume it in scene order on the render's CUDA thread.
+    // Batching limits temporary host trees to 32 meshes instead of the scene.
+    let meshes_with_queries = scene.meshes.chunks(32).flat_map(|meshes| {
+        let queries: Vec<_> = if scene_queries {
+            meshes
+                .par_iter()
+                .map(|m| crate::query_bvh::build_triangles(&m.vertices, &m.indices))
+                .collect()
+        } else {
+            vec![(Vec::new(), Vec::new()); meshes.len()]
+        };
+        meshes.iter().zip(queries)
+    });
+    for (m, (query_nodes, query_indices)) in meshes_with_queries {
         let d_verts = stream.clone_htod(&m.vertices[..]).cuda()?;
         let d_indices = stream.clone_htod(&m.indices[..]).cuda()?;
         let verts_ptr = dptr_f32(&d_verts, &stream);
@@ -528,29 +543,8 @@ pub fn render_to_pixels(
             });
             _f32_buffers.push(data);
         }
-        let (query_nodes, query_indices) = if scene_queries {
-            let boxes: Vec<_> = m
-                .indices
-                .as_chunks::<3>()
-                .0
-                .iter()
-                .map(|triangle| {
-                    let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
-                    for &index in triangle {
-                        for a in 0..3 {
-                            let v = m.vertices[index as usize * 3 + a];
-                            lo[a] = lo[a].min(v);
-                            hi[a] = hi[a].max(v);
-                        }
-                    }
-                    (lo, hi)
-                })
-                .collect();
-            let (nodes, indices) = crate::query_bvh::build(&boxes);
-            (uploads.copy_slice(&nodes)?, uploads.copy_slice(&indices)?)
-        } else {
-            (0, 0)
-        };
+        let query_nodes = uploads.copy_slice(&query_nodes)?;
+        let query_indices = uploads.copy_slice(&query_indices)?;
         meshes_gpu.push(MeshGpu {
             query_nodes,
             query_indices,

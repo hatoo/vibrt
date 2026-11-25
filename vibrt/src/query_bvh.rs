@@ -2,6 +2,26 @@
 use crate::gpu_types::QueryNode;
 pub type Bounds = ([f32; 3], [f32; 3]);
 
+pub fn build_triangles(vertices: &[f32], indices: &[u32]) -> (Vec<QueryNode>, Vec<u32>) {
+    let bounds: Vec<_> = indices
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .map(|triangle| {
+            let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+            for &index in triangle {
+                for axis in 0..3 {
+                    let v = vertices[index as usize * 3 + axis];
+                    lo[axis] = lo[axis].min(v);
+                    hi[axis] = hi[axis].max(v);
+                }
+            }
+            (lo, hi)
+        })
+        .collect();
+    build(&bounds)
+}
+
 pub fn build(bounds: &[Bounds]) -> (Vec<QueryNode>, Vec<u32>) {
     if bounds.is_empty() {
         return (Vec::new(), Vec::new());
@@ -55,6 +75,31 @@ pub fn build(bounds: &[Bounds]) -> (Vec<QueryNode>, Vec<u32>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn indexed_triangles_preserve_primitive_order_and_bounds() {
+        let vertices = [-2.0, 3.0, 1.0, 4.0, -1.0, 2.0, 0.0, 5.0, -3.0];
+        let indices = [2, 0, 1, 1, 1, 1, 0, 0, 0, 2, 2, 2, 1, 0, 2];
+        let bounds = [
+            ([-2.0, -1.0, -3.0], [4.0, 5.0, 2.0]),
+            ([4.0, -1.0, 2.0], [4.0, -1.0, 2.0]),
+            ([-2.0, 3.0, 1.0], [-2.0, 3.0, 1.0]),
+            ([0.0, 5.0, -3.0], [0.0, 5.0, -3.0]),
+            ([-2.0, -1.0, -3.0], [4.0, 5.0, 2.0]),
+        ];
+        let actual = build_triangles(&vertices, &indices);
+        let expected = build(&bounds);
+        assert_eq!(actual.1, expected.1);
+        assert_eq!(actual.0.len(), expected.0.len());
+        for (a, b) in actual.0.iter().zip(&expected.0) {
+            assert_eq!(
+                (a.lo, a.hi, a.first, a.count),
+                (b.lo, b.hi, b.first, b.count)
+            );
+        }
+        let empty = build_triangles(&[], &[]);
+        assert!(empty.0.is_empty() && empty.1.is_empty());
+    }
+
     #[test]
     fn leaves_cover_primitives_once_and_parents_enclose_children() {
         let bounds: Vec<_> = (0..257)
