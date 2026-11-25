@@ -3277,18 +3277,31 @@ struct SceneQuery {
   float2 bary;
   float3 P, N, Ng;
 };
+static __device__ float3 query_inverse_direction(float3 D) {
+  // A ray visits many BVH nodes with the same direction. Parallel slabs keep
+  // their explicit test below, so they do not need an infinite reciprocal.
+  return make_float3(fabsf(D.x) < 1e-30f ? 0.0f : 1.0f / D.x,
+                     fabsf(D.y) < 1e-30f ? 0.0f : 1.0f / D.y,
+                     fabsf(D.z) < 1e-30f ? 0.0f : 1.0f / D.z);
+}
 static __device__ bool query_box(const QueryNode &node, float3 P, float3 D,
+                                 float3 invD,
                                  float tmin, float tmax) {
-  const float *p = &P.x, *d = &D.x;
+  const float *p = &P.x, *d = &D.x, *inv = &invD.x;
   for (int axis = 0; axis < 3; axis++) {
     if (fabsf(d[axis]) < 1e-30f) {
       if (p[axis] < node.lo[axis] || p[axis] > node.hi[axis])
         return false;
     } else {
-      float a = (node.lo[axis] - p[axis]) / d[axis],
-            b = (node.hi[axis] - p[axis]) / d[axis];
-      tmin = fmaxf(tmin, fminf(a, b));
-      tmax = fminf(tmax, fmaxf(a, b));
+      float a = (node.lo[axis] - p[axis]) * inv[axis],
+            b = (node.hi[axis] - p[axis]) * inv[axis];
+      float near = fminf(a, b), far = fmaxf(a, b);
+      // Round the interval outwards to cover reciprocal/multiply error at
+      // grazing bounds. This only admits extra nodes; triangle tests retain
+      // their original arithmetic, distances, and traversal order.
+      constexpr float padding = 4.0f * 1.1920928955078125e-7f;
+      tmin = fmaxf(tmin, near - fmaxf(fabsf(near), 1e-30f) * padding);
+      tmax = fminf(tmax, far + fmaxf(fabsf(far), 1e-30f) * padding);
       if (tmin > tmax)
         return false;
     }
@@ -3302,12 +3315,13 @@ static __device__ __noinline__ void query_mesh(const QueryObject &obj,
   HitGroupData *hg = obj.geometry;
   P = transform_point(hg->world_to_object, P);
   D = transform_vector(hg->world_to_object, D);
+  float3 invD = query_inverse_direction(D);
   unsigned int stack[64];
   int sp = 0;
   stack[sp++] = 0;
   while (sp) {
     const QueryNode &node = obj.nodes[stack[--sp]];
-    if (!query_box(node, P, D, tmin, q.distance))
+    if (!query_box(node, P, D, invD, tmin, q.distance))
       continue;
     if (node.count == 0) {
       stack[sp++] = node.first;
@@ -3358,12 +3372,13 @@ query_scene(const PathVertex &v, float3 origin, float3 direction,
   if (distance <= tmin || dot3(direction, direction) < 1e-30f || !v.geometry ||
       !params.query_nodes)
     return q;
+  float3 invD = query_inverse_direction(direction);
   unsigned int stack[64];
   int sp = 0;
   stack[sp++] = 0;
   while (sp) {
     const QueryNode &node = params.query_nodes[stack[--sp]];
-    if (!query_box(node, origin, direction, tmin, q.distance))
+    if (!query_box(node, origin, direction, invD, tmin, q.distance))
       continue;
     if (node.count == 0) {
       stack[sp++] = node.first;
