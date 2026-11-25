@@ -3372,26 +3372,34 @@ query_scene(const PathVertex &v, float3 origin, float3 direction,
   if (distance <= tmin || dot3(direction, direction) < 1e-30f || !v.geometry ||
       !params.query_nodes)
     return q;
-  float3 invD = query_inverse_direction(direction);
-  unsigned int stack[64];
-  int sp = 0;
-  stack[sp++] = 0;
-  while (sp) {
-    const QueryNode &node = params.query_nodes[stack[--sp]];
-    if (!query_box(node, origin, direction, invD, tmin, q.distance))
-      continue;
-    if (node.count == 0) {
-      stack[sp++] = node.first;
-      stack[sp++] = node.first + 1;
-      continue;
-    }
-    for (unsigned int i = 0; i < node.count; i++) {
-      const QueryObject &obj =
-          params.query_objects[params.query_indices[node.first + i]];
-      if (!(obj.mask & mask) ||
-          (only_local && obj.geometry->instance_id != v.geometry->instance_id))
-        continue;
+  if (only_local) {
+    // Query objects retain scene-object order, matching the SBT instance IDs.
+    // Local queries need only the entry instance's mesh BVH, even when other
+    // instances share that mesh. Keep its visibility mask and self-hit policy.
+    const QueryObject &obj = params.query_objects[v.geometry->instance_id];
+    if (obj.mask & mask)
       query_mesh(obj, v, origin, direction, tmin, skip_self, q);
+  } else {
+    float3 invD = query_inverse_direction(direction);
+    unsigned int stack[64];
+    int sp = 0;
+    stack[sp++] = 0;
+    while (sp) {
+      const QueryNode &node = params.query_nodes[stack[--sp]];
+      if (!query_box(node, origin, direction, invD, tmin, q.distance))
+        continue;
+      if (node.count == 0) {
+        stack[sp++] = node.first;
+        stack[sp++] = node.first + 1;
+        continue;
+      }
+      for (unsigned int i = 0; i < node.count; i++) {
+        const QueryObject &obj =
+            params.query_objects[params.query_indices[node.first + i]];
+        if (!(obj.mask & mask))
+          continue;
+        query_mesh(obj, v, origin, direction, tmin, skip_self, q);
+      }
     }
   }
   if (q.hit) {

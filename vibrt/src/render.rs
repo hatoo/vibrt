@@ -708,6 +708,9 @@ pub fn render_to_pixels(
             },
         };
         if scene_queries {
+            // Local GPU queries index this table by HitGroupData::instance_id.
+            // Only query_indices may be reordered by the top-level BVH build.
+            debug_assert_eq!(query_objects.len(), obj_idx);
             let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
             for corner in 0..8 {
                 let p = std::array::from_fn(|a| {
