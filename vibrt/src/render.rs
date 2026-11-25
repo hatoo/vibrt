@@ -5,6 +5,7 @@
 //! Final buffers are returned to the caller; Blender handles display, color
 //! management, and file output.
 
+mod contexts;
 mod mesh_uploads;
 mod sample_batches;
 
@@ -17,7 +18,7 @@ use crate::{camera, pipeline, principled, CudaResultExt};
 use sample_batches::{SampleBatches, MAX_BATCH_SAMPLES};
 
 use anyhow::{Context, Result};
-use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DevicePtr};
+use cudarc::driver::{CudaSlice, CudaStream, DevicePtr};
 use optix::accel::{self, AccelBuildOptions, BuildInput, TriangleArrayInput};
 use optix::*;
 use rayon::prelude::*;
@@ -230,21 +231,27 @@ pub fn render_to_pixels(
     ));
 
     let t_prepare = std::time::Instant::now();
-    let cuda_ctx = CudaContext::new(0).cuda().context("CUDA context")?;
+    contexts::with_contexts(|contexts| {
+        render_with_contexts(scene, opts, progress, render_settings, t_prepare, contexts)
+    })
+}
+
+fn render_with_contexts(
+    scene: &LoadedScene,
+    opts: &RenderOptions,
+    progress: &mut dyn Progress,
+    render_settings: scene_format::RenderSettings,
+    t_prepare: std::time::Instant,
+    contexts: &contexts::Contexts,
+) -> Result<RenderOutput> {
+    let cuda_ctx = &contexts.cuda;
+    let ctx = &contexts.optix;
     let stream = cuda_ctx.default_stream();
     let uploads = UploadArena {
         stream: stream.clone(),
         buffers: Default::default(),
     };
     let cu_stream = stream.cu_stream() as optix_sys::CUstream;
-
-    let optix_handle = optix::init().context("OptiX init")?;
-    let ctx = DeviceContext::new(
-        &optix_handle,
-        cuda_ctx.cu_ctx() as optix_sys::CUcontext,
-        &DeviceContextOptions::default(),
-    )
-    .context("OptiX context")?;
 
     let context_time = t_prepare.elapsed();
     let requirements = crate::shader_compile::ShaderRequirements::new(
@@ -254,7 +261,7 @@ pub fn render_to_pixels(
     )?;
     let scene_queries =
         requirements.scene_queries() || scene.file.materials.iter().any(|m| m.volume.is_some());
-    let shaders = crate::shader_compile::compile(&ctx, requirements, progress)?;
+    let shaders = crate::shader_compile::compile(ctx, requirements, progress)?;
     let pipeline = &shaders.pipeline;
     let raygen_pg = &shaders.raygen;
     let miss_rg_pg = &shaders.miss_radiance;
@@ -465,7 +472,7 @@ pub fn render_to_pixels(
 
         let bi = [BuildInput::Triangles(tri_input)];
         let sizes =
-            accel::accel_compute_memory_usage(&ctx, &build_options, &bi).context("accel sizes")?;
+            accel::accel_compute_memory_usage(ctx, &build_options, &bi).context("accel sizes")?;
         let d_temp: CudaSlice<u8> = unsafe { stream.alloc(sizes.temp_size) }.cuda()?;
         let d_output: CudaSlice<u8> = unsafe { stream.alloc(sizes.output_size) }.cuda()?;
 
@@ -474,7 +481,7 @@ pub fn render_to_pixels(
         // attributes can transfer while this build runs on the render stream.
         mesh_uploads.wait_on_consumer()?;
         let handle = accel::accel_build(
-            &ctx,
+            ctx,
             cu_stream,
             &build_options,
             &bi,
@@ -756,11 +763,11 @@ pub fn render_to_pixels(
         instances: d_instances,
         num_instances: instances.len() as u32,
     })];
-    let sizes = accel::accel_compute_memory_usage(&ctx, &build_options, &ias_input)?;
+    let sizes = accel::accel_compute_memory_usage(ctx, &build_options, &ias_input)?;
     let d_temp: CudaSlice<u8> = unsafe { stream.alloc(sizes.temp_size) }.cuda()?;
     let d_output: CudaSlice<u8> = unsafe { stream.alloc(sizes.output_size) }.cuda()?;
     let traversable = accel::accel_build(
-        &ctx,
+        ctx,
         cu_stream,
         &build_options,
         &ias_input,
@@ -1284,7 +1291,7 @@ pub fn render_to_pixels(
         let h = render_settings.height;
 
         let denoiser = denoiser::Denoiser::new(
-            &ctx,
+            ctx,
             DenoiserModelKind::Aov,
             &denoiser::DenoiserOptions {
                 guide_albedo: true,
