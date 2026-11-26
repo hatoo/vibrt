@@ -19,13 +19,13 @@ def save_json(path, data):
     temporary.replace(path)
 
 
-def git(repo, *args):
+def git(repo, *args, timeout=60):
     environment = os.environ.copy()
     environment["GIT_TERMINAL_PROMPT"] = "0"
     environment["GCM_INTERACTIVE"] = "Never"
     return subprocess.run(["git", "-C", str(repo), *args], check=True,
                           stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                          stderr=subprocess.PIPE, env=environment, timeout=60).stdout
+                          stderr=subprocess.PIPE, env=environment, timeout=timeout).stdout
 
 
 def revision(repo, ref="HEAD"):
@@ -64,16 +64,48 @@ def open_workspace(repo, output):
     return workspace
 
 
+def checkpoint_experiment(workspace, head):
+    # 'stash create' snapshots both the index and tracked files without touching
+    # the worktree or the user's shared stash stack.
+    checkpoint = git(workspace, "stash", "create", "unfinished optimizer experiment").decode().strip()
+    if not checkpoint:
+        return
+    ref = f"refs/optimizer-recovery/{checkpoint}"
+    git(workspace, "update-ref", ref, checkpoint)
+    artifacts = workspace / "target/auto-optimize"
+    directory = artifacts / "recovery" / checkpoint
+    directory.mkdir(parents=True, exist_ok=True)
+    patch = directory / "experiment.patch"
+    patch.write_bytes(git(workspace, "diff", "--binary", head, ref))
+    with (artifacts / "MEMORY.md").open("a", encoding="utf-8") as notes:
+        notes.write(f"\n## Unverified experiment saved before master advanced\n\n"
+                    f"Original HEAD: {head}. Tracked edits: {patch}. Git snapshot: {ref} "
+                    f"(its second parent preserves the original index). Build the new clean baseline "
+                    "first, then port and revalidate the experiment before accepting it.\n")
+    git(workspace, "diff", "--quiet", ref, "--")
+    git(workspace, "diff", "--cached", "--quiet", ref + "^2", "--")
+    git(workspace, "restore", "--source=HEAD", "--staged", "--worktree", "--", ".")
+
+
 def sync_workspace(workspace):
+    require_branch(workspace)
     head = revision(workspace)
     remote = revision(workspace, REMOTE)
-    if head == remote:
-        return
-    if ancestor(workspace, head, remote) and not git(workspace, "status", "--porcelain").strip():
-        git(workspace, "merge", "--ff-only", REMOTE)
-        return
-    raise PublishBlocked("master advanced with unfinished work, or the optimizer branch diverged; "
-                         "preserving it for reconciliation and revalidation. No force push is used.")
+    if head != remote:
+        if not ancestor(workspace, head, remote):
+            raise PublishBlocked("Optimizer history diverged from origin/master; reconcile local commits first.")
+        status = git(workspace, "status", "--porcelain=v2", "-z").split(b"\0")
+        if any(line.startswith(b"u ") or (line.startswith((b"1 ", b"2 "))
+               and line.split(b" ", 3)[2].startswith(b"S")) for line in status):
+            raise PublishBlocked("Resolve unfinished merge or submodule changes before synchronizing.")
+        if any(line.startswith((b"1 ", b"2 ")) for line in status):
+            if any(line.startswith(b"? ") for line in status):
+                raise PublishBlocked("Untracked and tracked experiment files need to be preserved together.")
+            checkpoint_experiment(workspace, head)
+        git(workspace, "merge", "--ff-only", "--no-overwrite-ignore", remote)
+    if (workspace / ".gitmodules").is_file():
+        git(workspace, "-c", "core.longpaths=true", "submodule", "update", "--init",
+            "--depth", "1", timeout=900)
 
 
 def queue_publication(workspace, output, directory, result, baseline, previous=None):
