@@ -1246,12 +1246,22 @@ def _export_light(obj, writer, textures: list, materials=None, *, context=None) 
         # `scene_loader.rs` negates to the toward-sun direction the
         # kernel ultimately uses as `wi`.
         direction = [-obj.matrix_world[i][2] for i in range(3)]
+        # Cycles scene/light.cpp stores half the UI angular diameter and
+        # normalizes radiance by the projected disk area, pi*sin(radius)^2.
+        # Our kernel stores cone-integrated radiance, Le * solid_angle.
+        radius = 0.5 * float(light.angle)
+        if radius <= 0:
+            strength = energy
+        elif getattr(light, "normalize", True):
+            strength = energy * (2.0 / (1.0 + math.cos(radius)))
+        else:
+            strength = energy * (2.0 * math.pi * (1.0 - math.cos(radius)))
         return {
             "type": "sun",
             "direction": direction,
             "color": col,
-            "strength": energy,
-            "angle_rad": float(light.angle),
+            "strength": strength,
+            "angle_rad": radius,
         }
     if light.type == "SPOT":
         out = {
@@ -2600,7 +2610,7 @@ def _extract_sun_from_bake_inplace(rgb, w: int, h: int, sky_node, world_name: st
         "direction": [-sun_dir[0], -sun_dir[1], -sun_dir[2]],
         "color": color,
         "strength": flux_max_boosted,
-        "angle_rad": sun_size,
+        "angle_rad": 0.5 * sun_size,
     }
 
 

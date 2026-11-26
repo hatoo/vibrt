@@ -1,9 +1,9 @@
 """Check Mix/Add BSDF energy against independently rendered component BSDFs.
 
-Run with headless Blender, like scripts/test_shader_graphs.py. A single plane
-under a constant world makes material mixing linear; the reference is each
-component's rendered radiance, so this tests mixture weighting without assuming
-that vibrt's individual BSDF approximations exactly match Cycles.
+Run with headless Blender, like scripts/test_shader_graphs.py. Coplanar tiles
+under a constant world make material mixing linear. An orthographic camera
+gives every tile the same incoming direction, so independent components and
+their mixtures can share one render and one pipeline compilation.
 """
 from copy import deepcopy
 import json
@@ -21,7 +21,6 @@ from vibrt_blender import exporter, vibrt_native as native
 bpy.ops.wm.read_factory_settings(use_empty=True)
 vibrt_blender.register()
 scene = bpy.context.scene
-scene.render.resolution_x = scene.render.resolution_y = 48
 scene.render.resolution_percentage = 100
 scene.render.engine = "VIBRT"
 scene.cycles.max_bounces = 2
@@ -30,21 +29,11 @@ world.use_nodes = True
 world.node_tree.nodes["Background"].inputs["Color"].default_value = (1, 1, 1, 1)
 world.node_tree.nodes["Background"].inputs["Strength"].default_value = 1
 scene.world = world
-bpy.ops.mesh.primitive_plane_add(size=200)
-bpy.context.object.data.materials.append(bpy.data.materials.new("Test surface"))
 camera = bpy.data.objects.new("Camera", bpy.data.cameras.new("Camera"))
 scene.collection.objects.link(camera)
 scene.camera = camera
 camera.location = (0, 0, 3)
-
-description, blobs, textures = exporter.export_scene_to_memory(
-    bpy.context.evaluated_depsgraph_get(), serialize=False
-)
-byte_blobs = [blob.view(np.uint8) for blob in blobs]
-for obj in description["objects"]:
-    obj["material"] = 0
-    if "materials" in obj:
-        obj["materials"] = [0] * len(obj["materials"])
+camera.data.type = "ORTHO"
 
 
 def material(color, normal=(0, 0, 1), **parameters):
@@ -60,7 +49,7 @@ def mix(left, right, factor=0.5, add=False):
 
 
 components = {
-    "diffuse": material([0.2, 0.4, 0.7], pure_diffuse=True),
+    "diffuse": material([0.2, 0.4, 0.7], pure_diffuse=True, roughness=0),
     # The tilted normal gives this leaf a different view cosine from its sibling.
     "coated": material([0.7, 0.3, 0.1], normal=(0.3, 0, 0.9539392),
                        roughness=0.28, metallic=0.65, coat_weight=0.5,
@@ -75,17 +64,6 @@ directory = ROOT / "target/bsdf-mixtures"
 directory.mkdir(parents=True, exist_ok=True)
 
 
-def render(name, mat):
-    description["materials"] = [mat]
-    pixels, _ = native.render(description, byte_blobs, {"spp": 1024, "denoise": False},
-                              texture_arrays=textures)
-    assert np.isfinite(pixels).all(), name
-    np.save(directory / f"{name}.npy", pixels)
-    return pixels[8:-8, 8:-8, :3].mean(axis=(0, 1), dtype=np.float64)
-
-
-reference = {name: render(name, mat) for name, mat in components.items()}
-np.testing.assert_allclose(reference["diffuse"], [0.2, 0.4, 0.7], atol=2e-4, rtol=0)
 a, b, c, d = (components[name] for name in ("diffuse", "coated", "glass", "alpha"))
 cases = [
     ("mixed", mix(a, b, 0.3), {"diffuse": 0.7, "coated": 0.3}),
@@ -100,10 +78,44 @@ cases = [
     ("zero-weight", mix(a, b, 0), {"diffuse": 1}),
     ("full-weight", mix(a, b, 1), {"coated": 1}),
 ]
+materials = dict(components)
+materials.update((name, mat) for name, mat, _ in cases)
+side, tile = 4, 32
+assert len(materials) <= side * side
+scene.render.resolution_x = scene.render.resolution_y = side * tile
+camera.data.ortho_scale = side
+for index, name in enumerate(materials):
+    bpy.ops.mesh.primitive_plane_add(size=1, location=(
+        index % side - side / 2 + 0.5, index // side - side / 2 + 0.5, 0))
+    placeholder = bpy.data.materials.new(name)
+    # Preserve the fixture ID through export without relying on material order.
+    placeholder.use_nodes = True
+    placeholder.node_tree.nodes["Principled BSDF"].inputs["Base Color"].default_value = (
+        (index + 1) / 16, 0, 0, 1)
+    bpy.context.object.data.materials.append(placeholder)
+description, blobs, textures = exporter.export_scene_to_memory(
+    bpy.context.evaluated_depsgraph_get(), serialize=False
+)
+names = list(materials)
+description["materials"] = [materials[names[round(mat["base_color"][0] * 16) - 1]]
+                            for mat in description["materials"]]
+pixels, _ = native.render(description, [blob.view(np.uint8) for blob in blobs],
+                          {"spp": 8192, "denoise": False}, texture_arrays=textures)
+assert np.isfinite(pixels).all()
+np.save(directory / "atlas.npy", pixels)
+measurements = {}
+for index, name in enumerate(materials):
+    x, y = index % side * tile, index // side * tile
+    measurements[name] = pixels[y + 4:y + tile - 4, x + 4:x + tile - 4, :3].mean(
+        axis=(0, 1), dtype=np.float64)
+reference = {name: measurements[name] for name in components}
+# Independent tile samples include Russian roulette; allow Monte Carlo error
+# in the white-furnace check as well as in the mixture comparisons below.
+np.testing.assert_allclose(reference["diffuse"], [0.2, 0.4, 0.7], atol=1e-3, rtol=0)
 results = []
 for name, mat, weights in cases:
     expected = sum(reference[key] * weight for key, weight in weights.items())
-    actual = render(name, mat)
+    actual = measurements[name]
     error = float(np.max(np.abs(actual - expected) / np.maximum(0.1, np.abs(expected))))
     results.append(dict(name=name, expected=expected.tolist(), actual=actual.tolist(),
                         relative_error=error))

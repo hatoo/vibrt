@@ -1,8 +1,4 @@
-//! Scene-independent lighting distributions and BRDF lookup tables.
-
-// The integration depends only on the BRDF, never on the scene or GPU.
-// Build it once and embed the exact float bits, including for the first render.
-include!(concat!(env!("OUT_DIR"), "/ggx_energy_lut.rs"));
+//! Scene-independent environment lighting distributions.
 
 /// Build marginal + conditional CDFs for envmap importance sampling (RGB data).
 pub fn build_envmap_cdf(rgb: &[f32], width: u32, height: u32) -> (Vec<f32>, Vec<f32>, f32) {
@@ -41,4 +37,3 @@ pub fn build_envmap_cdf(rgb: &[f32], width: u32, height: u32) -> (Vec<f32>, Vec<
 }
 
 // Verify the generated table dimensions at compilation.
-const _: () = assert!(GGX_ENERGY_LUT.len() == GGX_LUT_SIZE * GGX_LUT_SIZE);

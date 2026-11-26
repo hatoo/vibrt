@@ -466,6 +466,7 @@ static __device__ __noinline__ float3 trace_path(float3 origin, float3 dir,
         e_slots[i].Ns = -e_slots[i].Ns;
         e_slots[i].B = -e_slots[i].B;
         e_slots[i].ior = 1.0f / e_slots[i].ior;
+        e_slots[i].coat_normal = -e_slots[i].coat_normal;
       }
     }
     // Build a scalar/aggregate `e` that legacy code paths can read for
@@ -552,24 +553,22 @@ static __device__ __noinline__ float3 trace_path(float3 origin, float3 dir,
       e_slots[0]=e_slots[chosen];e_weights[0]=1;e_n=1;e_group.n=1;
       throughput=throughput*total;
       MaterialEval &sub=e_slots[0];
-      float fraction = __saturatef(sub.sss_weight);
       bool standalone = sub.mat->closure_type == 7;
-      if (sub.mat->sss_method == 0 && !standalone) fraction=0;
-      float strength = standalone ? 1 : fraction*(1-sub.metallic)*(1-sub.transmission)*(1-sub.translucent_weight)*sub.alpha_blend;
-      float NoV = fmaxf(dot3(sub.Ns,-dir),0);
-      float reflectance = 0, coat = 0;
-      if (!standalone && !sub.mat->pure_diffuse) {
-        float f0=(sub.ior-1)/(sub.ior+1);f0=f0*f0*2*sub.specular_ior_level;
-        reflectance=__saturatef(f0*ggx_e_lookup(NoV,sub.alpha)+(1-f0)*ggx_b_lookup(NoV,sub.alpha));
-        float cf=(sub.coat_ior-1)/(sub.coat_ior+1);
-        coat=sub.coat_weight*schlick_scalar(NoV,cf*cf);
-        strength *= (1-reflectance)*(1-coat);
+      float strength = 1, other = 0;
+      float3 sss_weight = make_float3(1, 1, 1);
+      if (!standalone) {
+        vibrt_surface::Closures closures;
+        auto p = surface_parameters(sub, -dir);
+        vibrt_surface::setup(p, closures);
+        strength = vibrt_cycles::average(closures.subsurface_weight) * sub.alpha_blend;
+        other = closures.total * sub.alpha_blend + (1 - sub.alpha_blend);
+        // The BSSRDF walk/profile already applies its base color.
+        auto weight = vibrt_cycles::safe_divide_color(closures.subsurface_weight, p.color);
+        sss_weight = make_float3(weight.x, weight.y, weight.z) * sub.alpha_blend;
       }
-      float other = standalone ? 0 : (1-fraction)*(1-sub.metallic)*(1-sub.transmission) +
-          sub.metallic+sub.transmission+reflectance+coat+sub.sheen_weight+(1-sub.alpha_blend);
       float probability=strength/fmaxf(strength+other,1e-12f);
       if (strength>0 && rng.next()<probability) {
-        throughput=throughput*(strength/probability);
+        throughput=throughput*(sss_weight/probability);
         bool burley=sub.mat->sss_method<=1;
         float radius=fmaxf(fmaxf(sub.sss_radius.x,sub.sss_radius.y),sub.sss_radius.z)*sub.sss_scale;
         if (radius>1e-6f && !(burley && diffuse_bounces>0)) {

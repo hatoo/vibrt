@@ -59,13 +59,16 @@ Math implements 41 operations; Vector Math 30; color Mix 19. Noise supports
 distance metrics and normalization. Curves and color ramps use 257-sample
 tables, so narrow/discontinuous features can differ from analytical Cycles.
 
-Principled graph outputs include Base Color, Roughness, Metallic, IOR,
+Principled graph outputs include Base Color, Roughness, Diffuse Roughness, Metallic, IOR,
 Transmission Weight, Emission Color/Strength, Alpha, Specular IOR Level,
-Anisotropy/Rotation, Coat Weight/Roughness/IOR, Sheen Weight/Roughness/Tint,
-Subsurface Weight/Radius/Scale/IOR/Anisotropy, Normal and Tangent. Extra Principled
-inputs such as coat/specular tint, coat normal and thin film remain unsupported.
-Diffuse roughness, exact sheen, the legacy Hair BSDF, refraction-only closure
-behavior and colored transparency are not Cycles-equivalent. Standalone and
+Anisotropy/Rotation, Coat Weight/Roughness/IOR/Tint/Normal, Specular Tint,
+Sheen Weight/Roughness/Tint, Thin Film Thickness/IOR,
+Subsurface Weight/Radius/Scale/IOR/Anisotropy, Normal and Tangent.
+Surface evaluation, sampling and PDFs reuse Cycles' rough Diffuse, Sheen/Velvet
+and GGX/Beckmann closures. Principled assembles sheen, coat, metal, transmission,
+specular and diffuse/SSS in Cycles order, including attenuation of emission.
+Metallic supports F82 Edge Tint and physical conductor IOR/Extinction.
+Thin-film tables use scene-linear Rec.709. The legacy Hair BSDF and colored transparency remain limitations. Standalone and
 Principled SSS support Burley, Random Walk and Random Walk Skin. Random walks
 use Cycles coefficient/radius fits and entry sampling, with spectral free flights
 and Russian roulette (1,024-event cap); Dwivedi guiding is not implemented.
@@ -114,18 +117,18 @@ Native: **52**, Partial: **33**, Legacy: **6**, Unsupported: **3**, Outside Cycl
 | `ShaderNodeBevel` | Partial | Cycles cubic profile and three-axis sampling on triangle geometry; at most 64 intersections per sample. |
 | `ShaderNodeBlackbody` | Native | Shared C++ CPU/CUDA evaluator; socket conversions are explicit. |
 | `ShaderNodeBrightContrast` | Native | Shared C++ CPU/CUDA evaluator; socket conversions are explicit. |
-| `ShaderNodeBsdfAnisotropic` | Partial | Existing vibrt closure with dynamic supported color/value/normal sockets. See closure limitations below. |
-| `ShaderNodeBsdfDiffuse` | Partial | Existing vibrt closure with dynamic supported color/value/normal sockets. See closure limitations below. |
-| `ShaderNodeBsdfGlass` | Partial | Existing vibrt closure with dynamic supported color/value/normal sockets. See closure limitations below. |
+| `ShaderNodeBsdfAnisotropic` | Partial | Cycles GGX, Beckmann and Multi-GGX, with standalone anisotropy remapping and generated/linked tangent. |
+| `ShaderNodeBsdfDiffuse` | Partial | Cycles Lambert and Oren-Nayar, including linked roughness, color and normal. |
+| `ShaderNodeBsdfGlass` | Partial | Cycles GGX, Beckmann and Multi-GGX dielectric reflection/transmission with thin film. |
 | `ShaderNodeBsdfHair` | Partial | Existing vibrt closure with dynamic supported color/value/normal sockets. See closure limitations below. |
 | `ShaderNodeBsdfHairPrincipled` | Partial | Unmodified Cycles Chiang closure with Color/Melanin/Absorption parametrizations and strand randomization. Huang is rejected pending agreement with Cycles. |
-| `ShaderNodeBsdfMetallic` | Partial | F82 base color, roughness and anisotropy mapped to vibrt metal. Physical conductor, edge tint and thin film are unsupported. |
-| `ShaderNodeBsdfPrincipled` | Partial | Dynamic base/roughness/metallic/IOR/transmission/alpha/emission/specular/anisotropy/coat/sheen/SSS inputs listed below. Renderer closure physics are not identical to Cycles. |
+| `ShaderNodeBsdfMetallic` | Partial | Cycles GGX/Multi-GGX with F82 Edge Tint or physical conductor IOR/Extinction, anisotropy and thin film; Rec.709 working space. |
+| `ShaderNodeBsdfPrincipled` | Partial | Cycles numerical closures and layer ordering; dynamic tint, coat normal and thin film in addition to base/specular/coat/sheen/SSS inputs. Includes linked Diffuse Roughness; path integration remains renderer-specific. |
 | `ShaderNodeBsdfRayPortal` | Native | Dynamic color, position and direction; ray relocation also works inside Mix/Add trees. |
-| `ShaderNodeBsdfRefraction` | Partial | Existing vibrt closure with dynamic supported color/value/normal sockets. See closure limitations below. |
-| `ShaderNodeBsdfSheen` | Partial | Existing vibrt closure with dynamic supported color/value/normal sockets. See closure limitations below. |
+| `ShaderNodeBsdfRefraction` | Partial | Cycles GGX/Beckmann refraction-only closure, including total internal reflection rejection. |
+| `ShaderNodeBsdfSheen` | Partial | Cycles Microfiber LTC and Ashikhmin Velvet, including linked Color/Roughness/Normal. Integrator limitations still apply. |
 | `ShaderNodeBsdfToon` | Native | Diffuse and glossy components with dynamic Color, Size, Smooth and Normal. |
-| `ShaderNodeBsdfTranslucent` | Partial | Existing vibrt closure with dynamic supported color/value/normal sockets. See closure limitations below. |
+| `ShaderNodeBsdfTranslucent` | Partial | Cycles back-hemisphere Lambert closure with linked color and normal. |
 | `ShaderNodeBsdfTransparent` | Partial | Existing vibrt closure with dynamic supported color/value/normal sockets. See closure limitations below. |
 | `ShaderNodeBump` | Partial | Nested Bump graphs and normal chains use finite spatial differences. Ray differentials and displacement-aware Geometry Normal are incomplete. |
 | `ShaderNodeCameraData` | Native | Shared C++ CPU/CUDA evaluator; socket conversions are explicit. |
@@ -292,3 +295,8 @@ explicit object coordinates, Pointiness, missing images, shader group inputs,
 implicit group normals, elliptical light shader graphs, camera-inside emission volumes,
 transparent bounce budgets, Point/Spot falloff and soft shadows, and all three
 SSS methods against Cycles. Outputs are ignored under `target/scene-parity-tests/`.
+
+Surface closure regression: `scripts/test_surface_closures.py` renders 50 materials
+under environment and Sun illumination with 8,192 samples and unclamped
+contributions. It checks per-tile linear RGB against Cycles (8% relative,
+0.04 dark-value floor), including linked tint/normal/film/conductor sockets.

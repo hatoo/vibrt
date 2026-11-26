@@ -33,8 +33,12 @@ The standalone adapter extracts numerical helpers and replaces SVM stack,
 kernel globals, image access and shading context with vibrt's CPU/CUDA ABI.
 Noise, fractals, Voronoi, Gabor, Wave, Brick, Checker, Gradient, Magic,
 color/vector math, radial tiling, image projection, normal maps, Fresnel
-and tangent evaluation use or adapt these sources. Provenance and hashes
-are recorded in vibrt-nodes/third_party/cycles/.
+and tangent evaluation use or adapt these sources. Surface closures also reuse
+Oren-Nayar, Sheen LTC, Ashikhmin Velvet, microfacet evaluation/sampling,
+conductor/generalized Fresnel and thin-film/energy tables (Apache-2.0).
+Source bytes are pinned by the Blender git submodule at
+vibrt-nodes/third_party/blender, commit b70da489d7f4eae7760cc0a50cc6c60cd5464205.
+Provenance and adapter details are in vibrt-nodes/third_party/cycles/README.md.
 
 Subsurface scattering uses the Cycles Burley profiles, random-walk coefficient
 fit and dipole radius fit (Apache-2.0). The renderer supplies BVH traversal and

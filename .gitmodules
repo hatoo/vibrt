@@ -1,0 +1,4 @@
+[submodule "vibrt-nodes/third_party/blender"]
+	path = vibrt-nodes/third_party/blender
+	url = https://github.com/blender/blender.git
+	shallow = true

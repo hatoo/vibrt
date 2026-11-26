@@ -16,6 +16,8 @@
 #define ccl_device_forceinline VN_INLINE
 #define ccl_device_noinline VN_DEVICE
 #define ccl_device_noinline_cpu VN_DEVICE
+#define ccl_device_inline_method VN_INLINE
+#define ccl_static_constexpr static constexpr
 #define ccl_private
 #define ccl_ignore_integer_overflow
 #define ccl_constant const
@@ -316,26 +318,7 @@ VN_INLINE float3 refract(float3 a, float3 b, float eta) {
   return k < 0 ? zero_float3() : eta * a - (eta * d + sqrtf(k)) * b;
 }
 VN_INLINE float3 faceforward(float3 a, float3 b, float3 c) { return dot(b, c) < 0 ? a : -a; }
-VN_INLINE float3 rgb_to_hsv(float3 v) {
-  auto r = vibrt_nodes::rgb_to_hsv_bl({v.x, v.y, v.z});
-  return make_float3(r.x, r.y, r.z);
-}
-VN_INLINE float3 hsv_to_rgb(float3 v) {
-  auto r = vibrt_nodes::hsv_to_rgb_bl({v.x, v.y, v.z});
-  return make_float3(r.x, r.y, r.z);
-}
 VN_INLINE float3 saturate(float3 v) { return clamp(v, 0, 1); }
-VN_INLINE float3 rgb_to_hsl(float3 c) {
-  float3 h = rgb_to_hsv(c);
-  float hi = fmaxf(c.x, fmaxf(c.y, c.z)), lo = fminf(c.x, fminf(c.y, c.z));
-  float l = (hi + lo) * 0.5f;
-  return make_float3(h.x, hi == lo ? 0 : (hi - lo) / (l > 0.5f ? 2 - hi - lo : hi + lo), l);
-}
-VN_INLINE float3 hsl_to_rgb(float3 h) {
-  float chroma = (1 - fabsf(2 * h.z - 1)) * h.y;
-  float3 c = hsv_to_rgb(make_float3(h.x, 1, 1));
-  return c * chroma + (h.z - chroma * 0.5f);
-}
 VN_INLINE float fast_inv_cbrtf(float x) { return 1 / cbrtf(x); }
 VN_INLINE float fast_sinf(float x) { return sinf(x); }
 VN_INLINE float fast_cosf(float x) { return cosf(x); }

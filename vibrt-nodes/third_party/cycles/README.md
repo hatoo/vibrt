@@ -1,45 +1,51 @@
-# Cycles shader math
+# Cycles source provenance
 
-These headers are unmodified copies from Blender **v5.1.1**, commit
+The sources live in the official Blender git submodule at
+[`../blender`](../blender), pinned to Blender **v5.1.1**, commit
 `b70da489d7f4eae7760cc0a50cc6c60cd5464205`.
-`SHA256.json` records the exact bytes. Upstream paths are:
+The former copies and SHA256 manifest have been removed; the gitlink identifies
+the exact source tree. No files inside the submodule are patched.
 
-- `intern/cycles/kernel/svm/`: `types.h`, `math_util.h`, `color_util.h`,
-  `fractal_noise.h`, `noisetex.h`, `voronoi.h`, `wave.h`, `brick.h`,
-  `checker.h`, `gradient.h`, `magic.h`, `gabor.h`, `mapping.h`,
-  `map_range.h`, `blackbody.h`, `wavelength.h`, `vector_rotate.h`, `noise.h`,
-  `mapping_util.h`, `radial_tiling_shared.h`, `ao.h`, `bevel.h`, `raycast.h`,
-  `wireframe.h`.
-- `intern/cycles/util/`: `hash.h`.
-- `intern/cycles/kernel/`: `tables.h`.
-- `intern/cycles/kernel/closure/`: `bsdf_principled_hair_chiang.h`,
-  `bsdf_toon.h`, `bsdf_ray_portal.h`, `bssrdf.h`, `volume_util.h`.
-- `intern/cycles/kernel/integrator/`: `subsurface_disk.h`, `subsurface_random_walk.h`.
+Initialize it before building from a fresh checkout:
 
-Verify these locations against the upstream link and manifest when updating:
-[Blender source](https://github.com/blender/blender/tree/v5.1.1).
+```sh
+git submodule update --init --depth 1
+```
 
-`build.rs` extracts the numerical helpers and enums into an OUT_DIR header,
-removing Blender includes, namespace macros and SVM bytecode entry points.
-`native/cycles_compat.h` supplies vector/math types without Blender dependencies.
-`native/shader.h` adapts graph inputs, image sampling, coordinate transforms,
-normal maps, Fresnel and curve tables to vibrt's shading context. Image, normal,
-Fresnel and tangent adapters also follow the corresponding v5.1.1 SVM sources.
-These adapters are adaptations; the files in this directory remain unchanged.
-The build also extracts the unmodified Chiang hair closure, Burley radial
-profiles, random-walk coefficient fit, dipole radius fit and volume phase functions. `native/closures_compat.h` supplies their
-small numerical context. Toon, AO, Bevel, Wireframe, Raycast and subsurface disk
-sampling adapt the referenced algorithms to vibrt's geometry and traversal;
-they do not import Blender's scene objects or traversal implementation.
+Only `intern/cycles` is needed. A local sparse checkout can reduce the working
+tree with `git -C vibrt-nodes/third_party/blender sparse-checkout set intern/cycles`.
+Blender itself does not need to be built. Installed addons embed the generated
+code/tables and do not read this checkout at runtime.
 
-Most code is Apache-2.0, copyright Blender Foundation/Blender Authors.
-`noise.h` and `bsdf_toon.h` are BSD-3-Clause,
-copyright Sony Pictures Imageworks (2009–2010)
-and Blender Foundation (2011–2022). Parts of `voronoi.h` are MIT,
-copyright Inigo Quilez (2013). Individual SPDX headers are authoritative.
-License texts and attribution are bundled in
-[`blender/vibrt_blender/licenses`](../../../blender/vibrt_blender/licenses).
+`vibrt-nodes/build.rs` extracts numerical helpers into an OUT_DIR header, removing
+Blender includes, namespace macros and SVM bytecode entry points. It reads:
 
-This is a shared CPU/CUDA node evaluator with selected numerical closures,
-not a linked Cycles renderer. It does not include Cycles scene management,
-OSL, point-cloud or volume-grid support.
+- `kernel/svm/`: enums, Math/Mix, procedural textures and radial tiling.
+- `util/hash.h`, `util/color.h`, `util/math_fast.h`: hashes, color conversion and
+  inverse error function.
+- `kernel/closure/`: Diffuse/Oren-Nayar, Sheen/Velvet, microfacet/Fresnel, Chiang
+  hair, Burley/dipole profiles and volume phase functions.
+- `kernel/sample/mapping.h`, `kernel/util/lookup_table.h`, `kernel/tables.h`
+  and `scene/shader.tables`: sampling, interpolation and original numerical tables.
+- `kernel/integrator/subsurface_random_walk.h`: random-walk coefficient fit.
+
+`native/cycles_compat.h` and `native/closures_compat.h` provide platform types
+and the small numerical context. `native/closure_tables.h` maps table addresses;
+thin-film CMF data is converted to scene-linear Rec.709 as in
+`ShaderManager::compute_thin_film_table`.
+`native/bsdf.h` adapts layer assembly from `kernel/svm/closure.h` to explicit
+parameters. Setup, evaluation, sampling, Fresnel and PDFs call upstream functions.
+`native/core.h` maps legacy wire-format IDs and edge conventions to the same
+Math/Mix/color helpers used by `native/shader.h`.
+
+Image, normal, tangent and scene-query adapters follow the corresponding SVM
+sources. Toon, AO, Bevel, Wireframe, Raycast and subsurface traversal use vibrt's
+geometry; Blender scene management and OSL are not linked.
+
+Most selected code is Apache-2.0, copyright Blender Foundation/Blender Authors.
+Noise and Toon include BSD-3-Clause code from Sony Pictures Imageworks and
+Blender Foundation. Parts of Voronoi are MIT, copyright Inigo Quilez.
+Individual SPDX headers are authoritative. License texts and attribution are
+bundled in [`blender/vibrt_blender/licenses`](../../../blender/vibrt_blender/licenses).
+The Blender repository also contains code outside these selected sources;
+those files are not compiled into vibrt by this integration.

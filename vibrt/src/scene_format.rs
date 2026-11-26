@@ -233,6 +233,27 @@ pub struct MeshDesc {
 
 #[derive(Deserialize)]
 pub struct PrincipledMaterial {
+    /// Cycles surface model and distribution; shared with native/bsdf.h.
+    #[serde(default)]
+    pub surface_model: u32,
+    #[serde(default = "default_distribution")]
+    pub distribution: u32,
+    #[serde(default = "default_sheen_tint")]
+    pub specular_tint: [f32; 3],
+    #[serde(default = "default_sheen_tint")]
+    pub coat_tint: [f32; 3],
+    #[serde(default)]
+    pub coat_normal: [f32; 3],
+    #[serde(default)]
+    pub thin_film_thickness: f32,
+    #[serde(default = "default_thin_film_ior")]
+    pub thin_film_ior: f32,
+    #[serde(default = "default_sheen_tint")]
+    pub conductor_ior: [f32; 3],
+    #[serde(default)]
+    pub conductor_k: [f32; 3],
+    #[serde(default)]
+    pub diffuse_roughness: f32,
     #[serde(default)]
     pub aov_graphs: Vec<AovGraph>,
     pub base_color: [f32; 3],
@@ -630,6 +651,7 @@ pub enum LightDesc {
         direction: [f32; 3],
         color: [f32; 3],
         strength: f32,
+        /// Angular radius (half Blender's Sun Angle / sky Sun Size), in radians.
         #[serde(default)]
         angle_rad: f32,
     },
@@ -782,4 +804,11 @@ pub enum WorldDesc {
 
 fn identity_rotation_3x3() -> [f32; 9] {
     [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+}
+
+fn default_distribution() -> u32 {
+    2
+}
+fn default_thin_film_ior() -> f32 {
+    1.33
 }

@@ -1,6 +1,9 @@
 #include "devicecode.h"
 #include <optix.h>
 #include "rect_light_sampling.h"
+#include "vibrt_nodes_core.h"
+#include "vibrt_shader.h"
+#include "vibrt_bsdf.h"
 
 #ifndef M_PIf
 #define M_PIf 3.14159265358979323846f

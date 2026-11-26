@@ -8,7 +8,7 @@ A GPU path-tracing renderer for Blender, powered by NVIDIA OptiX 9.
 |-------|-------------|
 | [`optix-sys`](optix-sys/) | Raw FFI bindings to OptiX 9.0.0 (bindgen) |
 | [`optix`](optix/) | Safe Rust wrapper with RAII, builders, and type-safe enums |
-| [`vibrt-nodes`](vibrt-nodes/) | Standalone shader and sky nodes with shared C++/CUDA evaluation |
+| [`vibrt-nodes`](vibrt-nodes/) | Shared C++/CUDA shader nodes, sky models and Cycles surface closures |
 | [`vibrt`](vibrt/) | OptiX renderer and `vibrt_native` Python extension |
 
 The [`blender/vibrt_blender/`](blender/vibrt_blender/) addon registers `vibrt` as a render engine. It passes a live scene dictionary and NumPy buffers to the native extension in the same Blender process, then updates Blender's Render Result.
@@ -20,7 +20,7 @@ See [module boundaries and resource lifetimes](docs/architecture.md) for the ren
 - Path tracing with direct-light sampling for point / sun / spot / area-rect lights, emissive meshes and HDRI environments; MIS for competing sampling paths
 - Transparent shadow rays through transmissive / alpha-cutout surfaces
 - GPU shader graphs for linked material inputs, image/procedural textures, color/vector math, and Mix/Add closures; see the [node support matrix](docs/shader-nodes.md) for supported modes and approximations
-- GGX multi-scattering energy compensation (Kulla-Conty)
+- Cycles surface closures: rough Diffuse, Sheen/Velvet, GGX/Beckmann reflection and refraction, conductor Fresnel, thin film, and layered Principled materials
 - Direct/indirect contribution clamping using the sum of absolute RGB components
 - Triangle mesh geometry with multi-material slots (per-triangle material index); multi-object scenes via single-level OptiX instancing
 - Right-handed Z-up (no axis conversion from Blender)
@@ -43,12 +43,17 @@ See [module boundaries and resource lifetimes](docs/architecture.md) for the ren
 ## Building
 
 ```bash
+git submodule update --init --depth 1  # pinned Blender sources used by vibrt-nodes
 make dev-install          # build, stage, and link the addon into Blender
 make native-build         # rebuild and stage the extension after native edits
 make addon-with-native    # package blender/vibrt_blender.zip for installation
 ```
 
 To build just the native library, run `cargo build --release -p vibrt --features python`. The addon needs the resulting extension staged beside its Python sources. `make addon` packages Python sources only. See [addon installation and usage](blender/README.md).
+
+The Blender submodule is pinned to v5.1.1. Only selected Cycles numerical helpers
+are compiled; building Blender is unnecessary. Installed addons contain the
+required code and tables and do not need the submodule at runtime.
 
 ## Usage
 

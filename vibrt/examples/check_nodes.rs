@@ -10,7 +10,13 @@ fn main() -> Result<()> {
     let source = format!(
         "{}\n{}\n{}",
         vibrt_nodes::DEVICE_TYPES,
-        vibrt_nodes::DEVICE_CORE,
+        vibrt_nodes::DEVICE_CORE.replace(
+            "#include \"cycles_nodes.h\"",
+            &vibrt_nodes::DEVICE_CYCLES.replace(
+                "#include \"cycles_compat.h\"",
+                vibrt_nodes::DEVICE_CYCLES_COMPAT
+            )
+        ),
         r#"
 extern "C" __global__ void check_nodes(const ColorGraphNode *nodes, int n,
     const float *inputs, float *out, int count) {

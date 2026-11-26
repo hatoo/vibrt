@@ -21,6 +21,16 @@ struct Volume {
 
 struct AovShader;
 struct PrincipledGpu {
+  unsigned int surface_model;
+  unsigned int distribution;
+  float specular_tint[3];
+  float coat_tint[3];
+  float coat_normal[3];
+  float thin_film_thickness;
+  float thin_film_ior;
+  float conductor_ior[3];
+  float conductor_k[3];
+  float diffuse_roughness;
   AovShader *aov_shaders;
   unsigned int num_aov_shaders;
   float base_color[3];
@@ -405,9 +415,6 @@ struct LaunchParams {
   // so the CDF / NEE sampler stays unchanged.
   int envmap_split_by_camera_ray;
 
-  float *ggx_e_lut;
-  float *ggx_e_avg_lut;
-  float *ggx_b_lut;
 
   // Clamp indirect (bounce>=1) contributions by |R|+|G|+|B|. <=0 disables.
   float clamp_indirect;

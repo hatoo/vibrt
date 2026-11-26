@@ -3150,34 +3150,13 @@ def _from_principled(node, writer, textures, *, context=None) -> dict:
 
 
 def _from_sheen(node, writer, textures, *, context=None) -> dict:
-    """ShaderNodeBsdfSheen / Velvet → vibrt's sheen lobe.
-
-    Cycles' Sheen BSDF (LTC-based "Practical Multiple-Scattering Sheen")
-    is a fabric / fuzz / brushed-cloth lobe with no diffuse component
-    and a characteristic bright glow at glancing angles. The previous
-    fallback to `_from_diffuse` collapsed it to pure Lambert, which
-    misses the grazing brightness entirely — a Sheen-only surface
-    showed as a flat dark Lambertian gray instead of the soft fabric
-    sheen the artist intended.
-
-    vibrt's sheen lobe (`devicecode.cu` line ~1567) is the obvious
-    target — it's an ad-hoc Disney/Charlie-ish form, not LTC, but it
-    captures the qualitative behaviour: bright at grazing, dim at
-    normal incidence. Map the BSDF's Color → both `sheen_tint` and
-    `pure_diffuse` so the surface returns *only* the sheen
-    contribution (Cycles' SheenBsdf has no diffuse). Roughness maps
-    directly to `sheen_roughness` (vibrt clamps the inv-roughness
-    falloff exponent internally).
-    """
+    """Legacy socket export for Cycles Microfiber or Ashikhmin Velvet."""
     if context is None:
         context = ExportContext()
     p = _default_params()
+    p["surface_model"] = 8 if getattr(node, "distribution", "") == "ASHIKHMIN" or node.bl_idname == "ShaderNodeBsdfVelvet" else 5
     p["metallic"] = 0.0
     p["roughness"] = 1.0
-    # Suppress the diffuse / spec / coat lobes — Cycles' Sheen has
-    # none of these, only the LTC sheen kernel. With pure_diffuse=True
-    # the device drops the spec+coat eval; setting base_color=0 zeros
-    # the diffuse Lambert that would otherwise survive the gate.
     p["pure_diffuse"] = True
     p["base_color"] = [0.0, 0.0, 0.0]
     color_sock = node.inputs.get("Color")
@@ -3192,12 +3171,8 @@ def _from_sheen(node, writer, textures, *, context=None) -> dict:
     p["sheen_weight"] = 1.0
     rough_sock = node.inputs.get("Roughness")
     if rough_sock is not None and not rough_sock.is_linked:
-        # Cycles' SheenBsdf clamps roughness to [1e-3, 1.0]; vibrt's
-        # ad-hoc lobe uses 1/sheen_roughness as the falloff exponent
-        # so very small values produce a razor-thin grazing edge —
-        # match Cycles' clamp range.
         r = float(rough_sock.default_value)
-        p["sheen_roughness"] = max(min(r, 1.0), 1e-3)
+        p["sheen_roughness"] = max(min(r, 1.0), 0.0)
     _apply_normal_perturbation(p, node.inputs.get("Normal"), writer, textures, context=context)
     return p
 
