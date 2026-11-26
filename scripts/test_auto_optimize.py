@@ -380,6 +380,22 @@ class AutoOptimizeTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertEqual(auto_optimize.git(self.remote, "rev-parse", "master^").decode().strip(), concurrent)
 
+    def test_sync_checkpoints_unfinished_experiment_when_master_changes_same_file(self):
+        workspace = auto_optimize_git.open_workspace(self.repo, self.output)
+        scene = workspace / "scene.txt"
+        scene.write_bytes(b"staged experiment\n")
+        auto_optimize.git(workspace, "add", "scene.txt")
+        scene.write_bytes(b"unfinished experiment\n")
+        self.git("commit", "-m", "advance upstream")
+        self.git("push", "origin", "master")
+        auto_optimize_git.sync_workspace(workspace)
+        self.assertEqual(auto_optimize_git.revision(workspace), self.remote_head())
+        self.assertFalse(auto_optimize.git(workspace, "status", "--porcelain").strip())
+        ref = self.git("for-each-ref", "--format=%(refname)", "refs/optimizer-recovery").decode().strip()
+        self.assertEqual(self.git("show", ref + ":scene.txt"), b"unfinished experiment\n")
+        self.assertEqual(self.git("show", ref + "^2:scene.txt"), b"staged experiment\n")
+        self.assertIn(ref, (workspace / "target/auto-optimize/MEMORY.md").read_text(encoding="utf-8"))
+
     def test_second_runner_cannot_enter_or_clear_stop_and_restart_releases_lock(self):
         self.set_mode("hold")
         options = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {"start_new_session": True}
