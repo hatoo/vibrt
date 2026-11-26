@@ -588,8 +588,10 @@ static __device__ __noinline__ float3 trace_path(float3 origin, float3 dir,
 #endif
     // NEE
     float3 wo = -dir;
-    float3 nee = throughput * direct_light(e_group, v.P, wo, rng, vstack,
-                                             bounce + 1 < params.max_depth);
+    float3 nee;
+    BsdfSample bs = sample_surface_lighting(e_group, v.P, wo, rng, vstack,
+                                            bounce + 1 < params.max_depth, nee);
+    nee = throughput * nee;
     // bounce==0 → camera-ray NEE, clamp via Cycles' sample_clamp_direct.
     // bounce>0 → indirect-bounce NEE, clamp via sample_clamp_indirect.
     // Cycles applies clamping at exactly the same path-vertex layering.
@@ -599,8 +601,7 @@ static __device__ __noinline__ float3 trace_path(float3 origin, float3 dir,
       nee = clamp_indirect(nee, params.clamp_indirect);
     L = L + nee;
 
-    // Sample BSDF for next bounce
-    BsdfSample bs = sample_bsdf(e_group, wo, rng);
+    // Use the BSDF sample for the next bounce.
     if (bs.pdf <= 0.0f)
       break;
     float3 contrib = bs.f / bs.pdf;

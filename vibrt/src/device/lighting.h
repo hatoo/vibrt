@@ -265,7 +265,8 @@ static __device__ float rect_direction_pdf(const AreaRectLight &ar, float3 P,
 // short-circuits to the legacy binary `shadow_visible` path.
 static __device__ __noinline__ float3 direct_light(const MaterialEvalGroup &e, float3 P,
                                       float3 wo, RNG &rng,
-                                      const VolumeStack &vstack, bool rect_mis) {
+                                      const VolumeStack &vstack, bool rect_mis,
+                                      SurfaceClosureCache &cache) {
   float3 L = make_float3(0, 0, 0);
 
   // Point lights: sample the finite sphere/disk, or its delta limit.
@@ -280,7 +281,7 @@ static __device__ __noinline__ float3 direct_light(const MaterialEvalGroup &e, f
     float3 vis = shadow_transmittance(P, wi, d, vstack);
     if (luminance(vis) <= 0.0f)
       continue;
-    BsdfEval b = eval_bsdf(e, wo, wi);
+    BsdfEval b = eval_bsdf(e, wo, wi, cache);
     // IES: directional intensity multiplier in [0, 1] sampled in the
     // light's local frame. `wi` points from surface to light, so the
     // direction "from light toward surface" is `-wi`. ies_lookup
@@ -315,7 +316,7 @@ static __device__ __noinline__ float3 direct_light(const MaterialEvalGroup &e, f
     float3 vis = shadow_transmittance(P, wi, 1e20f, vstack);
     if (luminance(vis) <= 0.0f)
       continue;
-    BsdfEval b = eval_bsdf(e, wo, wi);
+    BsdfEval b = eval_bsdf(e, wo, wi, cache);
     float sun_omega = 2.0f * M_PIf * fmaxf(1.0f - cos_a, 1e-30f);
     float pdf_sun = 1.0f / sun_omega;
     // 3-strategy MIS: balance sun NEE against the (residual) envmap NEE
@@ -352,7 +353,7 @@ static __device__ __noinline__ float3 direct_light(const MaterialEvalGroup &e, f
     float3 vis = shadow_transmittance(P, wi, d, vstack);
     if (luminance(vis) <= 0.0f)
       continue;
-    BsdfEval b = eval_bsdf(e, wo, wi);
+    BsdfEval b = eval_bsdf(e, wo, wi, cache);
     float ies = ies_lookup(sp.ies_data, sp.ies_n_v, sp.ies_n_h,
                            sp.light_rotation, -wi);
     L = L + b.f * vis * point_light_emission(sp.shader, make_f3(sp.emission), Pl, -wi, d) * falloff * ies * light_weight;
@@ -381,7 +382,7 @@ static __device__ __noinline__ float3 direct_light(const MaterialEvalGroup &e, f
         if (cos_light > 0.0f) {
           float3 vis = shadow_transmittance(P, wi, d, vstack);
           if (luminance(vis) > 0.0f) {
-            BsdfEval b = eval_bsdf(e, wo, wi);
+            BsdfEval b = eval_bsdf(e, wo, wi, cache);
             float pdf = pdf_solid * pmf_light;
             if (pdf > 0.0f) {
               // Area rects emit along local +Z, but `ies_lookup` measures
@@ -462,7 +463,7 @@ static __device__ __noinline__ float3 direct_light(const MaterialEvalGroup &e, f
             if (cos_light > 0.0f) {
               float3 vis = shadow_transmittance(P, wi, d, vstack);
               if (luminance(vis) > 0.0f) {
-                BsdfEval b = eval_bsdf(e, wo, wi);
+                BsdfEval b = eval_bsdf(e, wo, wi, cache);
                 float area = tri.area;
                 float pdf_area = 1.0f / fmaxf(area, 1e-12f);
                 float pdf_solid = pdf_area * d2 / cos_light;
@@ -507,7 +508,7 @@ static __device__ __noinline__ float3 direct_light(const MaterialEvalGroup &e, f
     if (es.pdf > 0.0f) {
       float3 vis = shadow_transmittance(P, es.dir, 1e20f, vstack);
       if (luminance(vis) > 0.0f) {
-        BsdfEval b = eval_bsdf(e, wo, es.dir);
+        BsdfEval b = eval_bsdf(e, wo, es.dir, cache);
         if (b.pdf > 0.0f) {
           // 3-strategy MIS: balance envmap NEE against the sun cones'
           // delta NEE and the BSDF sample. Without the sun NEE term in
@@ -549,7 +550,7 @@ static __device__ __noinline__ float3 direct_light(const MaterialEvalGroup &e, f
         float pdf_cos = NoL * INV_PIf;
         float3 vis = shadow_transmittance(P, wi, 1e20f, vstack);
         if (luminance(vis) > 0.0f) {
-          BsdfEval b = eval_bsdf(e, wo, wi);
+          BsdfEval b = eval_bsdf(e, wo, wi, cache);
           if (b.pdf > 0.0f) {
             float w = power_heuristic(pdf_cos, b.pdf);
             L = L + b.f * vis * Le * (w / pdf_cos);
@@ -560,6 +561,19 @@ static __device__ __noinline__ float3 direct_light(const MaterialEvalGroup &e, f
   }
 
   return L;
+}
+
+// Give the cache one stable call frame, outside trace_path's live state. SSS
+// has already finished before this call; no leaf or outgoing direction changes
+// until both operations complete. Multiple leaves reuse just the last prepared
+// leaf, keeping storage independent of the scene's maximum mixture size.
+static __device__ __noinline__ BsdfSample sample_surface_lighting(
+    const MaterialEvalGroup &e, float3 P, float3 wo, RNG &rng,
+    const VolumeStack &vstack, bool rect_mis, float3 &nee) {
+  SurfaceClosureCache cache;
+  cache.material = nullptr;
+  nee = direct_light(e, P, wo, rng, vstack, rect_mis, cache);
+  return sample_bsdf(e, wo, rng, cache);
 }
 
 // In-scatter NEE for volume scatter events. Same lights as `direct_light`

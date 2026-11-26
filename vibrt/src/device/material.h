@@ -210,6 +210,23 @@ static __device__ vibrt_surface::Parameters surface_parameters(const MaterialEva
   return p;
 }
 
+// Shared only by direct lighting and direction sampling at one surface hit.
+// The leaves and outgoing direction stay fixed for that pair of operations.
+// Keep the storage in place: Closures contains pointers into its own members.
+struct SurfaceClosureCache {
+  vibrt_surface::Closures closures;
+  const MaterialEval *material;
+};
+
+static __forceinline__ __device__ const vibrt_surface::Closures &surface_closures(
+    const MaterialEval &e, float3 wo, SurfaceClosureCache &cache) {
+  if (cache.material != &e) {
+    vibrt_surface::setup(surface_parameters(e, wo), cache.closures);
+    cache.material = &e;
+  }
+  return cache.closures;
+}
+
 // Group of leaf MaterialEvals + their per-leaf weights. The weights sum
 // to 1 across the group (modulo per-pixel mix_fac quantisation). Built
 // by `eval_material` from the binary Mix tree at the hit. The host validates
@@ -736,7 +753,7 @@ static __forceinline__ __device__ float bump_shadowing_term(float3 Ng,
 // outer `eval_bsdf` wrapper below combines this with the secondary
 // closure (when present).
 static __device__ __noinline__ BsdfEval eval_bsdf_one(const MaterialEval &e, float3 wo,
-                                         float3 wi) {
+                                         float3 wi, SurfaceClosureCache &cache) {
   BsdfEval r;
   r.f = make_float3(0, 0, 0);
   r.pdf = 0.0f;
@@ -783,8 +800,7 @@ static __device__ __noinline__ BsdfEval eval_bsdf_one(const MaterialEval &e, flo
   if (e.mat->hair_weight > 0.5f)
     return eval_hair(e, wo, wi);
 
-  vibrt_surface::Closures closures;
-  vibrt_surface::setup(surface_parameters(e, wo), closures);
+  const auto &closures = surface_closures(e, wo, cache);
   auto value = vibrt_surface::evaluate(closures, vibrt_cycles::make_float3(wi.x, wi.y, wi.z), &r.pdf);
   r.f = make_float3(value.x, value.y, value.z);
   if (dot3(e.Ns, wi) > 0) r.f = r.f * bump_shadowing_term(e.Ng, e.Ns, wi);
@@ -828,7 +844,7 @@ struct BsdfDirectionSample {
 // Keep direction sampling separate from evaluation so the large sampler's
 // call frame is no longer live while eval_bsdf_one runs.
 static __device__ __noinline__ BsdfDirectionSample sample_bsdf_direction(const MaterialEval &e, float3 wo,
-                                              RNG &rng) {
+                                              RNG &rng, SurfaceClosureCache &cache) {
   BsdfDirectionSample s;
   s.wi = make_float3(0, 0, 1);
   s.valid = false;
@@ -929,8 +945,7 @@ static __device__ __noinline__ BsdfDirectionSample sample_bsdf_direction(const M
 
   // Coat weight mirrors eval_bsdf: scale by F_coat(V) so sampling budget
   // follows the actual coat intensity at this view angle (grazing >> normal).
-  vibrt_surface::Closures closures;
-  vibrt_surface::setup(surface_parameters(e, wo), closures);
+  const auto &closures = surface_closures(e, wo, cache);
   vibrt_cycles::float3 direction, value;
   float pdf;
   int label = vibrt_surface::sample(closures, rng.next(),
@@ -954,13 +969,14 @@ static __device__ __noinline__ BsdfDirectionSample sample_bsdf_direction(const M
 // `g.n == 1` this is just `eval_bsdf_one(g.slots[0], wo, wi)`.
 static __device__ BsdfEval eval_bsdf(const MaterialEvalGroup &g,
                                      float3 wo, float3 wi,
+                                     SurfaceClosureCache &cache,
                                      int sampled_index = -1) {
   BsdfEval r;
   r.f = make_float3(0.0f, 0.0f, 0.0f);
   r.pdf = 0.0f;
   float total_weight=0.0f;
   for (int i = 0; i < g.n; ++i) {
-    BsdfEval ev = eval_bsdf_one(g.slots[i], wo, wi);
+    BsdfEval ev = eval_bsdf_one(g.slots[i], wo, wi, cache);
     // Preserve rejection of a direction with zero density in the sampled
     // leaf, even when other leaves would give that direction a nonzero PDF.
     if (i == sampled_index && ev.pdf <= 0.0f) {
@@ -984,7 +1000,7 @@ static __device__ BsdfEval eval_bsdf(const MaterialEvalGroup &g,
 // which closure produced wi for the per-lobe bounce-cap accounting in
 // trace_path.
 static __device__ BsdfSample sample_bsdf(const MaterialEvalGroup &g,
-                                         float3 wo, RNG &rng) {
+                                         float3 wo, RNG &rng, SurfaceClosureCache &cache) {
   int picked = 0;
   float total_weight = 1.0f;
   if (g.n > 1) {
@@ -1000,7 +1016,7 @@ static __device__ BsdfSample sample_bsdf(const MaterialEvalGroup &g,
       }
     }
   }
-  BsdfDirectionSample direction = sample_bsdf_direction(g.slots[picked], wo, rng);
+  BsdfDirectionSample direction = sample_bsdf_direction(g.slots[picked], wo, rng, cache);
   BsdfSample s;
 #if (VIBRT_CLOSURE_TYPES & (1u << 4))
   s.portal = g.slots[picked].mat->closure_type == 4;
@@ -1033,7 +1049,7 @@ static __device__ BsdfSample sample_bsdf(const MaterialEvalGroup &g,
         value.f = direction.sampled_value;
         value.pdf = direction.sampled_pdf;
       } else
-        value = eval_bsdf_one(g.slots[i], wo, s.wi);
+        value = eval_bsdf_one(g.slots[i], wo, s.wi, cache);
       float w = g.n == 1 ? 1 : g.weights[i];
       s.f = s.f + value.f * w;
       s.pdf += value.pdf * w;
@@ -1056,8 +1072,8 @@ static __device__ BsdfSample sample_bsdf(const MaterialEvalGroup &g,
   // Evaluate every leaf once, in the original accumulation order. Deferring
   // evaluation avoids both a redundant call and per-lane skips of sampled
   // leaves, which would still run the evaluator for other lanes in the warp.
-  BsdfEval comb = g.n == 1 ? eval_bsdf_one(g.slots[0], wo, s.wi)
-                          : eval_bsdf(g, wo, s.wi, picked);
+  BsdfEval comb = g.n == 1 ? eval_bsdf_one(g.slots[0], wo, s.wi, cache)
+                          : eval_bsdf(g, wo, s.wi, cache, picked);
   s.f = comb.f;
   s.pdf = comb.pdf;
   return s;
