@@ -13,6 +13,8 @@ A GPU path-tracing renderer for Blender, powered by NVIDIA OptiX 9.
 
 The [`blender/vibrt_blender/`](blender/vibrt_blender/) addon registers `vibrt` as a render engine. It passes a live scene dictionary and NumPy buffers to the native extension in the same Blender process, then updates Blender's Render Result.
 
+See [module boundaries and resource lifetimes](docs/architecture.md) for the renderer's session/scene/job API and the export context shared by sky and material preparation.
+
 ## Features
 
 - Path tracing with direct-light sampling for point / sun / spot / area-rect lights, emissive meshes and HDRI environments; MIS for competing sampling paths

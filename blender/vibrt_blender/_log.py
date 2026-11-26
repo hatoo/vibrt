@@ -19,15 +19,16 @@ Use:
 from __future__ import annotations
 
 from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Callable, Optional
 
-_CALLBACK: Optional[Callable[[str], None]] = None
+_CALLBACK: ContextVar[Optional[Callable[[str], None]]] = ContextVar("vibrt_log", default=None)
 
 
 def log(msg: str) -> None:
     """Emit a single log line. Goes through whatever callback the
     enclosing `redirect()` context set, or `print` when none is active."""
-    cb = _CALLBACK
+    cb = _CALLBACK.get()
     if cb is None:
         print(msg)
     else:
@@ -38,10 +39,8 @@ def log(msg: str) -> None:
 def redirect(cb: Callable[[str], None]):
     """Route `log` calls through `cb` for the duration of the block.
     Nesting is supported: the previous callback is restored on exit."""
-    global _CALLBACK
-    prev = _CALLBACK
-    _CALLBACK = cb
+    token = _CALLBACK.set(cb)
     try:
         yield
     finally:
-        _CALLBACK = prev
+        _CALLBACK.reset(token)

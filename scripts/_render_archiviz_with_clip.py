@@ -4,11 +4,13 @@ remaining left-corner black is caused by a piece of geometry that sits between
 import bpy, sys, os, json
 sys.path.insert(0, os.path.abspath("blender"))
 import vibrt_blender.exporter as exporter
+from vibrt_blender.export_context import ExportContext
+export_context = ExportContext()
 from vibrt_blender import runner
 
 # Pre-bake the world (engine.update() does this normally).
-exporter.clear_sky_bake_cache()
-exporter.prebake_sky_envmaps_for_world(bpy.context.scene.world)
+exporter.clear_sky_bake_cache(context=export_context)
+exporter.prebake_sky_envmaps_for_world(bpy.context.scene.world, context=export_context)
 
 # Force a different clip_start.
 override_clip = float(os.environ.get("CLIPOVR", "5.0"))
@@ -23,7 +25,7 @@ def patched_export_camera(scene, cam_obj, aspect):
 exporter._export_camera = patched_export_camera
 
 depsgraph = bpy.context.evaluated_depsgraph_get()
-scene_json_str, scene_bin, tex_arrays = exporter.export_scene_to_memory(depsgraph)
+scene_json_str, scene_bin, tex_arrays = exporter.export_scene_to_memory(depsgraph, context=export_context)
 
 def _report(level, msg):
     print(f"[{level}] {msg}")

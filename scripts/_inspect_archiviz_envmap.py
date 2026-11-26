@@ -5,13 +5,15 @@ import bpy, json, sys, os, numpy as np
 
 sys.path.insert(0, os.path.abspath("blender"))
 import vibrt_blender.exporter as exporter
+from vibrt_blender.export_context import ExportContext
+export_context = ExportContext()
 
 # Mirror engine.update(): pre-bake the world.
-exporter.clear_sky_bake_cache()
-exporter.prebake_sky_envmaps_for_world(bpy.context.scene.world)
+exporter.clear_sky_bake_cache(context=export_context)
+exporter.prebake_sky_envmaps_for_world(bpy.context.scene.world, context=export_context)
 
 depsgraph = bpy.context.evaluated_depsgraph_get()
-scene_json_str, _, tex_arrays = exporter.export_scene_to_memory(depsgraph)
+scene_json_str, _, tex_arrays = exporter.export_scene_to_memory(depsgraph, context=export_context)
 scene = json.loads(scene_json_str)
 
 # Find the envmap texture id from scene.world.

@@ -5,6 +5,8 @@ sys.path.insert(0, os.path.abspath("blender"))
 
 import bpy
 import vibrt_blender.material_export as me
+from vibrt_blender.export_context import ExportContext
+export_context = ExportContext()
 
 mat = bpy.data.materials.get("white_lotus_leafs")
 print(f"=== material: {mat.name} ===")
@@ -20,9 +22,9 @@ class FakeWriter:
 
 textures = []
 writer = FakeWriter()
-me.begin_export()
-params = me.export_material(mat, writer, textures)
-me.end_export()
+me.begin_export(context=export_context)
+params = me.export_material(mat, writer, textures, context=export_context)
+me.end_export(context=export_context)
 # Trim color_graph for printing
 import pprint
 def trim(d):

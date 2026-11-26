@@ -21,16 +21,14 @@ def load_lin(path):
 import sys, math
 sys.path.insert(0, os.path.join(HERE, "blender"))
 import vibrt_blender  # noqa
+from vibrt_blender.export_context import ExportContext
+export_context = ExportContext()
 try: bpy.ops.preferences.addon_enable(module="vibrt_blender")
 except Exception: pass
-from vibrt_blender.exporter import (
-    prebake_sky_envmaps_for_world, _SKY_BAKE_CACHE,
-    _sky_node_alone_cache_key, _detect_mix_world,
-    _euler_xyz_to_matrix3,
-)
+from vibrt_blender.exporter import prebake_sky_envmaps_for_world, _sky_node_alone_cache_key, _detect_mix_world, _euler_xyz_to_matrix3
 
 scene = bpy.context.scene
-prebake_sky_envmaps_for_world(scene.world, w=1024, h=512)
+prebake_sky_envmaps_for_world(scene.world, w=1024, h=512, context=export_context)
 
 mix = _detect_mix_world(scene.world)
 bg_a, bg_b, fac = mix
@@ -39,7 +37,7 @@ def get_layer(bg):
     src = bg.inputs["Color"].links[0].from_node
     strength = float(bg.inputs["Strength"].default_value)
     if src.bl_idname == "ShaderNodeTexSky":
-        rgb_b, w, h, _ = _SKY_BAKE_CACHE[_sky_node_alone_cache_key(scene.world, src)]
+        rgb_b, w, h, _ = export_context.sky_maps[_sky_node_alone_cache_key(scene.world, src)]
         rgb = (rgb_b if isinstance(rgb_b, np.ndarray)
                else np.frombuffer(rgb_b, dtype=np.float32)).reshape((h, w, 3))
         return ("equirect", rgb, w, h, np.eye(3), strength, "repeat")

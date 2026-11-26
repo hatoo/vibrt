@@ -52,6 +52,18 @@ scene.vibrt_denoise = False
 bpy.context.preferences.use_preferences_save = False
 bpy.context.preferences.view.render_display_type = "NONE"
 state = {"count": 0, "finished": False, "cancelled": False, "started": 0.0}
+original_export_world = exporter._export_world
+
+
+def observe_world(*args, context=None, **kwargs):
+    result = original_export_world(*args, context=context, **kwargs)
+    state["sky_prepared"] = bool(context and context.sky_maps)
+    return result
+
+
+if args.expect_sky:
+    exporter._export_world = observe_world
+
 previews = []
 original_display_update = RenderResultDisplay.update
 
@@ -97,6 +109,7 @@ def cancelled(*_args):
 
 def begin_render():
     previews.clear()
+    state["sky_prepared"] = False
     state["finished"] = False
     state["started"] = time.monotonic()
     scene.render.filepath = str((args.output / f"render-{state['count'] + 1}.png").resolve())
@@ -122,7 +135,7 @@ def watch():
         bpy.data.images.remove(image)
         assert scene_ids() == original_ids, "Render changed the user's scene datablocks"
         if args.expect_sky:
-            assert exporter._SKY_BAKE_CACHE, "Sky bake was skipped"
+            assert state["sky_prepared"], "Sky bake was skipped"
         if args.expect_progress:
             assert len(previews) >= (2 if args.spp > 1 else 1), "No progressive frames"
             if args.spp > 1:

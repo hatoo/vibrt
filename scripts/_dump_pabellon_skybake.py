@@ -12,6 +12,8 @@ import numpy as np
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(HERE, "blender"))
 import vibrt_blender.exporter as exporter
+from vibrt_blender.export_context import ExportContext
+export_context = ExportContext()
 
 scene = bpy.context.scene
 world = scene.world
@@ -21,13 +23,13 @@ print(f"  has sky node? {exporter._world_sky_node(world) is not None}")
 
 # Try multiple resolutions and report bake time + visible roughness proxies.
 for (w, h) in [(1024, 512), (2048, 1024), (4096, 2048)]:
-    exporter._SKY_BAKE_CACHE.clear()
+    export_context.sky_maps.clear()
     import time
     t0 = time.perf_counter()
-    exporter.prebake_sky_envmaps_for_world(world, w=w, h=h)
+    exporter.prebake_sky_envmaps_for_world(world, w=w, h=h, context=export_context)
     dt = time.perf_counter() - t0
     key = exporter._world_generic_cache_key(world) if exporter._world_needs_full_bake(world) else exporter._sky_node_cache_key(world, exporter._world_sky_node(world))
-    cached = exporter._SKY_BAKE_CACHE.get(key)
+    cached = export_context.sky_maps.get(key)
     if cached is None:
         print(f"  {w}x{h}: bake failed")
         continue

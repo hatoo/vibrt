@@ -7,13 +7,15 @@ sys.path.insert(0, os.path.join(HERE, "blender"))
 
 import bpy
 import vibrt_blender.exporter as exporter
+from vibrt_blender.export_context import ExportContext
+export_context = ExportContext()
 import vibrt_blender.runner as runner
 
 scene = bpy.context.scene
-exporter.clear_sky_bake_cache()
-exporter.prebake_sky_envmaps_for_world(scene.world)
+exporter.clear_sky_bake_cache(context=export_context)
+exporter.prebake_sky_envmaps_for_world(scene.world, context=export_context)
 depsgraph = bpy.context.evaluated_depsgraph_get()
-json_str, mesh_blobs, texture_arrays = exporter.export_scene_to_memory(depsgraph)
+json_str, mesh_blobs, texture_arrays = exporter.export_scene_to_memory(depsgraph, context=export_context)
 
 def report(*a, **kw):
     pass

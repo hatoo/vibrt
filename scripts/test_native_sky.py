@@ -16,6 +16,8 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "blender"))
 from vibrt_blender import exporter, native_sky, sky_bake, vibrt_native
+from vibrt_blender.export_context import ExportContext
+export_context = ExportContext()
 from vibrt_blender.bin_writer import BinWriter
 
 os.environ.pop("VIBRT_CYCLES_SKY", None)
@@ -48,13 +50,13 @@ def ids():
 
 
 def native_prepare(w, h):
-    exporter.clear_sky_bake_cache()
+    exporter.clear_sky_bake_cache(context=export_context)
     before = ids()
     with patch.object(sky_bake, "_start_worker", side_effect=AssertionError("unexpected Cycles worker")):
-        sky_bake.prepare_scene(scene, width=w, height=h)
+        sky_bake.prepare_scene(scene, width=w, height=h, context=export_context)
     assert ids() == before, "Native sky changed Blender datablocks"
     assert not bpy.data.filepath, "Native sky saved the scene"
-    return dict(exporter._SKY_BAKE_CACHE)
+    return dict(export_context.sky_maps)
 
 
 def compare(actual, reference, label, tolerance=0.005):
@@ -126,7 +128,7 @@ background.inputs["Strength"].default_value = 2.0
 expected, _, _ = exporter._bake_sky_world_to_pixels(world, w=256, h=128)
 cache = native_prepare(256, 128)
 compare(cache[exporter._world_generic_cache_key(world)][0], expected, "HDR curves + HSV + strength")
-description = exporter._export_world(world, BinWriter(), [], [])
+description = exporter._export_world(world, BinWriter(), [], [], context=export_context)
 assert description["type"] == "envmap" and description["strength"] == 1.0
 
 # Repeat after an unsaved edit: no stale result or disk cache is permitted.
@@ -141,7 +143,7 @@ tree.links.new(sky.outputs["Color"], background.inputs["Color"])
 background.inputs["Strength"].default_value = 3.0
 expected, _, _ = exporter._bake_sky_world_to_pixels(world, w=256, h=128)
 actual = native_prepare(256, 128)[exporter._sky_node_cache_key(world, sky)][0]
-description = exporter._export_world(world, BinWriter(), [], [])
+description = exporter._export_world(world, BinWriter(), [], [], context=export_context)
 compare(actual * description["strength"], expected, "direct sky strength applied once")
 
 # A color-processed layer mixed with a constant background uses full evaluation.
@@ -170,7 +172,7 @@ compare(cache[exporter._world_branch_cache_key(world, background, "lighting")][0
         "camera-ray split lighting")
 compare(cache[exporter._world_branch_cache_key(world, other, "camera")][0], camera,
         "camera-ray split background")
-assert exporter._export_world(world, BinWriter(), [], [])["split_by_camera_ray"]
+assert exporter._export_world(world, BinWriter(), [], [], context=export_context)["split_by_camera_ray"]
 
 # Color mixes and Gamma use the same path as curved/HSV sky graphs.
 tree.links.new(background.outputs[0], output.inputs["Surface"])
@@ -189,9 +191,9 @@ for value in (1.7, 0.0):
     actual = native_prepare(128, 64)[exporter._world_generic_cache_key(world)][0]
     compare(actual, expected, f"color mix + gamma={value}")
 color_mix.blend_type = "DODGE"
-exporter.clear_sky_bake_cache()
-assert not native_sky.prepare_scene(scene, cancel=lambda: False, log=print, width=64, height=32)
-assert not exporter._SKY_BAKE_CACHE, "Unsupported blend left a partial sky cache"
+exporter.clear_sky_bake_cache(context=export_context)
+assert not native_sky.prepare_scene(scene, cancel=lambda: False, log=print, width=64, height=32, context=export_context)
+assert not export_context.sky_maps, "Unsupported blend left a partial sky cache"
 
 # Unsupported vector graphs must actually fall back, with no partial cache.
 tree.links.new(background.outputs[0], output.inputs["Surface"])
@@ -199,13 +201,13 @@ tree.links.new(sky.outputs["Color"], background.inputs["Color"])
 background.inputs["Strength"].default_value = 1.0
 mapping = tree.nodes.new("ShaderNodeMapping")
 tree.links.new(mapping.outputs[0], sky.inputs["Vector"])
-exporter.clear_sky_bake_cache()
-assert not native_sky.prepare_scene(scene, cancel=lambda: False, log=print, width=64, height=32)
-assert not exporter._SKY_BAKE_CACHE
+exporter.clear_sky_bake_cache(context=export_context)
+assert not native_sky.prepare_scene(scene, cancel=lambda: False, log=print, width=64, height=32, context=export_context)
+assert not export_context.sky_maps
 with patch.object(sky_bake.subprocess, "Popen", wraps=sky_bake.subprocess.Popen) as spawned:
-    sky_bake.prepare_scene(scene, width=64, height=32)
+    sky_bake.prepare_scene(scene, width=64, height=32, context=export_context)
     assert spawned.call_count == 1
-assert exporter._SKY_BAKE_CACHE
+assert export_context.sky_maps
 
 # Reject malformed FFI inputs before entering the C++ models.
 for settings, w, h in [({"model": "unknown"}, 8, 4), ({"turbidity": 0.0}, 8, 4),

@@ -12,6 +12,8 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "blender"))
 from vibrt_blender import exporter, sky_bake
+from vibrt_blender.export_context import ExportContext
+export_context = ExportContext()
 
 # This suite exercises worker isolation; native model accuracy is tested separately.
 os.environ["VIBRT_CYCLES_SKY"] = "1"
@@ -37,22 +39,22 @@ for turbidity in (2.0, 6.0):
     sky.turbidity = turbidity
     # The reference runs on this background process's main thread, without
     # an outer render. Render callbacks must always use the isolated worker.
-    exporter.clear_sky_bake_cache()
-    exporter.prebake_sky_envmaps_for_world(world, w=64, h=32)
-    reference = dict(exporter._SKY_BAKE_CACHE)
+    exporter.clear_sky_bake_cache(context=export_context)
+    exporter.prebake_sky_envmaps_for_world(world, w=64, h=32, context=export_context)
+    reference = dict(export_context.sky_maps)
     assert reference
-    exporter.clear_sky_bake_cache()
+    exporter.clear_sky_bake_cache(context=export_context)
     before = scene_ids()
     if turbidity == 2.0:
-        sky_bake.prepare_scene(scene, width=64, height=32)
+        sky_bake.prepare_scene(scene, width=64, height=32, context=export_context)
     else:
-        with sky_bake.prepare_scene_async(scene, width=64, height=32) as finish:
-            assert not exporter._SKY_BAKE_CACHE, "Sky published before the export barrier"
+        with sky_bake.prepare_scene_async(scene, width=64, height=32, context=export_context) as finish:
+            assert not export_context.sky_maps, "Sky published before the export barrier"
             finish()
-            ready = dict(exporter._SKY_BAKE_CACHE)
+            ready = dict(export_context.sky_maps)
             finish()
-            assert all(exporter._SKY_BAKE_CACHE[key] is value for key, value in ready.items())
-    actual = exporter._SKY_BAKE_CACHE
+            assert all(export_context.sky_maps[key] is value for key, value in ready.items())
+    actual = export_context.sky_maps
     assert actual.keys() == reference.keys()
     assert scene_ids() == before, "Worker preparation mutated Blender's scene datablocks"
     assert bpy.data.filepath == "", "Worker preparation saved the user's scene"
@@ -65,9 +67,9 @@ for turbidity in (2.0, 6.0):
         previous = pixels.copy()
     print(f"[sky-bake-test] PASS unsaved turbidity={turbidity}", flush=True)
 
-exporter.clear_sky_bake_cache()
-sky_bake.prepare_scene(scene)
+exporter.clear_sky_bake_cache(context=export_context)
+sky_bake.prepare_scene(scene, context=export_context)
 assert all((w, h) == (2048, 1024)
-           for _pixels, w, h, _sun in exporter._SKY_BAKE_CACHE.values())
-assert exporter._SKY_BAKE_CACHE
+           for _pixels, w, h, _sun in export_context.sky_maps.values())
+assert export_context.sky_maps
 print("[sky-bake-test] PASS default world resolution=2048x1024", flush=True)

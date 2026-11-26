@@ -9,15 +9,17 @@ for _m in list(sys.modules):
     if _m == "vibrt_blender" or _m.startswith("vibrt_blender."):
         del sys.modules[_m]
 import vibrt_blender  # noqa
+from vibrt_blender.export_context import ExportContext
+export_context = ExportContext()
 try:
     bpy.ops.preferences.addon_enable(module="vibrt_blender")
 except Exception:
     pass
 from vibrt_blender.exporter import export_scene_to_memory, prebake_sky_envmaps_for_world
 
-prebake_sky_envmaps_for_world(bpy.context.scene.world, w=2048, h=1024)
+prebake_sky_envmaps_for_world(bpy.context.scene.world, w=2048, h=1024, context=export_context)
 deps = bpy.context.evaluated_depsgraph_get()
-json_str, _bin, texs = export_scene_to_memory(deps, texture_pct=100)
+json_str, _bin, texs = export_scene_to_memory(deps, texture_pct=100, context=export_context)
 data = json.loads(json_str)
 world = data["world"]
 print("world type:", world["type"], "fac:", world.get("fac"))

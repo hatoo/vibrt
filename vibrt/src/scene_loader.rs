@@ -203,7 +203,7 @@ pub fn load_scene<'a>(
     if file.version != 1 {
         return Err(anyhow!("unsupported scene.json version: {}", file.version));
     }
-    crate::shader_compile::optimize_materials(&mut file.materials)?;
+    crate::material::optimize_materials(&mut file.materials)?;
 
     // ~half of junk_shop's 142 textures are sRGB and pay a host-side
     // pow-2.4 conversion in `load_texture` (linear ones are zero-copy).

@@ -4,6 +4,8 @@ import bpy, os, sys
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(HERE, "blender"))
 from vibrt_blender import material_export
+from vibrt_blender.export_context import ExportContext
+export_context = ExportContext()
 
 
 class FakeWriter:
@@ -27,9 +29,9 @@ print(f"material: {mat.name}")
 
 writer = FakeWriter()
 textures = []
-material_export.begin_export()
-params = material_export.export_material(mat, writer, textures)
-material_export.end_export()
+material_export.begin_export(context=export_context)
+params = material_export.export_material(mat, writer, textures, context=export_context)
+material_export.end_export(context=export_context)
 
 print(f"\nExported params:")
 for k, v in params.items():

@@ -10,6 +10,7 @@ import time
 import numpy as np
 
 from . import node_ops
+from .export_context import ExportContext
 
 
 class UnsupportedSky(Exception):
@@ -58,7 +59,8 @@ def _rgb_curve(node):
 
 
 class _Graph:
-    def __init__(self, native):
+    def __init__(self, native, *, context=None):
+        self.export_context = context if context is not None else ExportContext()
         self.native = native
         self.skies = []
         self.pixels = {}
@@ -176,7 +178,7 @@ class _Graph:
         return evaluate, next(iter(skies.values())) if len(skies) == 1 else None
 
 
-def prepare_scene(scene, *, cancel, log, width=None, height=None):
+def prepare_scene(scene, *, cancel, log, width=None, height=None, context):
     """Return True only if every required environment map can be evaluated."""
     import bpy
     from . import exporter, runner, sky_bake
@@ -192,7 +194,7 @@ def prepare_scene(scene, *, cancel, log, width=None, height=None):
             or bpy.data.colorspace.working_space_interop_id != "lin_rec709_scene"):
         return False
     world = scene.world
-    graph = _Graph(native)
+    graph = _Graph(native, context=context)
     plans = []
     w, h = (2048, 1024) if width is None else (width, height)
     try:
@@ -242,7 +244,7 @@ def prepare_scene(scene, *, cancel, log, width=None, height=None):
         cache[key] = rgb, w, h, sun
     if cancel():
         raise KeyboardInterrupt("Sky preparation cancelled")
-    exporter._SKY_BAKE_CACHE.update(cache)
+    context.sky_maps.update(cache)
     if plans:
         models = ", ".join(sorted({n.sky_type for n in graph.skies}))
         log(f"[vibrt] native sky {models}: {len(plans)} environment map(s) in {time.perf_counter()-start:.3f}s")

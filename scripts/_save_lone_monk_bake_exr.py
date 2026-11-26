@@ -11,15 +11,17 @@ import numpy as np
 
 sys.path.insert(0, r"C:\Users\hato2\Desktop\vibrt\blender")
 from vibrt_blender import exporter
+from vibrt_blender.export_context import ExportContext
+export_context = ExportContext()
 
 w = bpy.context.scene.world
-exporter.clear_sky_bake_cache()
+exporter.clear_sky_bake_cache(context=export_context)
 
 # Run vibrt's bake (this will populate the cache and *also* extract
 # the sun, mutating the rgb in place).
-exporter.prebake_sky_envmaps_for_world(w, w=2048, h=1024)
-key = next(iter(exporter._SKY_BAKE_CACHE.keys()))
-rgb, bw, bh, sun = exporter._SKY_BAKE_CACHE[key]
+exporter.prebake_sky_envmaps_for_world(w, w=2048, h=1024, context=export_context)
+key = next(iter(export_context.sky_maps.keys()))
+rgb, bw, bh, sun = export_context.sky_maps[key]
 arr = np.asarray(rgb).reshape(bh, bw, 3).astype(np.float32)
 print(f"after sun extraction: max L = {arr.max():.4f}  sun = {sun}")
 
@@ -42,17 +44,17 @@ save_exr(residual_path, arr, bw, bh)
 print(f"wrote {residual_path}")
 
 # Now bake again WITHOUT sun extraction so we can test the full envmap.
-exporter.clear_sky_bake_cache()
+exporter.clear_sky_bake_cache(context=export_context)
 # Temporarily monkey-patch the extractor to skip its work.
 orig_extract = exporter._extract_sun_from_bake_inplace
 exporter._extract_sun_from_bake_inplace = lambda *a, **kw: None
 try:
-    exporter.prebake_sky_envmaps_for_world(w, w=2048, h=1024)
+    exporter.prebake_sky_envmaps_for_world(w, w=2048, h=1024, context=export_context)
 finally:
     exporter._extract_sun_from_bake_inplace = orig_extract
 
-key = next(iter(exporter._SKY_BAKE_CACHE.keys()))
-rgb_full, bw, bh, _ = exporter._SKY_BAKE_CACHE[key]
+key = next(iter(export_context.sky_maps.keys()))
+rgb_full, bw, bh, _ = export_context.sky_maps[key]
 arr_full = np.asarray(rgb_full).reshape(bh, bw, 3).astype(np.float32)
 print(f"\nFULL bake (no sun extraction): max L = {arr_full.max():.4f}, "
       f"mean L = {arr_full.mean():.4f}")

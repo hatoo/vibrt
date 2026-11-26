@@ -13,6 +13,8 @@ HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(HERE, "blender"))
 
 import vibrt_blender.exporter as exporter
+from vibrt_blender.export_context import ExportContext
+export_context = ExportContext()
 
 # Replace the sun extractor with a passthrough that records the raw bake
 # pre-clamp, so we can sample the actual disc-center pixel.
@@ -26,8 +28,8 @@ def _spy(rgb, w, h, sky_node, world_name):
 exporter._extract_sun_from_bake_inplace = _spy
 
 scene = bpy.context.scene
-exporter.clear_sky_bake_cache()
-exporter.prebake_sky_envmaps_for_world(scene.world)
+exporter.clear_sky_bake_cache(context=export_context)
+exporter.prebake_sky_envmaps_for_world(scene.world, context=export_context)
 
 rgb_pre = captured["rgb_pre"]
 h, w, _ = rgb_pre.shape
@@ -59,7 +61,7 @@ print(f"  threshold-extracted pixels above implicit cap; sun light color was alr
 print(f"  printed by the engine — re-extracting via the cached split:")
 key = exporter._sky_node_cache_key(scene.world,
     next(n for n in scene.world.node_tree.nodes if n.bl_idname == "ShaderNodeTexSky"))
-baked = exporter._SKY_BAKE_CACHE.get(key)
+baked = export_context.sky_maps.get(key)
 if baked is not None:
     _, _, _, sun_light = baked
     if sun_light is not None:

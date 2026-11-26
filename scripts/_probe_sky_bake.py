@@ -15,6 +15,8 @@ HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(HERE, "blender"))
 
 import vibrt_blender.exporter as exporter
+from vibrt_blender.export_context import ExportContext
+export_context = ExportContext()
 import vibrt_blender.material_export as material_export
 
 scene = bpy.context.scene
@@ -22,8 +24,8 @@ world = scene.world
 print(f"world: {world.name}")
 
 # Bake via the exact path the addon uses.
-exporter.clear_sky_bake_cache()
-exporter.prebake_sky_envmaps_for_world(world)
+exporter.clear_sky_bake_cache(context=export_context)
+exporter.prebake_sky_envmaps_for_world(world, context=export_context)
 
 # Pull the cached bake back out.
 sky_node = next(
@@ -31,7 +33,7 @@ sky_node = next(
     None,
 )
 key = exporter._sky_node_cache_key(world, sky_node)
-baked = exporter._SKY_BAKE_CACHE.get(key)
+baked = export_context.sky_maps.get(key)
 if baked is None:
     print("ERROR: bake cache miss")
     sys.exit(1)

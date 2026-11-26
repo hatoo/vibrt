@@ -14,104 +14,49 @@ import time
 import bpy
 
 from . import native_scene, node_ops
+from .export_context import ExportContext
+from .texture_export import (
+    _PreBakedTexture, _read_image_pixels, export_image_texture, _export_prebaked,
+    _image_to_linear_rgb, _bake_source_to_linear, _resample_bilinear,
+    _srgb_to_linear_np, _bake_chain,
+)
 
 
-_LOGGED_WARNINGS: set = set()
-_CURRENT_MATERIAL: str = ""
+def reset_stats(*, context) -> None:
+    context.warnings.clear()
+    context.stats["material_self_s"] = 0.0
+    context.stats["texture_self_s"] = 0.0
+    context.stats["pixel_read_s"] = 0.0
+    context.stats["bake_chain_s"] = 0.0
+    context.stats["texture_count"] = 0
+    context.stats["pixel_bytes"] = 0
+    context.stats["slow_textures"].clear()
+    context.stats["slow_materials"].clear()
+    context.stats["premix_cache_hits"] = 0
+    context.stats["premix_cache_misses"] = 0
+    context.stats["linear_rgb_cache_hits"] = 0
+    context.stats["linear_rgb_cache_misses"] = 0
+    context.premix_cache.clear()
+    context.linear_rgb_cache.clear()
+    context.mean_rgba_cache.clear()
 
 
-# Phase timing accumulators — populated by the hot paths in this module and
-# drained by exporter.py after each export. Self-times subtract
-# nested child timings so the breakdown in the summary log is additive.
-_STATS: dict = {
-    "material_self_s": 0.0,
-    "texture_self_s": 0.0,
-    "pixel_read_s": 0.0,
-    "bake_chain_s": 0.0,
-    "texture_count": 0,
-    "pixel_bytes": 0,
-    "slow_textures": [],  # list of (name, w, h, seconds), only > 0.25s
-    "slow_materials": [],  # list of (name, self_seconds), only > 0.10s
-    "premix_cache_hits": 0,
-    "premix_cache_misses": 0,
-    "linear_rgb_cache_hits": 0,
-    "linear_rgb_cache_misses": 0,
-}
-
-
-# Session-scoped cache for `_try_premix_two_textures`. Same Mix(TexA, TexB,
-# fac, blend) may be reached repeatedly from different sockets on the same
-# material (profile showed 2× per material on classroom.blend), and sometimes
-# across materials that reuse textures. The bake is deterministic, so we can
-# reuse the result keyed by the same identity string the function already
-# computed for `_PreBakedTexture.cache_key`. Cleared in `reset_stats()`.
-_PREMIX_CACHE: dict = {}
-
-
-# Session-scoped cache for `_image_to_linear_rgb`. The result is a pure
-# function of the image's pixels + colorspace, but every Mix-bake path
-# re-reads the pixels and re-runs the sRGB→linear conversion. Keyed by
-# `image.as_pointer()` since that's stable for the lifetime of the export.
-# Values are stored read-only so any accidental mutation fails loudly.
-_LINEAR_RGB_CACHE: dict = {}
-
-
-# Session-scoped cache for `_image_mean_rgb`. Used when a constant-folding
-# chain (MixShader factor, Emission colour, ...) needs the image reduced to
-# a single RGBA value rather than its per-pixel array.
-_MEAN_RGBA_CACHE: dict = {}
-
-
-def reset_stats() -> None:
-    _STATS["material_self_s"] = 0.0
-    _STATS["texture_self_s"] = 0.0
-    _STATS["pixel_read_s"] = 0.0
-    _STATS["bake_chain_s"] = 0.0
-    _STATS["texture_count"] = 0
-    _STATS["pixel_bytes"] = 0
-    _STATS["slow_textures"].clear()
-    _STATS["slow_materials"].clear()
-    _STATS["premix_cache_hits"] = 0
-    _STATS["premix_cache_misses"] = 0
-    _STATS["linear_rgb_cache_hits"] = 0
-    _STATS["linear_rgb_cache_misses"] = 0
-    _PREMIX_CACHE.clear()
-    _LINEAR_RGB_CACHE.clear()
-    _MEAN_RGBA_CACHE.clear()
-
-
-def pop_stats() -> dict:
+def pop_stats(*, context) -> dict:
     """Snapshot the current stats — caller is expected to `reset_stats()` first."""
     return {
-        "material_self_s": _STATS["material_self_s"],
-        "texture_self_s": _STATS["texture_self_s"],
-        "pixel_read_s": _STATS["pixel_read_s"],
-        "bake_chain_s": _STATS["bake_chain_s"],
-        "texture_count": _STATS["texture_count"],
-        "pixel_bytes": _STATS["pixel_bytes"],
-        "slow_textures": list(_STATS["slow_textures"]),
-        "slow_materials": list(_STATS["slow_materials"]),
-        "premix_cache_hits": _STATS["premix_cache_hits"],
-        "premix_cache_misses": _STATS["premix_cache_misses"],
-        "linear_rgb_cache_hits": _STATS["linear_rgb_cache_hits"],
-        "linear_rgb_cache_misses": _STATS["linear_rgb_cache_misses"],
+        "material_self_s": context.stats["material_self_s"],
+        "texture_self_s": context.stats["texture_self_s"],
+        "pixel_read_s": context.stats["pixel_read_s"],
+        "bake_chain_s": context.stats["bake_chain_s"],
+        "texture_count": context.stats["texture_count"],
+        "pixel_bytes": context.stats["pixel_bytes"],
+        "slow_textures": list(context.stats["slow_textures"]),
+        "slow_materials": list(context.stats["slow_materials"]),
+        "premix_cache_hits": context.stats["premix_cache_hits"],
+        "premix_cache_misses": context.stats["premix_cache_misses"],
+        "linear_rgb_cache_hits": context.stats["linear_rgb_cache_hits"],
+        "linear_rgb_cache_misses": context.stats["linear_rgb_cache_misses"],
     }
-
-
-def _warn(key: str, msg: str) -> None:
-    """Print a one-line warning, deduped within the current material.
-
-    `key` is the dedup key; `msg` is the human message. Reset per-material by
-    `export_material`, so the same issue recurring across materials still
-    prints (once per material), but a single material doesn't spam the log.
-    """
-    full_key = (_CURRENT_MATERIAL, key)
-    if full_key in _LOGGED_WARNINGS:
-        return
-    _LOGGED_WARNINGS.add(full_key)
-    prefix = f"material {_CURRENT_MATERIAL!r}: " if _CURRENT_MATERIAL else ""
-    from ._log import log as _emit
-    _emit(f"[vibrt] warn: {prefix}{msg}")
 
 
 def _node_tag(node) -> str:
@@ -181,281 +126,15 @@ def _follow_reroutes(sock):
 # Integer percentage applied to final-written texture dimensions, or None/100
 # for no-op. Intermediate caches (linear RGB, mean RGBA, premix) still operate
 # at full resolution; the downsample affects the exported texture buffers.
-_TEXTURE_PCT = None
 
 
-def begin_export(texture_pct: int | None = None) -> None:
+def begin_export(texture_pct: int | None = None, *, context) -> None:
     """Reset per-export state."""
-    global _TEXTURE_PCT
-    _TEXTURE_PCT = texture_pct
+    context.texture_pct = texture_pct
 
 
-def end_export() -> None:
-    global _TEXTURE_PCT
-    _TEXTURE_PCT = None
-
-
-class _PreBakedTexture:
-    """A synthetic linear RGB texture produced during legacy export (e.g. by
-    pre-mixing the two sides of a two-texture Mix node).
-
-    Carries `rgb` as a numpy (h, w, 3) float32 array and a `cache_key` so the
-    main exporter can dedupe and write it without going through `bpy.Image`.
-    """
-    __slots__ = ("rgb", "w", "h", "cache_key")
-
-    def __init__(self, rgb, w: int, h: int, cache_key: str):
-        self.rgb = rgb
-        self.w = w
-        self.h = h
-        self.cache_key = cache_key
-
-
-def _read_image_pixels(image):
-    """Read a fresh RGBA buffer; missing images use Cycles' magenta sentinel."""
-    import numpy as np
-    try:
-        width, height = map(int, image.size)
-        if width == 0 or height == 0:
-            image.update()
-            width, height = map(int, image.size)
-        if width <= 0 or height <= 0:
-            raise ValueError("empty image")
-        pixels = np.empty(width * height * 4, np.float32)
-        started = time.perf_counter()
-        image.pixels.foreach_get(pixels)
-        _STATS["pixel_read_s"] += time.perf_counter() - started
-        _STATS["pixel_bytes"] += pixels.nbytes
-        return width, height, pixels
-    except (RuntimeError, ValueError) as exc:
-        _warn(f"missing-image:{image.name}",
-              f"image {image.name!r} has no readable pixels ({exc}); using magenta")
-        return 1, 1, np.array([1.0, 0.0, 1.0, 1.0], np.float32)
-
-
-def export_image_texture(
-    image,
-    writer,
-    textures: list,
-    colorspace: str | None = None,
-    chain: tuple = (),
-) -> int:
-    """Retain an image's float32 pixel buffer and register its TextureDesc.
-
-    Accepts either a `bpy.types.Image` (chain transforms baked into its pixels)
-    or a `_PreBakedTexture` (already in linear space; chain is applied on top of
-    the prebaked pixels). Returns the texture index. Reuses existing entries by
-    cache key.
-    """
-    import numpy as np
-    if isinstance(image, _PreBakedTexture):
-        return _export_prebaked(image, writer, textures, chain=chain)
-    chain_key = "" if not chain else "|" + repr(tuple(x[0] for x in chain))
-    key = f"__image__{image.name}{chain_key}"
-    for i, t in enumerate(textures):
-        if t.get("_key") == key:
-            return i
-    t_enter = time.perf_counter()
-    pixel_before = _STATS["pixel_read_s"]
-    bake_before = _STATS["bake_chain_s"]
-    width, height, pixels = _read_image_pixels(image)
-    if colorspace is None:
-        colorspace = (
-            "srgb"
-            if image.colorspace_settings.name.lower().startswith("srgb")
-            else "linear"
-        )
-    if chain:
-        pixels, colorspace = _bake_chain(pixels, width, height, colorspace, chain)
-    if _TEXTURE_PCT is not None and _TEXTURE_PCT != 100:
-        new_w = max(1, int(round(width * _TEXTURE_PCT / 100.0)))
-        new_h = max(1, int(round(height * _TEXTURE_PCT / 100.0)))
-        if (new_w, new_h) != (width, height):
-            rgba = pixels.reshape((height, width, 4))
-            rgba = _resample_bilinear(rgba, new_h, new_w)
-            pixels = np.ascontiguousarray(rgba, dtype=np.float32).reshape(-1)
-            width, height = new_w, new_h
-    desc = {
-        "width": int(width),
-        "height": int(height),
-        "channels": 4,
-        "colorspace": colorspace,
-        "_key": key,
-        # Add the index into the writer's separate texture-array list.
-        **writer.write_texture_pixels(pixels),
-    }
-    textures.append(desc)
-    dt = time.perf_counter() - t_enter
-    children = (_STATS["pixel_read_s"] - pixel_before) + (_STATS["bake_chain_s"] - bake_before)
-    _STATS["texture_self_s"] += max(0.0, dt - children)
-    _STATS["texture_count"] += 1
-    if dt > 0.25:
-        slow = _STATS["slow_textures"]
-        slow.append((image.name, int(width), int(height), dt))
-        slow.sort(key=lambda e: e[3], reverse=True)
-        del slow[5:]
-    return len(textures) - 1
-
-
-def _export_prebaked(pb: "_PreBakedTexture", writer, textures: list, chain: tuple = ()) -> int:
-    import numpy as np
-    # A non-empty chain carries the residual colour transforms that sit above
-    # the baked Mix (e.g. a terminal HueSaturation Value dimming). It must be
-    # folded into the cache key so two materials sharing the same prebaked
-    # base but a different terminal transform get distinct entries.
-    chain_key = "" if not chain else "|" + repr(tuple(x[0] for x in chain))
-    key = pb.cache_key + chain_key
-    for i, t in enumerate(textures):
-        if t.get("_key") == key:
-            return i
-    rgb = pb.rgb
-    w, h = int(pb.w), int(pb.h)
-    if chain:
-        # Prebaked pixels are already linear; apply the chain transforms in
-        # place (texture-first → outer-last, same order as `_bake_chain`).
-        # Done at full resolution before the texture_pct resample, mirroring
-        # the bpy.Image path in `export_image_texture`.
-        rgb = np.asarray(rgb, dtype=np.float32).reshape((h, w, 3)).copy()
-        for _id, apply_fn in chain:
-            rgb = apply_fn(rgb)
-        rgb = np.ascontiguousarray(rgb, dtype=np.float32)
-    if _TEXTURE_PCT is not None and _TEXTURE_PCT != 100:
-        new_w = max(1, int(round(w * _TEXTURE_PCT / 100.0)))
-        new_h = max(1, int(round(h * _TEXTURE_PCT / 100.0)))
-        if (new_w, new_h) != (w, h):
-            rgb = _resample_bilinear(rgb, new_h, new_w)
-            w, h = new_w, new_h
-    rgba = np.concatenate(
-        [rgb, np.ones((h, w, 1), dtype=np.float32)], axis=-1
-    )
-    pixels = np.ascontiguousarray(rgba, dtype=np.float32).reshape(-1)
-    desc = {
-        "width": w,
-        "height": h,
-        "channels": 4,
-        "colorspace": "linear",
-        "_key": key,
-        **writer.write_texture_pixels(pixels),
-    }
-    textures.append(desc)
-    return len(textures) - 1
-
-
-def _image_to_linear_rgb(image):
-    """Decode a `bpy.types.Image` into a (h, w, 3) numpy array in linear space."""
-    import numpy as np
-    ptr = image.as_pointer()
-    hit = _LINEAR_RGB_CACHE.get(ptr)
-    if hit is not None:
-        _STATS["linear_rgb_cache_hits"] += 1
-        return hit
-    _STATS["linear_rgb_cache_misses"] += 1
-    w, h, px = _read_image_pixels(image)
-    px = px.reshape((h, w, 4))
-    rgb = np.ascontiguousarray(px[..., :3], dtype=np.float32)
-    if image.colorspace_settings.name.lower().startswith("srgb"):
-        rgb = _srgb_to_linear_np(rgb)
-    # Freeze so downstream chain / resample steps can't accidentally mutate the
-    # shared buffer. All known apply_fn/resample/mix helpers return new arrays.
-    rgb.setflags(write=False)
-    result = (rgb, w, h)
-    _LINEAR_RGB_CACHE[ptr] = result
-    return result
-
-
-def _bake_source_to_linear(source, chain):
-    """Resolve any texture source (`bpy.Image` or `_PreBakedTexture`) plus chain
-    into a linear (h, w, 3) numpy array.
-    """
-    if isinstance(source, _PreBakedTexture):
-        # PreBaked is already linear; chains on top would be unusual.
-        rgb = source.rgb
-        for _id, apply_fn in chain:
-            rgb = apply_fn(rgb)
-        return rgb, source.w, source.h
-    rgb, w, h = _image_to_linear_rgb(source)
-    for _id, apply_fn in chain:
-        rgb = apply_fn(rgb)
-    return rgb, w, h
-
-
-def _resample_bilinear(rgb, target_h: int, target_w: int):
-    """Separable bilinear resample — X pass first, then Y. The 4-corner form
-    allocated 4 × (target_h, target_w, c) intermediates per call; classroom's
-    700 → 2048 upsample made that ~200MB and ~300ms. Separable drops the
-    heaviest pass to (h, target_w, c).
-    """
-    import numpy as np
-    h, w, _ = rgb.shape
-    if h == target_h and w == target_w:
-        return rgb
-    native = native_scene.accelerator()
-    if native is not None and rgb.dtype == np.float32:
-        return native.resample_bilinear(np.ascontiguousarray(rgb), target_h, target_w)
-    # X pass: interpolate columns, shape (h, target_w, c).
-    xs = np.linspace(0.0, w - 1, target_w, dtype=np.float32)
-    x0 = np.floor(xs).astype(np.int32)
-    x1 = np.minimum(x0 + 1, w - 1)
-    fx = (xs - x0)[None, :, None]
-    a = rgb[:, x0, :]
-    b = rgb[:, x1, :]
-    row_interp = a + (b - a) * fx
-    # Y pass: interpolate rows, shape (target_h, target_w, c).
-    ys = np.linspace(0.0, h - 1, target_h, dtype=np.float32)
-    y0 = np.floor(ys).astype(np.int32)
-    y1 = np.minimum(y0 + 1, h - 1)
-    fy = (ys - y0)[:, None, None]
-    c0 = row_interp[y0]
-    c1 = row_interp[y1]
-    out = c0 + (c1 - c0) * fy
-    return out.astype(np.float32, copy=False)
-
-
-def _srgb_to_linear_np(x):
-    """sRGB → linear conversion, kept in float32 end-to-end.
-
-    The previous `np.power(..., 2.4)` with a Python-float exponent silently
-    promoted the whole image to f64 and `np.where` over f32+f64 operands
-    produced an f64 intermediate, so a 2K image would allocate ~50MB of f64
-    it didn't need. Using an explicit `np.float32(2.4)` + `dtype=np.float32`
-    keeps memory and arithmetic at half that.
-    """
-    import numpy as np
-    xf = x if x.dtype == np.float32 else x.astype(np.float32)
-    native = native_scene.accelerator()
-    if native is not None:
-        return native.srgb_to_linear(np.ascontiguousarray(xf))
-    lin = xf * np.float32(1.0 / 12.92)
-    gamma = np.power(
-        (xf + np.float32(0.055)) * np.float32(1.0 / 1.055),
-        np.float32(2.4),
-        dtype=np.float32,
-    )
-    return np.where(xf <= np.float32(0.04045), lin, gamma)
-
-
-def _bake_chain(pixels, w, h, colorspace, chain):
-    """Apply `chain` color transforms to RGBA f32 pixels.
-
-    Transforms operate in linear space (matching Cycles' shader semantics: the
-    TexImage node converts sRGB→linear before its Color output). If the source
-    is sRGB, we linearise before applying. Returns the new pixel list and the
-    output colorspace string ("linear" once anything is baked in).
-    """
-    import numpy as np
-    t_enter = time.perf_counter()
-    try:
-        arr = np.asarray(pixels, dtype=np.float32).reshape((h, w, 4)).copy()
-        rgb = arr[..., :3].copy()
-        if colorspace.lower() == "srgb":
-            rgb = _srgb_to_linear_np(rgb).astype(np.float32)
-        for _id, apply_fn in chain:
-            rgb = apply_fn(rgb)
-        arr[..., :3] = rgb
-        # The writer accepts NumPy arrays directly, without a list round-trip.
-        return arr.reshape(-1), "linear"
-    finally:
-        _STATS["bake_chain_s"] += time.perf_counter() - t_enter
+def end_export(*, context) -> None:
+    context.texture_pct = None
 
 
 def _socket_rgb(sock) -> list[float]:
@@ -467,7 +146,7 @@ def _socket_f(sock) -> float:
     return float(sock.default_value)
 
 
-def _warn_linked_scalar(node, input_name: str) -> float:
+def _warn_linked_scalar(node, input_name: str, *, context=None) -> float:
     """Return the effective constant value for a scalar input socket.
 
     Tries three strategies in order:
@@ -489,19 +168,21 @@ def _warn_linked_scalar(node, input_name: str) -> float:
     linked to `Invert(ColorRamp(tex))` and falling back to default 1.0
     (peak F0 multiplier = 2× over) instead of the texture's mean (~0.5).
     """
+    if context is None:
+        context = ExportContext()
     sock = node.inputs.get(input_name)
     if sock is None:
         return 0.0
     sock = _follow_reroutes(sock)
     if not sock.is_linked:
         return _socket_f(sock)
-    resolved = _resolve_exact_scalar(sock)
+    resolved = _resolve_exact_scalar(sock, context=context)
     if resolved is not None:
         return resolved
     src = sock.links[0].from_node
-    lossy = _resolve_constant_scalar(sock)
+    lossy = _resolve_constant_scalar(sock, context=context)
     if lossy is not None:
-        _warn(
+        context.warn(
             f"linked-scalar:{node.as_pointer()}:{input_name}",
             f"{_node_tag(node)}: input {input_name!r} linked to "
             f"{src.bl_idname} — folded to lossy mean {lossy:.4f} "
@@ -509,7 +190,7 @@ def _warn_linked_scalar(node, input_name: str) -> float:
             f"socket default {sock.default_value})",
         )
         return lossy
-    _warn(
+    context.warn(
         f"linked-scalar:{node.as_pointer()}:{input_name}",
         f"{_node_tag(node)}: input {input_name!r} linked to {src.bl_idname} "
         f"but not baked — using constant default ({sock.default_value})",
@@ -580,7 +261,7 @@ def _bake_ramp_to_lut(ramp, n_stops: int = 256) -> list[float]:
     return out
 
 
-def _resolve_exact_scalar(sock, depth: int = 0) -> float | None:
+def _resolve_exact_scalar(sock, depth: int = 0, *, context=None) -> float | None:
     """Strict scalar fold: refuses texture means / procedural mean-colour
     approximations so callers can distinguish a real constant from a guess.
 
@@ -588,6 +269,8 @@ def _resolve_exact_scalar(sock, depth: int = 0) -> float | None:
     scalar Mix, and Invert — all evaluating to a single deterministic float.
     Anything else (TexImage, Attribute, Fresnel, ...) returns None.
     """
+    if context is None:
+        context = ExportContext()
     if depth > 8:
         return None
     sock = _follow_reroutes(sock)
@@ -610,32 +293,32 @@ def _resolve_exact_scalar(sock, depth: int = 0) -> float | None:
     bl = src.bl_idname
     if bl == "NodeGroupInput":
         # Inside a NodeGroup, the inner BSDF's scalar input may be wired to
-        # the group's external interface. Follow the live `_GROUP_STACK` to
+        # the group's external interface. Follow the live `context.group_stack` to
         # the parent ShaderNodeGroup and resolve from the matching outer
         # socket. This is what unblocks Glass BSDFs whose IOR comes from a
         # NodeGroup's "IOR" parameter (flat_archiviz wraps every glass
         # surface in such a group with IOR=1.45 default).
         out_name = link.from_socket.name
-        if not _GROUP_STACK:
+        if not context.group_stack:
             return None
-        parent = _GROUP_STACK.pop()
+        parent = context.group_stack.pop()
         try:
             external = parent.inputs.get(out_name)
             if external is None:
                 return None
-            return _resolve_exact_scalar(external, depth + 1)
+            return _resolve_exact_scalar(external, depth + 1, context=context)
         finally:
-            _GROUP_STACK.append(parent)
+            context.group_stack.append(parent)
     if bl == "ShaderNodeValue":
         return float(src.outputs[0].default_value)
     if bl == "ShaderNodeMath":
-        return _eval_math_constant(src, depth + 1)
+        return _eval_math_constant(src, depth + 1, context=context)
     if bl == "ShaderNodeClamp":
-        v = _resolve_exact_scalar(src.inputs["Value"], depth + 1)
+        v = _resolve_exact_scalar(src.inputs["Value"], depth + 1, context=context)
         if v is None:
             return None
-        mn = _resolve_exact_scalar(src.inputs["Min"], depth + 1)
-        mx = _resolve_exact_scalar(src.inputs["Max"], depth + 1)
+        mn = _resolve_exact_scalar(src.inputs["Min"], depth + 1, context=context)
+        mx = _resolve_exact_scalar(src.inputs["Max"], depth + 1, context=context)
         if mn is None or mx is None:
             return None
         mode = getattr(src, "clamp_type", "MINMAX")
@@ -654,9 +337,9 @@ def _resolve_exact_scalar(sock, depth: int = 0) -> float | None:
                        if i.name == "B" and i.type == "VALUE"), None)
         if fac_sock is None or a_sock is None or b_sock is None:
             return None
-        fa = _resolve_exact_scalar(fac_sock, depth + 1)
-        va = _resolve_exact_scalar(a_sock, depth + 1)
-        vb = _resolve_exact_scalar(b_sock, depth + 1)
+        fa = _resolve_exact_scalar(fac_sock, depth + 1, context=context)
+        va = _resolve_exact_scalar(a_sock, depth + 1, context=context)
+        vb = _resolve_exact_scalar(b_sock, depth + 1, context=context)
         if fa is None or va is None or vb is None:
             return None
         if bool(getattr(src, "clamp_factor", True)):
@@ -671,17 +354,17 @@ def _resolve_exact_scalar(sock, depth: int = 0) -> float | None:
         if fac_sock is None:
             fac = 1.0
         else:
-            fac = _resolve_exact_scalar(fac_sock, depth + 1)
+            fac = _resolve_exact_scalar(fac_sock, depth + 1, context=context)
             if fac is None:
                 return None
-        x = _resolve_exact_scalar(col_sock, depth + 1)
+        x = _resolve_exact_scalar(col_sock, depth + 1, context=context)
         if x is None:
             return None
         return float(node_ops.apply(dict(type="invert", fac=fac), [x, x, x])[0])
     return None
 
 
-def _socket_constant_rgb(sock) -> list[float] | None:
+def _socket_constant_rgb(sock, *, context=None) -> list[float] | None:
     """Return a constant RGB triple if the socket is effectively constant.
 
     Walks through bakeable colour-modifying nodes (RGBCurve, Gamma, Mix when
@@ -690,17 +373,21 @@ def _socket_constant_rgb(sock) -> list[float] | None:
     any node on the path is non-bakeable or any leaf is a TexImage (which
     isn't a constant — callers should treat it as a real texture chain).
     """
-    return _resolve_constant_socket(sock, depth=0)
+    if context is None:
+        context = ExportContext()
+    return _resolve_constant_socket(sock, depth=0, context=context)
 
 
-def _image_mean_rgba(image) -> tuple[list[float], float] | None:
+def _image_mean_rgba(image, *, context=None) -> tuple[list[float], float] | None:
     """Return (mean_linear_rgb, mean_alpha) for `image`, or None when pixels
     can't be read. Cached per-image. Used only in constant-folding paths —
     the full texture pipeline reads pixels directly via foreach_get.
     """
+    if context is None:
+        context = ExportContext()
     import numpy as np
     ptr = image.as_pointer()
-    hit = _MEAN_RGBA_CACHE.get(ptr)
+    hit = context.mean_rgba_cache.get(ptr)
     if hit is not None:
         return hit
     if image.size[0] == 0 or image.size[1] == 0:
@@ -710,7 +397,7 @@ def _image_mean_rgba(image) -> tuple[list[float], float] | None:
         return None
     px = np.empty(w * h * 4, dtype=np.float32)
     image.pixels.foreach_get(px)
-    _STATS["pixel_bytes"] += px.nbytes
+    context.stats["pixel_bytes"] += px.nbytes
     px = px.reshape((-1, 4))
     rgb = px[..., :3]
     if image.colorspace_settings.name.lower().startswith("srgb"):
@@ -718,11 +405,13 @@ def _image_mean_rgba(image) -> tuple[list[float], float] | None:
     mean_rgb = [float(rgb[..., c].mean()) for c in range(3)]
     mean_a = float(px[..., 3].mean())
     result = (mean_rgb, mean_a)
-    _MEAN_RGBA_CACHE[ptr] = result
+    context.mean_rgba_cache[ptr] = result
     return result
 
 
-def _resolve_constant_socket(sock, depth: int = 0):
+def _resolve_constant_socket(sock, depth: int = 0, *, context=None):
+    if context is None:
+        context = ExportContext()
     if depth > 8:
         return None
     sock = _follow_reroutes(sock)
@@ -735,16 +424,16 @@ def _resolve_constant_socket(sock, depth: int = 0):
         # matching external socket so a NodeGroup-wrapped Color input
         # (Glass.Color from a Glass NodeGroup, etc.) folds to its callsite
         # value instead of dead-ending here.
-        if not _GROUP_STACK:
+        if not context.group_stack:
             return None
-        parent = _GROUP_STACK.pop()
+        parent = context.group_stack.pop()
         try:
             external = parent.inputs.get(link.from_socket.name)
             if external is None:
                 return None
-            return _resolve_constant_socket(external, depth + 1)
+            return _resolve_constant_socket(external, depth + 1, context=context)
         finally:
-            _GROUP_STACK.append(parent)
+            context.group_stack.append(parent)
     mean = _node_mean_color(src, link.from_socket)
     if mean is not None:
         return mean
@@ -767,12 +456,12 @@ def _resolve_constant_socket(sock, depth: int = 0):
             return None
         from_name = link.from_socket.name
         if from_name == "Alpha":
-            mean = _image_mean_rgba(src.image)
+            mean = _image_mean_rgba(src.image, context=context)
             if mean is None:
                 return None
             a = mean[1]
             return [a, a, a]
-        mean = _image_mean_rgba(src.image)
+        mean = _image_mean_rgba(src.image, context=context)
         if mean is None:
             return None
         return list(mean[0])
@@ -788,7 +477,7 @@ def _resolve_constant_socket(sock, depth: int = 0):
         if _socket_is_uniform_random_01(fac_sock):
             return _ramp_mean_color(src.color_ramp)
         if fac_sock.is_linked:
-            inner = _resolve_constant_socket(fac_sock, depth + 1)
+            inner = _resolve_constant_socket(fac_sock, depth + 1, context=context)
             if inner is None:
                 return None
             fac = float(inner[0])  # collapse to scalar via R channel
@@ -800,13 +489,13 @@ def _resolve_constant_socket(sock, depth: int = 0):
         fac_sock, a_sock, b_sock, blend, use_clamp, ok = _mix_node_params(src)
         if ok and blend in _SUPPORTED_MIX_BLENDS:
             if fac_sock.is_linked:
-                fac = _resolve_constant_scalar(fac_sock, depth + 1)
+                fac = _resolve_constant_scalar(fac_sock, depth + 1, context=context)
                 if fac is None:
                     return None
             else:
                 fac = _socket_f(fac_sock)
-            a_const = _resolve_constant_socket(a_sock, depth + 1)
-            b_const = _resolve_constant_socket(b_sock, depth + 1)
+            a_const = _resolve_constant_socket(a_sock, depth + 1, context=context)
+            b_const = _resolve_constant_socket(b_sock, depth + 1, context=context)
             if a_const is None or b_const is None:
                 return None
             import numpy as np
@@ -819,7 +508,7 @@ def _resolve_constant_socket(sock, depth: int = 0):
     # Try transforms that take a single Color input (Gamma, BrightContrast,
     # Invert, HueSaturation, RGBCurve, Clamp). Walk their input to a constant
     # and apply the transform's LUT.
-    candidates = _chain_candidates(src)
+    candidates = _chain_candidates(src, context=context)
     if candidates is None:
         return None
     for name, inp in candidates:
@@ -827,7 +516,7 @@ def _resolve_constant_socket(sock, depth: int = 0):
         if inp.type not in ("RGBA", "VALUE"):
             continue
         if inp.is_linked:
-            inner = _resolve_constant_socket(inp, depth + 1)
+            inner = _resolve_constant_socket(inp, depth + 1, context=context)
             if inner is None:
                 continue
         else:
@@ -841,13 +530,13 @@ def _resolve_constant_socket(sock, depth: int = 0):
                 else:
                     inner = _socket_rgb(inp)
             except Exception as exc:
-                _warn(
+                context.warn(
                     f"resolve_const:{_node_tag(src)}:{name}",
                     f"could not read default of socket {name!r} on "
                     f"{_node_tag(src)} ({exc}) — skipping constant-fold candidate",
                 )
                 continue
-        xform = _node_color_transform(src, chain_input_name=name)
+        xform = _node_color_transform(src, chain_input_name=name, context=context)
         if xform is None:
             return inner
         import numpy as np
@@ -905,13 +594,15 @@ def _view_dependent_ior(sock, depth: int = 0) -> float | None:
     return None
 
 
-def _resolve_constant_scalar(sock, depth: int = 0) -> float | None:
+def _resolve_constant_scalar(sock, depth: int = 0, *, context=None) -> float | None:
     """Fold a VALUE socket to a single float, walking Math/Clamp/Value.
 
     Returns None when we hit a node we can't evaluate — no "representative
     mean" substitution for non-foldable leaves (Random, procedural noise).
     Callers must handle the None by warning and dropping the effect.
     """
+    if context is None:
+        context = ExportContext()
     if depth > 8:
         return None
     sock = _follow_reroutes(sock)
@@ -929,26 +620,26 @@ def _resolve_constant_scalar(sock, depth: int = 0) -> float | None:
         # Same NodeGroup-hop pattern as _resolve_exact_scalar — handles
         # MixShader Factor / scalar inputs that come from a NodeGroup's
         # external interface.
-        if not _GROUP_STACK:
+        if not context.group_stack:
             return None
-        parent = _GROUP_STACK.pop()
+        parent = context.group_stack.pop()
         try:
             external = parent.inputs.get(link.from_socket.name)
             if external is None:
                 return None
-            return _resolve_constant_scalar(external, depth + 1)
+            return _resolve_constant_scalar(external, depth + 1, context=context)
         finally:
-            _GROUP_STACK.append(parent)
+            context.group_stack.append(parent)
     if src.bl_idname == "ShaderNodeValue":
         return float(src.outputs[0].default_value)
     if src.bl_idname == "ShaderNodeMath":
-        return _eval_math_constant(src, depth + 1)
+        return _eval_math_constant(src, depth + 1, context=context)
     if src.bl_idname == "ShaderNodeClamp":
-        v = _resolve_constant_scalar(src.inputs["Value"], depth + 1)
+        v = _resolve_constant_scalar(src.inputs["Value"], depth + 1, context=context)
         if v is None:
             return None
-        mn = _resolve_constant_scalar(src.inputs["Min"], depth + 1)
-        mx = _resolve_constant_scalar(src.inputs["Max"], depth + 1)
+        mn = _resolve_constant_scalar(src.inputs["Min"], depth + 1, context=context)
+        mx = _resolve_constant_scalar(src.inputs["Max"], depth + 1, context=context)
         if mn is None or mx is None:
             return None
         mode = getattr(src, "clamp_type", "MINMAX")
@@ -967,7 +658,7 @@ def _resolve_constant_scalar(sock, depth: int = 0) -> float | None:
             return None
         def _val(s):
             if s.is_linked:
-                return _resolve_constant_scalar(s, depth + 1)
+                return _resolve_constant_scalar(s, depth + 1, context=context)
             return float(s.default_value)
         fa, va, vb = _val(fac_sock), _val(a_sock), _val(b_sock)
         if fa is None or va is None or vb is None:
@@ -987,21 +678,23 @@ def _resolve_constant_scalar(sock, depth: int = 0) -> float | None:
     # Any colour-producing source the RGB resolver understands (TexImage
     # mean, Invert, Mix, HueSat, RGBCurve, ...) can feed a scalar socket via
     # luminance — Cycles' Colour→Value conversion uses the same weights.
-    rgb = _resolve_constant_socket(sock, depth)
+    rgb = _resolve_constant_socket(sock, depth, context=context)
     if rgb is not None:
         return 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]
     return None
 
 
-def _eval_math_constant(node, depth: int) -> float | None:
+def _eval_math_constant(node, depth: int, *, context=None) -> float | None:
     """Evaluate a ShaderNodeMath with constant-foldable inputs. Returns None
     when any needed input is non-foldable or the op is unsupported.
     """
+    if context is None:
+        context = ExportContext()
     op = getattr(node, "operation", "ADD")
     inputs = node.inputs
-    a = _resolve_constant_scalar(inputs[0], depth) if len(inputs) > 0 else None
-    b = _resolve_constant_scalar(inputs[1], depth) if len(inputs) > 1 else None
-    c = _resolve_constant_scalar(inputs[2], depth) if len(inputs) > 2 else None
+    a = _resolve_constant_scalar(inputs[0], depth, context=context) if len(inputs) > 0 else None
+    b = _resolve_constant_scalar(inputs[1], depth, context=context) if len(inputs) > 1 else None
+    c = _resolve_constant_scalar(inputs[2], depth, context=context) if len(inputs) > 2 else None
     if a is None:
         return None
     unary = {"SQRT", "INVERSE_SQRT", "ABSOLUTE", "EXPONENT", "SIGN", "ROUND", "FLOOR", "CEIL",
@@ -1016,7 +709,7 @@ def _eval_math_constant(node, depth: int) -> float | None:
     except ValueError as ex:
         # Unsupported operations and invalid domains remain non-foldable.
         if "unknown Math op" in str(ex):
-            _warn(f"math-fold-op:{op}", f"{_node_tag(node)}: op={op!r} can't be constant-folded")
+            context.warn(f"math-fold-op:{op}", f"{_node_tag(node)}: op={op!r} can't be constant-folded")
         return None
 
 
@@ -1078,17 +771,19 @@ def _blackbody_to_linear_rgb(kelvin: float) -> list[float]:
 # wrong thing is worse than rendering a homogeneous approximation.
 
 
-def _vol_color_input(sock):
+def _vol_color_input(sock, *, context=None):
     """Resolve a Color socket on a volume node to a constant RGB triple.
     Falls back to the socket default with a warning if procedurally driven.
     """
+    if context is None:
+        context = ExportContext()
     if sock is None:
         return [1.0, 1.0, 1.0]
     if sock.is_linked:
-        const = _socket_constant_rgb(sock)
+        const = _socket_constant_rgb(sock, context=context)
         if const is not None:
             return list(const)
-        _warn(
+        context.warn(
             f"vol-color:{sock.name}",
             f"volume {sock.name!r} is procedurally driven — baking to socket default",
         )
@@ -1096,11 +791,13 @@ def _vol_color_input(sock):
     return [float(v[0]), float(v[1]), float(v[2])]
 
 
-def _vol_scalar_input(sock, default: float = 0.0) -> float:
+def _vol_scalar_input(sock, default: float = 0.0, *, context=None) -> float:
+    if context is None:
+        context = ExportContext()
     if sock is None:
         return default
     if sock.is_linked:
-        _warn(
+        context.warn(
             f"vol-scalar:{sock.name}",
             f"volume {sock.name!r} is linked — using socket default {sock.default_value}",
         )
@@ -1110,28 +807,30 @@ def _vol_scalar_input(sock, default: float = 0.0) -> float:
         return default
 
 
-def _resolve_volume_coeffs(node):
+def _resolve_volume_coeffs(node, *, context=None):
     """Walk a volume shader node and return (σ_s, σ_a, σ_e, anisotropy).
 
     All three coefficients are RGB lists, already pre-multiplied by density
     so the caller can sum them across Add/Mix subgraphs without juggling a
     second density field. Returns None for unsupported nodes.
     """
+    if context is None:
+        context = ExportContext()
     bl = node.bl_idname
     if bl == "ShaderNodeEmission":
-        color = _vol_color_input(node.inputs.get("Color"))
-        strength = _vol_scalar_input(node.inputs.get("Strength"), 1.0)
+        color = _vol_color_input(node.inputs.get("Color"), context=context)
+        strength = _vol_scalar_input(node.inputs.get("Strength"), 1.0, context=context)
         return [0.0] * 3, [0.0] * 3, [c * strength for c in color], 0.0
     if bl == "ShaderNodeVolumePrincipled":
-        color = _vol_color_input(node.inputs.get("Color"))
-        density = _vol_scalar_input(node.inputs.get("Density"), 1.0)
-        absorption = _vol_color_input(node.inputs.get("Absorption Color"))
-        anisotropy = _vol_scalar_input(node.inputs.get("Anisotropy"), 0.0)
-        em_color = _vol_color_input(node.inputs.get("Emission Color"))
-        em_strength = _vol_scalar_input(node.inputs.get("Emission Strength"), 0.0)
-        bb_intensity = _vol_scalar_input(node.inputs.get("Blackbody Intensity"), 0.0)
-        bb_tint = _vol_color_input(node.inputs.get("Blackbody Tint"))
-        bb_temp = _vol_scalar_input(node.inputs.get("Temperature"), 1000.0)
+        color = _vol_color_input(node.inputs.get("Color"), context=context)
+        density = _vol_scalar_input(node.inputs.get("Density"), 1.0, context=context)
+        absorption = _vol_color_input(node.inputs.get("Absorption Color"), context=context)
+        anisotropy = _vol_scalar_input(node.inputs.get("Anisotropy"), 0.0, context=context)
+        em_color = _vol_color_input(node.inputs.get("Emission Color"), context=context)
+        em_strength = _vol_scalar_input(node.inputs.get("Emission Strength"), 0.0, context=context)
+        bb_intensity = _vol_scalar_input(node.inputs.get("Blackbody Intensity"), 0.0, context=context)
+        bb_tint = _vol_color_input(node.inputs.get("Blackbody Tint"), context=context)
+        bb_temp = _vol_scalar_input(node.inputs.get("Temperature"), 1000.0, context=context)
         sigma_s = [color[i] * density for i in range(3)]
         sigma_a = [absorption[i] * density for i in range(3)]
         sigma_e = [em_color[i] * em_strength * density for i in range(3)]
@@ -1143,22 +842,22 @@ def _resolve_volume_coeffs(node):
 
     if bl == "ShaderNodeVolumeCoefficients":
         return (
-            _vol_color_input(node.inputs.get("Scatter Coefficients")),
-            _vol_color_input(node.inputs.get("Absorption Coefficients")),
-            _vol_color_input(node.inputs.get("Emission Coefficients")),
-            _vol_scalar_input(node.inputs.get("Anisotropy"), 0.0),
+            _vol_color_input(node.inputs.get("Scatter Coefficients"), context=context),
+            _vol_color_input(node.inputs.get("Absorption Coefficients"), context=context),
+            _vol_color_input(node.inputs.get("Emission Coefficients"), context=context),
+            _vol_scalar_input(node.inputs.get("Anisotropy"), 0.0, context=context),
         )
 
     if bl == "ShaderNodeVolumeAbsorption":
-        color = _vol_color_input(node.inputs.get("Color"))
-        density = _vol_scalar_input(node.inputs.get("Density"), 1.0)
+        color = _vol_color_input(node.inputs.get("Color"), context=context)
+        density = _vol_scalar_input(node.inputs.get("Density"), 1.0, context=context)
         sigma_a = [color[i] * density for i in range(3)]
         return [0.0, 0.0, 0.0], sigma_a, [0.0, 0.0, 0.0], 0.0
 
     if bl == "ShaderNodeVolumeScatter":
-        color = _vol_color_input(node.inputs.get("Color"))
-        density = _vol_scalar_input(node.inputs.get("Density"), 1.0)
-        anisotropy = _vol_scalar_input(node.inputs.get("Anisotropy"), 0.0)
+        color = _vol_color_input(node.inputs.get("Color"), context=context)
+        density = _vol_scalar_input(node.inputs.get("Density"), 1.0, context=context)
+        anisotropy = _vol_scalar_input(node.inputs.get("Anisotropy"), 0.0, context=context)
         sigma_s = [color[i] * density for i in range(3)]
         return sigma_s, [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], anisotropy
 
@@ -1167,8 +866,8 @@ def _resolve_volume_coeffs(node):
         in_b = _follow_reroutes(node.inputs[1])
         a = in_a.links[0].from_node if in_a.is_linked else None
         b = in_b.links[0].from_node if in_b.is_linked else None
-        ca = _resolve_volume_coeffs(a) if a else None
-        cb = _resolve_volume_coeffs(b) if b else None
+        ca = _resolve_volume_coeffs(a, context=context) if a else None
+        cb = _resolve_volume_coeffs(b, context=context) if b else None
         if ca is None and cb is None:
             return None
         if ca is None:
@@ -1196,7 +895,7 @@ def _resolve_volume_coeffs(node):
     if bl == "ShaderNodeMixShader":
         fac_sock = node.inputs.get("Fac")
         if fac_sock is None or fac_sock.is_linked:
-            _warn(
+            context.warn(
                 f"vol-mix:{node.name}",
                 f"MixShader on volume has linked/missing Fac — using fac=0.5",
             )
@@ -1208,8 +907,8 @@ def _resolve_volume_coeffs(node):
         in_b = _follow_reroutes(node.inputs[2])
         a = in_a.links[0].from_node if in_a.is_linked else None
         b = in_b.links[0].from_node if in_b.is_linked else None
-        ca = _resolve_volume_coeffs(a) if a else None
-        cb = _resolve_volume_coeffs(b) if b else None
+        ca = _resolve_volume_coeffs(a, context=context) if a else None
+        cb = _resolve_volume_coeffs(b, context=context) if b else None
         if ca is None and cb is None:
             return None
         zero = ([0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], 0.0)
@@ -1226,12 +925,14 @@ def _resolve_volume_coeffs(node):
             g_a * (1.0 - fac) + g_b * fac,
         )
 
-    _warn(f"vol-unsup:{bl}", f"unsupported volume node: {bl}")
+    context.warn(f"vol-unsup:{bl}", f"unsupported volume node: {bl}")
     return None
 
 
-def _volume_phase(node):
+def _volume_phase(node, *, context=None):
     """Preserve a shared phase through Add/Mix; reject incompatible phase mixtures."""
+    if context is None:
+        context = ExportContext()
     if node.bl_idname in {"ShaderNodeAddShader", "ShaderNodeMixShader"}:
         sockets = list(node.inputs)[-2:]
         if node.bl_idname == "ShaderNodeMixShader" and not node.inputs[0].is_linked:
@@ -1245,9 +946,9 @@ def _volume_phase(node):
             socket = _follow_reroutes(socket)
             if socket.is_linked:
                 child = socket.links[0].from_node
-                coefficients = _resolve_volume_coeffs(child)
+                coefficients = _resolve_volume_coeffs(child, context=context)
                 if coefficients and max(coefficients[0]) > 0:
-                    phases.append(_volume_phase(child))
+                    phases.append(_volume_phase(child, context=context))
         if phases and any(phase != phases[0] for phase in phases[1:]):
             raise ValueError(
                 "Volume Mix/Add with different phase functions is not supported"
@@ -1261,7 +962,7 @@ def _volume_phase(node):
         "MIE": 4,
     }.get(getattr(node, "phase", "HENYEY_GREENSTEIN"), 0)
     parameters = [
-        _vol_scalar_input(node.inputs.get(name), default)
+        _vol_scalar_input(node.inputs.get(name), default, context=context)
         for name, default in (
             ("IOR", 1.33),
             ("Backscatter", 0.1),
@@ -1272,13 +973,15 @@ def _volume_phase(node):
     return phase, parameters
 
 
-def _resolve_volume(volume_socket) -> dict | None:
+def _resolve_volume(volume_socket, *, context=None) -> dict | None:
     """Convert a Cycles Volume output socket into a renderer VolumeParams.
 
     Returns None when the socket is unlinked, when the resolved coefficients
     are all zero (vacuum — no point shipping it), or when no supported
     volume node is reachable.
     """
+    if context is None:
+        context = ExportContext()
     if volume_socket is None:
         return None
     volume_socket = _follow_reroutes(volume_socket)
@@ -1289,17 +992,17 @@ def _resolve_volume(volume_socket) -> dict | None:
     # Preserve ray-dependent emission (e.g. camera-only fog) in the shader VM.
     from .shader_graph import compile_emission, UnsupportedNode
     try:
-        emission_graph = compile_emission(volume_socket, None, None)
+        emission_graph = compile_emission(volume_socket, None, None, context=context)
     except UnsupportedNode:
         emission_graph = None
     if emission_graph is not None:
         return {"color": [0.0] * 3, "density": 1.0,
                 "emission_graph": emission_graph}
-    coeffs = _resolve_volume_coeffs(src)
+    coeffs = _resolve_volume_coeffs(src, context=context)
     if coeffs is None:
         return None
     sigma_s, sigma_a, sigma_e, anisotropy = coeffs
-    phase, phase_params = _volume_phase(src)
+    phase, phase_params = _volume_phase(src, context=context)
     if (max(sigma_s) <= 0.0 and max(sigma_a) <= 0.0 and max(sigma_e) <= 0.0):
         return None
     # Renderer convention is σ_s = color × density. We've already folded
@@ -1321,19 +1024,21 @@ def _resolve_volume(volume_socket) -> dict | None:
 _IDENTITY_UV = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
 
 
-def _first_teximage_uv_transform(node_tree) -> list[float] | None:
+def _first_teximage_uv_transform(node_tree, *, context=None) -> list[float] | None:
     """Return the first non-identity UV affine attached to a TexImage's Vector
     input in the tree, or None. Scanning the TexImage nodes directly avoids
     picking up Mapping nodes that only drive procedurals (e.g. Noise Texture
     for bump) — applying such a Mapping to an unlinked TexImage would stretch
     it spuriously.
     """
+    if context is None:
+        context = ExportContext()
     if node_tree is None:
         return None
     for n in node_tree.nodes:
         if n.bl_idname != "ShaderNodeTexImage":
             continue
-        affine = _tex_node_uv_transform(n)
+        affine = _tex_node_uv_transform(n, context=context)
         if affine != list(_IDENTITY_UV):
             return affine
     return None
@@ -1357,18 +1062,20 @@ def _invert_affine_2x3(m: list[float]) -> list[float]:
             inv_c, inv_d, -(inv_c * tx + inv_d * ty)]
 
 
-def _mapping_to_affine(node) -> list[float]:
+def _mapping_to_affine(node, *, context=None) -> list[float]:
     """Convert a Mapping node to a 2x3 affine matrix over UV.
 
     Supports POINT (apply transform to input coords) and TEXTURE (apply the
     inverse — see Blender's vector_math_mapping). VECTOR/NORMAL fall back to
     identity with a warning.
     """
+    if context is None:
+        context = ExportContext()
     if node is None:
         return list(_IDENTITY_UV)
     vector_type = getattr(node, "vector_type", "POINT")
     if vector_type not in ("POINT", "TEXTURE"):
-        _warn(
+        context.warn(
             f"map-vtype:{node.as_pointer()}",
             f"Mapping {_node_tag(node)}: vector_type={vector_type!r} not "
             f"supported (only POINT/TEXTURE) — UV transform ignored",
@@ -1395,9 +1102,9 @@ def _mapping_to_affine(node) -> list[float]:
             xs, ys, zs = src.inputs.get("X"), src.inputs.get("Y"), src.inputs.get("Z")
             if xs is None or ys is None or zs is None:
                 return None, False
-            x = _resolve_constant_scalar(xs) if xs.is_linked else _socket_f(xs)
-            y = _resolve_constant_scalar(ys) if ys.is_linked else _socket_f(ys)
-            z = _resolve_constant_scalar(zs) if zs.is_linked else _socket_f(zs)
+            x = _resolve_constant_scalar(xs, context=context) if xs.is_linked else _socket_f(xs)
+            y = _resolve_constant_scalar(ys, context=context) if ys.is_linked else _socket_f(ys)
+            z = _resolve_constant_scalar(zs, context=context) if zs.is_linked else _socket_f(zs)
             if x is None or y is None or z is None:
                 return None, False
             return [x, y, z], False
@@ -1445,7 +1152,7 @@ def _mapping_to_affine(node) -> list[float]:
             if n in node.inputs and node.inputs[n].is_linked:
                 _, q = _vec3_const(node.inputs[n])
                 if not q and _vec3_const(node.inputs[n])[0] is None:
-                    _warn(
+                    context.warn(
                         f"map-linked:{node.as_pointer()}:{n}",
                         f"Mapping {_node_tag(node)}: {n} is driven by a non-"
                         f"foldable chain — UV transform uses default constant only",
@@ -1506,18 +1213,20 @@ _PASSTHROUGH_INPUTS: dict[str, tuple[str, ...] | None] = {
 }
 
 
-def _socket_linked_image(sock, depth: int = 0) -> bpy.types.Image | None:
+def _socket_linked_image(sock, depth: int = 0, *, context=None) -> bpy.types.Image | None:
     """Return just the image feeding a non-base-color socket.
 
     Kept as a thin wrapper for callers that don't bake the chain (currently
     only the alpha-cutout path in `_from_principled`). Prefer
     `_export_linked_scalar_texture` for roughness / metallic / bump inputs.
     """
-    img, _ = _socket_linked_image_with_chain(sock, depth)
+    if context is None:
+        context = ExportContext()
+    img, _ = _socket_linked_image_with_chain(sock, depth, context=context)
     return img
 
 
-def _export_linked_scalar_texture(sock, writer, textures):
+def _export_linked_scalar_texture(sock, writer, textures, *, context=None):
     """Resolve a scalar input socket to a (linear) baked texture.
 
     The chain transforms still apply per-channel; the GPU only reads the R
@@ -1525,10 +1234,12 @@ def _export_linked_scalar_texture(sock, writer, textures):
     fine — R after the bake is what the GPU will sample. Returns texture id
     or None.
     """
-    img, chain = _socket_linked_image_with_chain(sock)
+    if context is None:
+        context = ExportContext()
+    img, chain = _socket_linked_image_with_chain(sock, context=context)
     if img is None:
         return None
-    return export_image_texture(img, writer, textures, "linear", chain=chain)
+    return export_image_texture(img, writer, textures, "linear", chain=chain, context=context)
 
 
 _CONSTANT_LEAF_NODES = frozenset((
@@ -1681,10 +1392,9 @@ def _node_mean_color(node, output_sock) -> list[float] | None:
 # Stack of ShaderNodeGroup nodes currently being resolved by _from_group.
 # Lets chain traversal jump back out through NodeGroupInput → parent socket
 # without threading the stack through every BSDF helper.
-_GROUP_STACK: list = []
 
 
-def _socket_linked_image_with_chain(sock, depth: int = 0, group_stack=None):
+def _socket_linked_image_with_chain(sock, depth: int = 0, group_stack=None, *, context=None):
     """Return (image, transforms_chain) feeding a color socket.
 
     `transforms_chain` is a tuple of (id_tuple, apply_fn) pairs that should be
@@ -1695,16 +1405,18 @@ def _socket_linked_image_with_chain(sock, depth: int = 0, group_stack=None):
 
     `group_stack` tracks nested ShaderNodeGroup traversals so a chain that
     enters a NodeGroupInput can follow back out to the corresponding socket on
-    the parent group node. Defaults to the live `_GROUP_STACK` so BSDF helpers
+    the parent group node. Defaults to the live `context.group_stack` so BSDF helpers
     don't need to thread it through.
     """
+    if context is None:
+        context = ExportContext()
     if group_stack is None:
-        group_stack = tuple(_GROUP_STACK)
+        group_stack = tuple(context.group_stack)
     sock = _follow_reroutes(sock)
     if not sock.is_linked:
         return None, ()
     if depth > 12:
-        _warn(
+        context.warn(
             f"depth:{id(sock)}",
             f"socket {sock.name!r}: chain deeper than 12 nodes — giving up",
         )
@@ -1714,7 +1426,7 @@ def _socket_linked_image_with_chain(sock, depth: int = 0, group_stack=None):
     from_socket = link.from_socket
     if src.bl_idname == "ShaderNodeTexImage":
         if src.image is None:
-            _warn(
+            context.warn(
                 f"texnoimage:{src.as_pointer()}",
                 f"TexImage {src.name!r} has no image assigned",
             )
@@ -1725,18 +1437,18 @@ def _socket_linked_image_with_chain(sock, depth: int = 0, group_stack=None):
         # path (e.g. Mix) handles the constant via _socket_constant_rgb.
         return None, ()
     if src.bl_idname == "ShaderNodeGroup":
-        return _follow_into_group(src, from_socket, depth, group_stack)
+        return _follow_into_group(src, from_socket, depth, group_stack, context=context)
     if src.bl_idname == "NodeGroupInput":
-        return _follow_out_of_group(from_socket, depth, group_stack)
+        return _follow_out_of_group(from_socket, depth, group_stack, context=context)
     if src.bl_idname in ("ShaderNodeMix", "ShaderNodeMixRGB"):
         # Both sides may be textures — collapse the whole Mix into one offline
         # baked texture so the chain returning from here is empty.
-        prebaked = _try_premix_two_textures(src, group_stack)
+        prebaked = _try_premix_two_textures(src, group_stack, context=context)
         if prebaked is not None:
             return prebaked, ()
-    candidates = _chain_candidates(src)
+    candidates = _chain_candidates(src, context=context)
     if candidates is None:
-        _warn(
+        context.warn(
             f"nonpassthru:{src.bl_idname}",
             f"node {_node_tag(src)} in colour chain is not recognised — "
             f"stopping traversal (the texture behind it will not be used)",
@@ -1745,20 +1457,22 @@ def _socket_linked_image_with_chain(sock, depth: int = 0, group_stack=None):
     for name, inp in candidates:
         if not inp.is_linked:
             continue
-        img, sub_chain = _socket_linked_image_with_chain(inp, depth + 1, group_stack)
+        img, sub_chain = _socket_linked_image_with_chain(inp, depth + 1, group_stack, context=context)
         if img is None:
             continue
-        xform = _node_color_transform(src, chain_input_name=name)
+        xform = _node_color_transform(src, chain_input_name=name, context=context)
         # Inner (closer to texture) first, then outer.
         chain = sub_chain + ((xform,) if xform is not None else ())
         return img, chain
     return None, ()
 
 
-def _follow_into_group(group_node, output_sock, depth, group_stack):
+def _follow_into_group(group_node, output_sock, depth, group_stack, *, context=None):
     """Enter a ShaderNodeGroup: find the NodeGroupOutput input matching the
     socket whose value the chain wants, then keep following backwards.
     """
+    if context is None:
+        context = ExportContext()
     tree = group_node.node_tree
     if tree is None:
         return None, ()
@@ -1776,16 +1490,19 @@ def _follow_into_group(group_node, output_sock, depth, group_stack):
     if inner is None:
         return None, ()
     return _socket_linked_image_with_chain(
-        inner, depth + 1, group_stack + (group_node,)
+        inner, depth + 1, group_stack + (group_node,),
+        context=context,
     )
 
 
-def _follow_out_of_group(output_sock, depth, group_stack):
+def _follow_out_of_group(output_sock, depth, group_stack, *, context=None):
     """Exit a ShaderNodeGroup via NodeGroupInput: look up the matching socket
     on the most recent parent group node and continue the chain there.
     """
+    if context is None:
+        context = ExportContext()
     if not group_stack:
-        _warn(
+        context.warn(
             f"groupin-orphan:{output_sock.name}",
             f"NodeGroupInput.{output_sock.name!r} encountered without an "
             f"outer group context — chain stopped",
@@ -1796,25 +1513,27 @@ def _follow_out_of_group(output_sock, depth, group_stack):
     if external is None:
         return None, ()
     if external.is_linked:
-        return _socket_linked_image_with_chain(external, depth + 1, group_stack[:-1])
+        return _socket_linked_image_with_chain(external, depth + 1, group_stack[:-1], context=context)
     # Unlinked: the group's external default could still be a baked-in colour,
     # but there's no texture chain to walk. Returning None lets the caller
     # fall back to its own constant handling (`_socket_constant_rgb`).
     return None, ()
 
 
-def _chain_candidates(src):
+def _chain_candidates(src, *, context=None):
     """Return `[(name, socket), ...]` to follow through `src`, or None if `src`
     isn't a recognised pass-through node.
 
     Special-cases `ShaderNodeMix` because its inputs list contains duplicate
     A/B sockets for each data_type — we only want the RGBA ones.
     """
+    if context is None:
+        context = ExportContext()
     bl = src.bl_idname
     if bl == "ShaderNodeMix":
         data_type = getattr(src, "data_type", "RGBA")
         if data_type != "RGBA":
-            _warn(
+            context.warn(
                 f"mix-dt:{src.as_pointer()}",
                 f"node {_node_tag(src)}: data_type={data_type!r} not "
                 f"supported (only RGBA)",
@@ -1822,7 +1541,7 @@ def _chain_candidates(src):
             return None
         _, a, b = _mix_rgba_sockets(src)
         if a is None or b is None:
-            _warn(
+            context.warn(
                 f"mix-sock:{src.as_pointer()}",
                 f"node {_node_tag(src)}: could not locate RGBA A/B sockets",
             )
@@ -1854,7 +1573,7 @@ def _mix_rgba_sockets(node):
     return fac, a, b
 
 
-def _node_color_transform(node, chain_input_name=None):
+def _node_color_transform(node, chain_input_name=None, *, context=None):
     """Return (id_tuple, apply_fn) for a colour-modifying node, or None.
 
     `id_tuple` is a hashable identifier used in the texture cache key so that
@@ -1864,31 +1583,33 @@ def _node_color_transform(node, chain_input_name=None):
     which socket the texture chain comes in on (matters for two-input nodes
     like Mix — the "other" side has to be constant to be bakeable).
     """
+    if context is None:
+        context = ExportContext()
     bl = node.bl_idname
     if bl == "ShaderNodeRGBCurve":
         return _rgbcurve_transform(node)
     if bl == "ShaderNodeGamma":
-        return _gamma_transform(node)
+        return _gamma_transform(node, context=context)
     if bl == "ShaderNodeBrightContrast":
-        return _brightcontrast_transform(node)
+        return _brightcontrast_transform(node, context=context)
     if bl == "ShaderNodeInvert":
-        return _invert_transform(node)
+        return _invert_transform(node, context=context)
     if bl == "ShaderNodeHueSaturation":
-        return _huesat_transform(node)
+        return _huesat_transform(node, context=context)
     if bl == "ShaderNodeValToRGB":
         return _colorramp_transform(node)
     if bl == "ShaderNodeClamp":
-        return _clamp_transform(node)
+        return _clamp_transform(node, context=context)
     if bl in ("ShaderNodeMix", "ShaderNodeMixRGB"):
-        return _mix_transform(node, chain_input_name)
+        return _mix_transform(node, chain_input_name, context=context)
     if bl == "ShaderNodeMath":
-        return _math_transform(node, chain_input_name)
+        return _math_transform(node, chain_input_name, context=context)
     if bl in ("ShaderNodeCombineColor", "ShaderNodeCombineRGB"):
-        return _combine_color_transform(node, chain_input_name)
+        return _combine_color_transform(node, chain_input_name, context=context)
     return None
 
 
-def _resolve_channel_extract(sock, expected_separate_node, depth: int = 0):
+def _resolve_channel_extract(sock, expected_separate_node, depth: int = 0, *, context=None):
     """If `sock` is fed by a chain that ultimately extracts a single
     channel of `expected_separate_node` (a ShaderNodeSeparate{Color,RGB}),
     optionally through a few per-channel transforms (Invert / Math),
@@ -1901,6 +1622,8 @@ def _resolve_channel_extract(sock, expected_separate_node, depth: int = 0):
     Otherwise `None`. Used by `_combine_color_transform` to fold the
     "Invert G channel-only" idiom (Separate → Invert(G) → Combine).
     """
+    if context is None:
+        context = ExportContext()
     if depth > 6:
         return None
     sock = _follow_reroutes(sock)
@@ -1924,13 +1647,13 @@ def _resolve_channel_extract(sock, expected_separate_node, depth: int = 0):
             return None
         return ch, []
     if bl == "ShaderNodeInvert":
-        inner = _resolve_channel_extract(src.inputs["Color"], expected_separate_node, depth + 1)
+        inner = _resolve_channel_extract(src.inputs["Color"], expected_separate_node, depth + 1, context=context)
         if inner is None:
             return None
         ch, xforms = inner
         # Honour the Fac socket so an artist who dialed the inversion
         # back to half-strength still gets ≈the right curve.
-        fac = _resolve_constant_scalar(src.inputs.get("Fac")) if src.inputs.get("Fac") else 1.0
+        fac = _resolve_constant_scalar(src.inputs.get("Fac"), context=context) if src.inputs.get("Fac") else 1.0
         if fac is None:
             return None
         def apply_invert(s):
@@ -1940,7 +1663,7 @@ def _resolve_channel_extract(sock, expected_separate_node, depth: int = 0):
     if bl == "ShaderNodeMath":
         inner = None
         for inp in src.inputs:
-            r = _resolve_channel_extract(inp, expected_separate_node, depth + 1)
+            r = _resolve_channel_extract(inp, expected_separate_node, depth + 1, context=context)
             if r is not None:
                 inner = (inp, r)
                 break
@@ -1953,7 +1676,7 @@ def _resolve_channel_extract(sock, expected_separate_node, depth: int = 0):
         for inp in src.inputs:
             if inp is chain_inp:
                 continue
-            v = _resolve_constant_scalar(inp) if inp.is_linked else _socket_f(inp)
+            v = _resolve_constant_scalar(inp, context=context) if inp.is_linked else _socket_f(inp)
             if v is None:
                 return None
             others.append(v)
@@ -1972,7 +1695,7 @@ def _resolve_channel_extract(sock, expected_separate_node, depth: int = 0):
     return None
 
 
-def _combine_color_transform(node, chain_input_name=None):
+def _combine_color_transform(node, chain_input_name=None, *, context=None):
     """Bake CombineColor / CombineRGB.
 
     Two supported shapes:
@@ -1984,10 +1707,12 @@ def _combine_color_transform(node, chain_input_name=None):
          transforms (Invert / Math). This is the canonical "Invert G"
          normal-map convention swap (lone_monk's `wood - table` group).
     """
+    if context is None:
+        context = ExportContext()
     import numpy as np
     mode = getattr(node, "mode", "RGB")
     if mode != "RGB":
-        _warn(
+        context.warn(
             f"combine-mode:{node.as_pointer()}:{mode}",
             f"{_node_tag(node)}: mode={mode!r} not supported (RGB only) — "
             f"effect not baked",
@@ -2030,7 +1755,7 @@ def _combine_color_transform(node, chain_input_name=None):
             if sock is None or not sock.is_linked:
                 ok_all = False
                 break
-            r = _resolve_channel_extract(sock, sep_node)
+            r = _resolve_channel_extract(sock, sep_node, context=context)
             if r is None:
                 ok_all = False
                 break
@@ -2057,11 +1782,11 @@ def _combine_color_transform(node, chain_input_name=None):
         if sock is None:
             return None
         if sock.is_linked:
-            v = _resolve_constant_scalar(sock)
+            v = _resolve_constant_scalar(sock, context=context)
         else:
             v = _socket_f(sock)
         if v is None:
-            _warn(
+            context.warn(
                 f"combine-leaf:{node.as_pointer()}:{n}",
                 f"{_node_tag(node)}: non-chain input {n!r} not foldable to a "
                 f"constant — effect not baked",
@@ -2083,7 +1808,7 @@ def _combine_color_transform(node, chain_input_name=None):
     return id_tuple, apply
 
 
-def _math_transform(node, chain_input_name=None):
+def _math_transform(node, chain_input_name=None, *, context=None):
     """Bake a scalar Math node into an RGB transform when every non-chain
     input folds to a constant.
 
@@ -2095,6 +1820,8 @@ def _math_transform(node, chain_input_name=None):
     ceiling_AO by 0.8 — without this the factor saturates to 1 and the baked
     texture darkens twice as much as Cycles).
     """
+    if context is None:
+        context = ExportContext()
     import numpy as np
     op = getattr(node, "operation", "ADD")
     use_clamp = bool(getattr(node, "use_clamp", False))
@@ -2111,9 +1838,9 @@ def _math_transform(node, chain_input_name=None):
     for i, inp in enumerate(inputs):
         if i == chain_idx:
             continue
-        v = _resolve_constant_scalar(inp) if inp.is_linked else _socket_f(inp)
+        v = _resolve_constant_scalar(inp, context=context) if inp.is_linked else _socket_f(inp)
         if v is None:
-            _warn(
+            context.warn(
                 f"math-chain:{node.as_pointer()}:{op}",
                 f"{_node_tag(node)}: op={op} non-chain input {inp.name!r} not "
                 f"foldable to a constant — effect not baked",
@@ -2129,7 +1856,7 @@ def _math_transform(node, chain_input_name=None):
 
     supported = {"ADD", "SUBTRACT", "MULTIPLY", "DIVIDE", "POWER", "MULTIPLY_ADD", "MINIMUM", "MAXIMUM"}
     if op not in supported or (op == "MULTIPLY_ADD" and len(other_vals) < 2):
-        _warn(f"math-op:{op}", f"{_node_tag(node)}: op={op!r} not baked")
+        context.warn(f"math-op:{op}", f"{_node_tag(node)}: op={op!r} not baked")
         return None
     b = other_vals[0] if other_vals else 0.0
     # Preserve the existing exporter's near-zero constant-denominator policy.
@@ -2170,9 +1897,11 @@ def _rgbcurve_transform(node):
     return id_tuple, lambda rgb: node_ops.apply(settings, rgb)
 
 
-def _gamma_transform(node):
+def _gamma_transform(node, *, context=None):
+    if context is None:
+        context = ExportContext()
     if node.inputs["Gamma"].is_linked:
-        _warn(
+        context.warn(
             f"gamma-linked:{node.as_pointer()}",
             f"{_node_tag(node)}: Gamma input is linked — effect not baked",
         )
@@ -2184,11 +1913,13 @@ def _gamma_transform(node):
     return id_tuple, lambda rgb: node_ops.apply(settings, rgb)
 
 
-def _brightcontrast_transform(node):
+def _brightcontrast_transform(node, *, context=None):
     # Blender formula: a = 1 + contrast; b = 0.5*(1 - a) + bright;
     # out = max(a*col + b, 0).
+    if context is None:
+        context = ExportContext()
     if node.inputs["Bright"].is_linked or node.inputs["Contrast"].is_linked:
-        _warn(
+        context.warn(
             f"brcon-linked:{node.as_pointer()}",
             f"{_node_tag(node)}: Bright/Contrast input is linked — effect not baked",
         )
@@ -2200,9 +1931,11 @@ def _brightcontrast_transform(node):
     return id_tuple, lambda rgb: node_ops.apply(settings, rgb)
 
 
-def _invert_transform(node):
+def _invert_transform(node, *, context=None):
+    if context is None:
+        context = ExportContext()
     if node.inputs["Fac"].is_linked:
-        _warn(
+        context.warn(
             f"inv-linked:{node.as_pointer()}",
             f"{_node_tag(node)}: Fac input is linked — effect not baked",
         )
@@ -2213,21 +1946,23 @@ def _invert_transform(node):
     return id_tuple, lambda rgb: node_ops.apply(dict(type="invert", fac=fac), rgb)
 
 
-def _huesat_transform(node):
+def _huesat_transform(node, *, context=None):
     # Each scalar parameter on this node may be driven by a chain (e.g. a
     # ColorRamp into Hue, or a Math op driving Fac). We accept the chain as
     # long as it folds to a constant — that's enough for lone_monk's
     # `leather - book - cover` materials, where the artist clamped the Fac
     # via Math.MULTIPLY but the multiplicands are all constants.
+    if context is None:
+        context = ExportContext()
     def _const_or_warn(name: str):
         sock = node.inputs.get(name)
         if sock is None:
             return 1.0 if name == "Fac" else (0.5 if name == "Hue" else 1.0)
         if not sock.is_linked:
             return _socket_f(sock)
-        v = _resolve_constant_scalar(sock)
+        v = _resolve_constant_scalar(sock, context=context)
         if v is None:
-            _warn(
+            context.warn(
                 f"hsv-linked:{node.as_pointer()}:{name}",
                 f"{_node_tag(node)}: {name} input is linked and not foldable "
                 f"to a constant — effect not baked",
@@ -2274,9 +2009,11 @@ def _colorramp_transform(node):
     return id_tuple, lambda rgb: node_ops.apply(settings, rgb)
 
 
-def _clamp_transform(node):
+def _clamp_transform(node, *, context=None):
+    if context is None:
+        context = ExportContext()
     if node.inputs["Min"].is_linked or node.inputs["Max"].is_linked:
-        _warn(
+        context.warn(
             f"clamp-linked:{node.as_pointer()}",
             f"{_node_tag(node)}: Min/Max input is linked — effect not baked",
         )
@@ -2370,17 +2107,19 @@ def _apply_mix_blend(col1, col2, fac, blend: str, use_clamp: bool):
     return node_ops.apply(dict(type="mix", blend=blend.lower(), clamp=use_clamp), col1, col2, fac)
 
 
-def _mix_transform(node, chain_input_name):
+def _mix_transform(node, chain_input_name, *, context=None):
     """Bake a Mix node when the non-chain input is a constant colour.
 
     For two-texture mixes (both inputs driven by chains) the pre-bake step in
     `_try_premix_two_textures` collapses the entire Mix into a synthetic
     texture, so the chain reaching this point sees an unlinked operand.
     """
+    if context is None:
+        context = ExportContext()
     import numpy as np
     fac_sock, a_sock, b_sock, blend, use_clamp, ok = _mix_node_params(node)
     if not ok:
-        _warn(
+        context.warn(
             f"mix-dt2:{node.as_pointer()}",
             f"{_node_tag(node)}: data_type not RGBA / sockets unresolved — "
             f"effect not baked",
@@ -2389,16 +2128,16 @@ def _mix_transform(node, chain_input_name):
     is_a_chain = chain_input_name in ("A", "Color1")
 
     if blend not in _SUPPORTED_MIX_BLENDS:
-        _warn(
+        context.warn(
             f"mix-blend:{node.as_pointer()}:{blend}",
             f"{_node_tag(node)}: blend_type={blend!r} not supported — "
             f"effect passed through without baking",
         )
         return None
     if fac_sock.is_linked:
-        fac = _resolve_constant_scalar(fac_sock)
+        fac = _resolve_constant_scalar(fac_sock, context=context)
         if fac is None:
-            _warn(
+            context.warn(
                 f"mix-fac-linked:{node.as_pointer()}",
                 f"{_node_tag(node)}: Factor is linked and not foldable to a "
                 f"constant — effect not baked",
@@ -2407,9 +2146,9 @@ def _mix_transform(node, chain_input_name):
     else:
         fac = _socket_f(fac_sock)
     other_sock = b_sock if is_a_chain else a_sock
-    other_const = _socket_constant_rgb(other_sock)
+    other_const = _socket_constant_rgb(other_sock, context=context)
     if other_const is None:
-        _warn(
+        context.warn(
             f"mix-other-linked:{node.as_pointer()}",
             f"{_node_tag(node)}: non-chain input {other_sock.name!r} is "
             f"driven by another chain (two-texture mix) — effect not baked",
@@ -2432,7 +2171,7 @@ def _mix_transform(node, chain_input_name):
     return id_tuple, apply
 
 
-def _try_premix_two_textures(mix_node, group_stack):
+def _try_premix_two_textures(mix_node, group_stack, *, context=None):
     """Pre-bake a Mix into one `_PreBakedTexture` when the shape can't be
     collapsed by the in-chain `_mix_transform` path.
 
@@ -2448,22 +2187,25 @@ def _try_premix_two_textures(mix_node, group_stack):
     nothing texture-shaped left to bake (all operands are constants, which the
     constant-folding path will pick up instead).
     """
+    if context is None:
+        context = ExportContext()
     import numpy as np
     fac_sock, a_sock, b_sock, blend, use_clamp, ok = _mix_node_params(mix_node)
     if not ok or blend not in _SUPPORTED_MIX_BLENDS:
         return None
-    img_a, chain_a = _socket_linked_image_with_chain(a_sock, group_stack=group_stack)
-    img_b, chain_b = _socket_linked_image_with_chain(b_sock, group_stack=group_stack)
+    img_a, chain_a = _socket_linked_image_with_chain(a_sock, group_stack=group_stack, context=context)
+    img_b, chain_b = _socket_linked_image_with_chain(b_sock, group_stack=group_stack, context=context)
     if fac_sock.is_linked:
         img_f, chain_f = _socket_linked_image_with_chain(
-            fac_sock, group_stack=group_stack
+            fac_sock, group_stack=group_stack,
+            context=context,
         )
         if img_f is not None:
             fac_const = None
             # A textured factor forces a full premix, so it's fine if one
             # colour side is only a resolvable constant.
-            const_a = None if img_a is not None else _socket_constant_rgb(a_sock)
-            const_b = None if img_b is not None else _socket_constant_rgb(b_sock)
+            const_a = None if img_a is not None else _socket_constant_rgb(a_sock, context=context)
+            const_b = None if img_b is not None else _socket_constant_rgb(b_sock, context=context)
             if img_a is None and const_a is None:
                 return None
             if img_b is None and const_b is None:
@@ -2473,7 +2215,7 @@ def _try_premix_two_textures(mix_node, group_stack):
             # real constant. `_mix_transform` picks up tex-vs-const shapes, so
             # only claim the premix when both colour sides are textures.
             chain_f = ()
-            fac_scalar = _resolve_constant_scalar(fac_sock)
+            fac_scalar = _resolve_constant_scalar(fac_sock, context=context)
             if fac_scalar is None or img_a is None or img_b is None:
                 return None
             fac_const = fac_scalar
@@ -2508,15 +2250,15 @@ def _try_premix_two_textures(mix_node, group_stack):
         f"__mix2tex__|{_side_key(img_a, chain_a_id, const_a)}|"
         f"{_side_key(img_b, chain_b_id, const_b)}|{blend}|{fac_key}|{use_clamp}"
     )
-    hit = _PREMIX_CACHE.get(cache_key)
+    hit = context.premix_cache.get(cache_key)
     if hit is not None:
-        _STATS["premix_cache_hits"] += 1
+        context.stats["premix_cache_hits"] += 1
         return hit
-    _STATS["premix_cache_misses"] += 1
+    context.stats["premix_cache_misses"] += 1
 
-    baked_a = _bake_source_to_linear(img_a, chain_a) if img_a is not None else None
-    baked_b = _bake_source_to_linear(img_b, chain_b) if img_b is not None else None
-    baked_f = _bake_source_to_linear(img_f, chain_f) if img_f is not None else None
+    baked_a = _bake_source_to_linear(img_a, chain_a, context=context) if img_a is not None else None
+    baked_b = _bake_source_to_linear(img_b, chain_b, context=context) if img_b is not None else None
+    baked_f = _bake_source_to_linear(img_f, chain_f, context=context) if img_f is not None else None
     sizes = [(b[2], b[1]) for b in (baked_a, baked_b, baked_f) if b is not None]
     # Guaranteed non-empty: at least one of the three must be a texture, else
     # we'd have returned above.
@@ -2546,7 +2288,7 @@ def _try_premix_two_textures(mix_node, group_stack):
         fac = fac_const
     mixed = _apply_mix_blend(rgb_a, rgb_b, fac, blend, use_clamp)
     result = _PreBakedTexture(mixed, out_w, out_h, cache_key)
-    _PREMIX_CACHE[cache_key] = result
+    context.premix_cache[cache_key] = result
     return result
 
 
@@ -2563,9 +2305,11 @@ _GRAPH_MATH_OPS = frozenset((
 ))
 
 
-def _tex_node_uv_transform(tex_node) -> list[float]:
+def _tex_node_uv_transform(tex_node, *, context=None) -> list[float]:
     """Extract the UV affine feeding a TexImage.Vector. Returns identity when
     the Vector is unlinked (TexImage falls back to the mesh's default UV)."""
+    if context is None:
+        context = ExportContext()
     vec_sock = tex_node.inputs.get("Vector")
     if vec_sock is None:
         return list(_IDENTITY_UV)
@@ -2574,7 +2318,7 @@ def _tex_node_uv_transform(tex_node) -> list[float]:
         return list(_IDENTITY_UV)
     src = vec_sock.links[0].from_node
     if src.bl_idname == "ShaderNodeMapping":
-        return _mapping_to_affine(src)
+        return _mapping_to_affine(src, context=context)
     if src.bl_idname == "ShaderNodeTexCoord":
         return list(_IDENTITY_UV)
     # Anything else (procedurals, wrangler groups) loses the transform — the
@@ -2582,7 +2326,7 @@ def _tex_node_uv_transform(tex_node) -> list[float]:
     return list(_IDENTITY_UV)
 
 
-def _try_emit_color_graph(sock, writer, textures, group_stack=None, vc_attrs=None) -> dict | None:
+def _try_emit_color_graph(sock, writer, textures, group_stack=None, vc_attrs=None, *, context=None) -> dict | None:
     """Emit the legacy color-only GPU graph for the socket feeding `sock`.
 
     Supports images, Mix, Invert, selected Math operations, Hue/Saturation,
@@ -2596,8 +2340,10 @@ def _try_emit_color_graph(sock, writer, textures, group_stack=None, vc_attrs=Non
     this to set `_vertex_color_attr` on the material dict so the mesh
     exporter ships the matching per-vertex colour blob.
     """
+    if context is None:
+        context = ExportContext()
     if group_stack is None:
-        group_stack = tuple(_GROUP_STACK)
+        group_stack = tuple(context.group_stack)
     sock = _follow_reroutes(sock)
     if not sock.is_linked:
         # Just a constant colour — no graph needed, caller can use base_color.
@@ -2624,8 +2370,8 @@ def _try_emit_color_graph(sock, writer, textures, group_stack=None, vc_attrs=Non
         if bl == "ShaderNodeTexImage":
             if src.image is None:
                 return None
-            tex_id = export_image_texture(src.image, writer, textures, "srgb")
-            uv = _tex_node_uv_transform(src)
+            tex_id = export_image_texture(src.image, writer, textures, "srgb", context=context)
+            uv = _tex_node_uv_transform(src, context=context)
             idx = len(nodes)
             nodes.append({"type": "image_tex", "tex": tex_id, "uv": uv})
             memo[key] = idx
@@ -2665,7 +2411,7 @@ def _try_emit_color_graph(sock, writer, textures, group_stack=None, vc_attrs=Non
                 if fi is not None:
                     fac_spec: float | dict = {"node": fi}
                 else:
-                    fac_const = _resolve_constant_scalar(fac_sock)
+                    fac_const = _resolve_constant_scalar(fac_sock, context=context)
                     if fac_const is None:
                         return None
                     fac_spec = fac_const
@@ -2685,7 +2431,7 @@ def _try_emit_color_graph(sock, writer, textures, group_stack=None, vc_attrs=Non
             if col_sock is None:
                 return None
             if fac_sock is not None and fac_sock.is_linked:
-                _warn(
+                context.warn(
                     f"invert_textured_fac:{_node_tag(src)}",
                     f"{_node_tag(src)}: textured Fac on Invert is not yet "
                     "supported — node will be ignored in the color graph",
@@ -2721,7 +2467,7 @@ def _try_emit_color_graph(sock, writer, textures, group_stack=None, vc_attrs=Non
                 if i == chain_idx:
                     continue
                 if inp.is_linked:
-                    v = _resolve_constant_scalar(inp)
+                    v = _resolve_constant_scalar(inp, context=context)
                     if v is None:
                         return None
                 else:
@@ -2896,9 +2642,9 @@ def _try_emit_color_graph(sock, writer, textures, group_stack=None, vc_attrs=Non
                 nodes.append({"type": "color_ramp", "input": rand_idx, "lut": lut})
                 memo[key] = idx
                 return idx
-            scalar = _resolve_constant_scalar(in_sock)
+            scalar = _resolve_constant_scalar(in_sock, context=context)
             if scalar is None:
-                rgb = _socket_constant_rgb(in_sock)
+                rgb = _socket_constant_rgb(in_sock, context=context)
                 if rgb is None:
                     return None
                 scalar = 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]
@@ -2914,7 +2660,7 @@ def _try_emit_color_graph(sock, writer, textures, group_stack=None, vc_attrs=Non
         # leaf so the surrounding graph can still emit. Specific handlers
         # above (Attribute → vertex_color) already claim the nodes where a
         # mean-colour fold would be less faithful than a per-pixel reader.
-        fallback_rgb = _socket_constant_rgb(emit_sock)
+        fallback_rgb = _socket_constant_rgb(emit_sock, context=context)
         if fallback_rgb is not None:
             idx = len(nodes)
             nodes.append({"type": "const", "rgb": fallback_rgb})
@@ -2934,7 +2680,7 @@ def _try_emit_color_graph(sock, writer, textures, group_stack=None, vc_attrs=Non
     return color_fold.fold_constants({"nodes": nodes, "output": out_idx})
 
 
-def _normal_perturbation(normal_sock):
+def _normal_perturbation(normal_sock, *, context=None):
     """Inspect a Normal input socket and return (normal_sock_or_None,
     n_strength, bump_sock_or_None, b_strength).
 
@@ -2942,6 +2688,8 @@ def _normal_perturbation(normal_sock):
     feed the perturbation; callers run them through the chain machinery to
     bake any colour transforms into the resulting linear texture.
     """
+    if context is None:
+        context = ExportContext()
     if normal_sock is None:
         return None, 1.0, None, 1.0
     normal_sock = _follow_reroutes(normal_sock)
@@ -2964,8 +2712,8 @@ def _normal_perturbation(normal_sock):
     if (src.bl_idname == "ShaderNodeNewGeometry"
             and link.from_socket.name in ("Normal", "Incoming")):
         return None, 1.0, None, 1.0
-    if src.bl_idname == "NodeGroupInput" and _GROUP_STACK:
-        outer = _GROUP_STACK[-1].inputs.get(link.from_socket.name)
+    if src.bl_idname == "NodeGroupInput" and context.group_stack:
+        outer = context.group_stack[-1].inputs.get(link.from_socket.name)
         if outer is not None and not outer.is_linked:
             return None, 1.0, None, 1.0
     if src.bl_idname == "ShaderNodeNormalMap":
@@ -2993,14 +2741,14 @@ def _normal_perturbation(normal_sock):
         else:
             fac_sock, a_sock, b_sock = _mix_rgba_sockets(src)
         if fac_sock is None or a_sock is None or b_sock is None:
-            _warn(
+            context.warn(
                 f"normal-mix-sock:{src.as_pointer()}",
                 f"Normal input driven by {_node_tag(src)}: could not pick A/B "
                 f"sockets — perturbation ignored",
             )
             return None, 1.0, None, 1.0
         fac = (
-            _resolve_constant_scalar(fac_sock) if fac_sock.is_linked
+            _resolve_constant_scalar(fac_sock, context=context) if fac_sock.is_linked
             else _socket_f(fac_sock)
         )
         if fac is None:
@@ -3010,9 +2758,9 @@ def _normal_perturbation(normal_sock):
         # still picks up Strength / Distance from whichever wins.
         pick = a_sock if fac < 0.5 else b_sock
         weight = (1.0 - fac) if fac < 0.5 else fac
-        n2, ns2, b2, bs2 = _normal_perturbation(pick)
+        n2, ns2, b2, bs2 = _normal_perturbation(pick, context=context)
         return n2, ns2 * weight, b2, bs2 * weight
-    _warn(
+    context.warn(
         f"normal-src:{src.bl_idname}",
         f"Normal input driven by {_node_tag(src)} — not handled (expected "
         f"NormalMap, Bump, or TexImage); normal perturbation ignored",
@@ -3020,25 +2768,29 @@ def _normal_perturbation(normal_sock):
     return None, 1.0, None, 1.0
 
 
-def _normal_map_image(normal_sock) -> bpy.types.Image | None:
-    n_sock, _, b_sock, _ = _normal_perturbation(normal_sock)
+def _normal_map_image(normal_sock, *, context=None) -> bpy.types.Image | None:
+    if context is None:
+        context = ExportContext()
+    n_sock, _, b_sock, _ = _normal_perturbation(normal_sock, context=context)
     src = n_sock if n_sock is not None else b_sock
     if src is None:
         return None
-    return _socket_linked_image(src)
+    return _socket_linked_image(src, context=context)
 
 
-def _apply_normal_perturbation(params: dict, normal_sock, writer, textures) -> None:
+def _apply_normal_perturbation(params: dict, normal_sock, writer, textures, *, context=None) -> None:
     """Resolve the Normal input and assign normal_tex / bump_tex + strengths."""
-    n_sock, n_strength, b_sock, b_strength = _normal_perturbation(normal_sock)
+    if context is None:
+        context = ExportContext()
+    n_sock, n_strength, b_sock, b_strength = _normal_perturbation(normal_sock, context=context)
     if n_sock is not None:
-        tex = _export_linked_scalar_texture(n_sock, writer, textures)
+        tex = _export_linked_scalar_texture(n_sock, writer, textures, context=context)
         if tex is not None:
             params["normal_tex"] = tex
             if n_strength != 1.0:
                 params["normal_strength"] = n_strength
     if b_sock is not None:
-        tex = _export_linked_scalar_texture(b_sock, writer, textures)
+        tex = _export_linked_scalar_texture(b_sock, writer, textures, context=context)
         if tex is not None:
             params["bump_tex"] = tex
             if b_strength != 1.0:
@@ -3056,8 +2808,10 @@ def _default_params() -> dict:
     }
 
 
-def _resolve_shader_input(socket, writer, textures, mat_name: str, depth=0) -> dict:
+def _resolve_shader_input(socket, writer, textures, mat_name: str, depth=0, *, context=None) -> dict:
     """Follow shader sockets across groups without losing the selected output."""
+    if context is None:
+        context = ExportContext()
     if depth > 32:
         raise ValueError("Recursive shader socket graph")
     socket = _follow_reroutes(socket)
@@ -3068,102 +2822,108 @@ def _resolve_shader_input(socket, writer, textures, mat_name: str, depth=0) -> d
     node = source.node
     if node.mute:
         link = next((link for link in node.internal_links if link.to_socket == source), None)
-        return _resolve_shader_input(link.from_socket if link else None, writer, textures, mat_name, depth+1)
-    if node.bl_idname == "NodeGroupInput" and _GROUP_STACK:
-        group = _GROUP_STACK.pop()
+        return _resolve_shader_input(link.from_socket if link else None, writer, textures, mat_name, depth+1, context=context)
+    if node.bl_idname == "NodeGroupInput" and context.group_stack:
+        group = context.group_stack.pop()
         try:
             outer = next((s for s in group.inputs if s.identifier == source.identifier), None)
-            return _resolve_shader_input(outer, writer, textures, mat_name, depth+1)
+            return _resolve_shader_input(outer, writer, textures, mat_name, depth+1, context=context)
         finally:
-            _GROUP_STACK.append(group)
+            context.group_stack.append(group)
     if node.bl_idname == "ShaderNodeGroup" and node.node_tree:
         output = next((n for n in node.node_tree.nodes
                        if n.bl_idname == "NodeGroupOutput" and n.is_active_output), None)
         inner = next((s for s in output.inputs if s.identifier == source.identifier), None) if output else None
-        _GROUP_STACK.append(node)
+        context.group_stack.append(node)
         try:
-            return _resolve_shader_input(inner, writer, textures, mat_name, depth+1)
+            return _resolve_shader_input(inner, writer, textures, mat_name, depth+1, context=context)
         finally:
-            _GROUP_STACK.pop()
-    return _resolve_shader(node, writer, textures, mat_name)
+            context.group_stack.pop()
+    return _resolve_shader(node, writer, textures, mat_name, context=context)
 
 
-def _resolve_shader(node, writer, textures, mat_name: str) -> dict:
+def _resolve_shader(node, writer, textures, mat_name: str, *, context=None) -> dict:
+    if context is None:
+        context = ExportContext()
     from .shader_graph import compile_leaf, UnsupportedNode
     if node.bl_idname in {"ShaderNodeMixShader", "ShaderNodeAddShader"}:
         from .shader_graph import Compiler
         is_add = node.bl_idname == "ShaderNodeAddShader"
         inputs = list(node.inputs)[0 if is_add else 1:]
-        children = [_resolve_shader_input(socket, writer, textures, mat_name) for socket in inputs]
+        children = [_resolve_shader_input(socket, writer, textures, mat_name, context=context) for socket in inputs]
         params = dict(_default_params(), left_subtree=children[0], secondary=children[1], add_shader=is_add)
         if not is_add:
             params["mix_fac"] = float(node.inputs[0].default_value)
             if node.inputs[0].is_linked:
-                compiler = Compiler(writer, textures, tuple(_GROUP_STACK))
+                compiler = Compiler(writer, textures, tuple(context.group_stack), context=context)
                 factor = compiler.input(node.inputs[0])
                 params["shader_graph"] = compiler.graph({"mix_fac": factor})
                 compiler.attach_attributes(params)
         return params
     try:
-        compiled = compile_leaf(node, writer, textures, tuple(_GROUP_STACK))
+        compiled = compile_leaf(node, writer, textures, tuple(context.group_stack), context=context)
         if compiled is not None:
             return compiled
     except UnsupportedNode as exc:
-        _warn(f"shader-graph:{mat_name}:{node.name}",
+        context.warn(f"shader-graph:{mat_name}:{node.name}",
               f"{mat_name}: shader graph limitation: {exc}; using legacy material conversion")
-    params = _resolve_shader_legacy(node, writer, textures, mat_name)
+    params = _resolve_shader_legacy(node, writer, textures, mat_name, context=context)
     if node.bl_idname not in {"ShaderNodeMixShader", "ShaderNodeAddShader", "ShaderNodeGroup"}:
         from .shader_graph import attach, UnsupportedNode
         try:
-            params = attach(node, params, writer, textures, tuple(_GROUP_STACK))
+            params = attach(node, params, writer, textures, tuple(context.group_stack), context=context)
         except UnsupportedNode as exc:
-            _warn(f"shader-graph:{mat_name}:{node.name}",
+            context.warn(f"shader-graph:{mat_name}:{node.name}",
                   f"{mat_name}: shader graph limitation: {exc}; using legacy material conversion")
     return params
 
 
-def _resolve_shader_legacy(node, writer, textures, mat_name: str) -> dict:
+def _resolve_shader_legacy(node, writer, textures, mat_name: str, *, context=None) -> dict:
     """Return Principled-equivalent params for any surface-shader node."""
+    if context is None:
+        context = ExportContext()
     bl = node.bl_idname
     if bl == "ShaderNodeBsdfPrincipled":
-        return _from_principled(node, writer, textures)
+        return _from_principled(node, writer, textures, context=context)
     if bl == "ShaderNodeBsdfDiffuse":
-        return _from_diffuse(node, writer, textures)
+        return _from_diffuse(node, writer, textures, context=context)
     if bl == "ShaderNodeBsdfGlossy" or bl == "ShaderNodeBsdfAnisotropic":
-        return _from_glossy(node, writer, textures)
+        return _from_glossy(node, writer, textures, context=context)
     if bl == "ShaderNodeBsdfTranslucent":
-        return _from_translucent(node, writer, textures)
+        return _from_translucent(node, writer, textures, context=context)
     if bl == "ShaderNodeBsdfTransparent":
-        return _from_transparent(node, writer, textures)
+        return _from_transparent(node, writer, textures, context=context)
     if bl == "ShaderNodeBsdfSheen" or bl == "ShaderNodeBsdfVelvet":
-        return _from_sheen(node, writer, textures)
+        return _from_sheen(node, writer, textures, context=context)
     if bl == "ShaderNodeBsdfHair":
-        return _from_hair(node, writer, textures)
+        return _from_hair(node, writer, textures, context=context)
     if bl == "ShaderNodeMixShader":
-        return _from_mix(node, writer, textures, mat_name)
+        return _from_mix(node, writer, textures, mat_name, context=context)
     if bl == "ShaderNodeBsdfGlass":
-        return _from_glass(node, writer, textures)
+        return _from_glass(node, writer, textures, context=context)
     if bl == "ShaderNodeBsdfRefraction":
-        return _from_refraction(node, writer, textures)
+        return _from_refraction(node, writer, textures, context=context)
     if bl == "ShaderNodeEmission":
-        return _from_emission(node, writer, textures)
+        return _from_emission(node, writer, textures, context=context)
     if bl == "ShaderNodeAddShader":
-        return _from_add(node, writer, textures, mat_name)
+        return _from_add(node, writer, textures, mat_name, context=context)
     if bl == "ShaderNodeGroup":
-        return _from_group(node, writer, textures, mat_name)
+        return _from_group(node, writer, textures, mat_name, context=context)
     if bl == "ShaderNodeVolumeAbsorption" or bl == "ShaderNodeVolumeScatter" or bl == "ShaderNodeVolumePrincipled":
-        _warn(f"vol-shader:{bl}", f"ignoring volume shader {bl}")
+        context.warn(f"vol-shader:{bl}", f"ignoring volume shader {bl}")
         return _default_params()
-    _warn(f"unsup-shader:{bl}", f"unsupported shader node: {bl}")
+    context.warn(f"unsup-shader:{bl}", f"unsupported shader node: {bl}")
     return _default_params()
 
 
-def _from_principled(node, writer, textures) -> dict:
+def _from_principled(node, writer, textures, *, context=None) -> dict:
+    if context is None:
+        context = ExportContext()
     p = _default_params()
     bc = node.inputs["Base Color"]
     vc_attrs: list[str] = []
     graph = (
-        _try_emit_color_graph(bc, writer, textures, vc_attrs=vc_attrs)
+        _try_emit_color_graph(bc, writer, textures, vc_attrs=vc_attrs, context=context)
         if bc.is_linked else None
     )
     if graph is not None:
@@ -3175,12 +2935,12 @@ def _from_principled(node, writer, textures) -> dict:
             # attribute).
             p["_vertex_color_attr"] = vc_attrs[0]
     else:
-        img, chain = _socket_linked_image_with_chain(bc)
+        img, chain = _socket_linked_image_with_chain(bc, context=context)
         if img is not None:
             # Linked socket: the link drives the colour, the default RGB is unused
             # in Cycles. The renderer multiplies base_color × texture, so neutralise
             # the factor to avoid tinting the texture.
-            p["base_color_tex"] = export_image_texture(img, writer, textures, "srgb", chain=chain)
+            p["base_color_tex"] = export_image_texture(img, writer, textures, "srgb", chain=chain, context=context)
             p["base_color"] = [1.0, 1.0, 1.0]
         elif bc.is_linked:
             attr = _find_base_color_attribute(bc)
@@ -3193,14 +2953,14 @@ def _from_principled(node, writer, textures) -> dict:
         else:
             p["base_color"] = _socket_rgb(bc)
 
-    tex = _export_linked_scalar_texture(node.inputs["Metallic"], writer, textures)
+    tex = _export_linked_scalar_texture(node.inputs["Metallic"], writer, textures, context=context)
     if tex is not None:
         p["metallic_tex"] = tex
         p["metallic"] = 1.0
     else:
         p["metallic"] = _socket_f(node.inputs["Metallic"])
 
-    tex = _export_linked_scalar_texture(node.inputs["Roughness"], writer, textures)
+    tex = _export_linked_scalar_texture(node.inputs["Roughness"], writer, textures, context=context)
     if tex is not None:
         p["roughness_tex"] = tex
         p["roughness"] = 1.0
@@ -3208,7 +2968,7 @@ def _from_principled(node, writer, textures) -> dict:
         p["roughness"] = _socket_f(node.inputs["Roughness"])
 
     if "IOR" in node.inputs:
-        p["ior"] = _warn_linked_scalar(node, "IOR")
+        p["ior"] = _warn_linked_scalar(node, "IOR", context=context)
     trans_name = (
         "Transmission Weight" if "Transmission Weight" in node.inputs
         else "Transmission" if "Transmission" in node.inputs
@@ -3217,12 +2977,13 @@ def _from_principled(node, writer, textures) -> dict:
     if trans_name:
         tex = _export_linked_scalar_texture(
             node.inputs[trans_name], writer, textures,
+            context=context,
         )
         if tex is not None:
             p["transmission_tex"] = tex
             p["transmission"] = 1.0
         else:
-            p["transmission"] = _warn_linked_scalar(node, trans_name)
+            p["transmission"] = _warn_linked_scalar(node, trans_name, context=context)
 
     # Principled emission: same texture-driven idiom as the standalone
     # Emission node (e.g. Cycles 4.x Emissive Color = Image Texture). Prefer
@@ -3237,7 +2998,7 @@ def _from_principled(node, writer, textures) -> dict:
     # with a custom Strength survives the round-trip — flat_archiviz
     # has 68 of 97 Principled materials with non-default values.
     if "Emission Strength" in node.inputs:
-        strength = _warn_linked_scalar(node, "Emission Strength")
+        strength = _warn_linked_scalar(node, "Emission Strength", context=context)
     if "Emission" in node.inputs:
         emit_sock = node.inputs["Emission"]
     elif "Emission Color" in node.inputs:
@@ -3246,28 +3007,29 @@ def _from_principled(node, writer, textures) -> dict:
         emit_img = None
         emit_chain = ()
         if emit_sock.is_linked:
-            emit_img, emit_chain = _socket_linked_image_with_chain(emit_sock)
+            emit_img, emit_chain = _socket_linked_image_with_chain(emit_sock, context=context)
         if emit_img is not None:
             p["emission_tex"] = export_image_texture(
-                emit_img, writer, textures, "srgb", chain=emit_chain
+                emit_img, writer, textures, "srgb", chain=emit_chain,
+                context=context,
             )
             p["emission"] = [strength, strength, strength]
         else:
-            color = _emission_constant_color(node, emit_sock)
+            color = _emission_constant_color(node, emit_sock, context=context)
             p["emission"] = [c * strength for c in color]
 
-    _apply_normal_perturbation(p, node.inputs.get("Normal"), writer, textures)
+    _apply_normal_perturbation(p, node.inputs.get("Normal"), writer, textures, context=context)
 
     # Anisotropy (Blender Principled: "Anisotropic" + "Anisotropic Rotation").
     for name in ("Anisotropic", "Anisotropy"):
         if name in node.inputs:
-            a = _warn_linked_scalar(node, name)
+            a = _warn_linked_scalar(node, name, context=context)
             if a != 0.0:
                 p["anisotropy"] = a
             break
     for name in ("Anisotropic Rotation", "Anisotropy Rotation"):
         if name in node.inputs:
-            r = _warn_linked_scalar(node, name)
+            r = _warn_linked_scalar(node, name, context=context)
             if r != 0.0:
                 p["tangent_rotation"] = r * 2.0 * math.pi
             break
@@ -3276,18 +3038,18 @@ def _from_principled(node, writer, textures) -> dict:
     # legacy 3.x: "Clearcoat" / "Clearcoat Roughness").
     for name in ("Coat Weight", "Clearcoat"):
         if name in node.inputs:
-            w = _warn_linked_scalar(node, name)
+            w = _warn_linked_scalar(node, name, context=context)
             if w > 0.0:
                 p["coat_weight"] = w
             break
     for name in ("Coat Roughness", "Clearcoat Roughness"):
         if name in node.inputs:
-            r = _warn_linked_scalar(node, name)
+            r = _warn_linked_scalar(node, name, context=context)
             if r != 0.03:
                 p["coat_roughness"] = r
             break
     if "Coat IOR" in node.inputs:
-        ior = _warn_linked_scalar(node, "Coat IOR")
+        ior = _warn_linked_scalar(node, "Coat IOR", context=context)
         if ior != 1.5:
             p["coat_ior"] = ior
 
@@ -3300,7 +3062,7 @@ def _from_principled(node, writer, textures) -> dict:
     # diffuse-ish surfaces. See `c:/tmp/cycles-src/src/kernel/svm/closure.h:418`.
     for name in ("Specular IOR Level", "Specular"):
         if name in node.inputs:
-            sil = _warn_linked_scalar(node, name)
+            sil = _warn_linked_scalar(node, name, context=context)
             if sil != 0.5:
                 p["specular_ior_level"] = sil
             break
@@ -3309,18 +3071,18 @@ def _from_principled(node, writer, textures) -> dict:
     # legacy: "Sheen" / "Sheen Tint" scalar).
     for name in ("Sheen Weight", "Sheen"):
         if name in node.inputs:
-            w = _warn_linked_scalar(node, name)
+            w = _warn_linked_scalar(node, name, context=context)
             if w > 0.0:
                 p["sheen_weight"] = w
             break
     if "Sheen Roughness" in node.inputs:
-        r = _warn_linked_scalar(node, "Sheen Roughness")
+        r = _warn_linked_scalar(node, "Sheen Roughness", context=context)
         if r != 0.5:
             p["sheen_roughness"] = r
     if "Sheen Tint" in node.inputs:
         sheen_tint_sock = node.inputs["Sheen Tint"]
         if sheen_tint_sock.is_linked:
-            _warn(
+            context.warn(
                 f"sheen-tint-linked:{node.as_pointer()}",
                 f"{_node_tag(node)}: Sheen Tint is linked but not baked — "
                 f"using constant default",
@@ -3336,14 +3098,14 @@ def _from_principled(node, writer, textures) -> dict:
     # by the simplified wrap-Lambert SSS in the renderer, so we don't emit it.
     for name in ("Subsurface Weight", "Subsurface"):
         if name in node.inputs:
-            w = _warn_linked_scalar(node, name)
+            w = _warn_linked_scalar(node, name, context=context)
             if w > 0.0:
                 p["sss_weight"] = w
             break
     if "Subsurface Radius" in node.inputs:
         sss_r_sock = node.inputs["Subsurface Radius"]
         if sss_r_sock.is_linked:
-            _warn(
+            context.warn(
                 f"sss-radius-linked:{node.as_pointer()}",
                 f"{_node_tag(node)}: Subsurface Radius is linked but not baked "
                 f"— using constant default",
@@ -3363,11 +3125,11 @@ def _from_principled(node, writer, textures) -> dict:
             # hit when below threshold (leaves, grass, fence cards).
             p["alpha_threshold"] = 0.5
             if "base_color_tex" not in p:
-                img = _socket_linked_image(alpha_sock)
+                img = _socket_linked_image(alpha_sock, context=context)
                 if img is not None:
-                    p["base_color_tex"] = export_image_texture(img, writer, textures, "srgb")
+                    p["base_color_tex"] = export_image_texture(img, writer, textures, "srgb", context=context)
                 else:
-                    _warn(
+                    context.warn(
                         f"alpha-noimg:{node.as_pointer()}",
                         f"{_node_tag(node)}: Alpha is linked but no TexImage "
                         f"found upstream — alpha threshold is effectively "
@@ -3387,7 +3149,7 @@ def _from_principled(node, writer, textures) -> dict:
     return p
 
 
-def _from_sheen(node, writer, textures) -> dict:
+def _from_sheen(node, writer, textures, *, context=None) -> dict:
     """ShaderNodeBsdfSheen / Velvet → vibrt's sheen lobe.
 
     Cycles' Sheen BSDF (LTC-based "Practical Multiple-Scattering Sheen")
@@ -3407,6 +3169,8 @@ def _from_sheen(node, writer, textures) -> dict:
     directly to `sheen_roughness` (vibrt clamps the inv-roughness
     falloff exponent internally).
     """
+    if context is None:
+        context = ExportContext()
     p = _default_params()
     p["metallic"] = 0.0
     p["roughness"] = 1.0
@@ -3419,7 +3183,7 @@ def _from_sheen(node, writer, textures) -> dict:
     color_sock = node.inputs.get("Color")
     if color_sock is not None:
         if color_sock.is_linked:
-            rgb = _socket_constant_rgb(color_sock)
+            rgb = _socket_constant_rgb(color_sock, context=context)
             tint = list(rgb) if rgb is not None else [1.0, 1.0, 1.0]
         else:
             cv = color_sock.default_value
@@ -3434,11 +3198,11 @@ def _from_sheen(node, writer, textures) -> dict:
         # match Cycles' clamp range.
         r = float(rough_sock.default_value)
         p["sheen_roughness"] = max(min(r, 1.0), 1e-3)
-    _apply_normal_perturbation(p, node.inputs.get("Normal"), writer, textures)
+    _apply_normal_perturbation(p, node.inputs.get("Normal"), writer, textures, context=context)
     return p
 
 
-def _from_translucent(node, writer, textures) -> dict:
+def _from_translucent(node, writer, textures, *, context=None) -> dict:
     """ShaderNodeBsdfTranslucent → proper Translucent BSDF lobe.
 
     Routes the Color socket through `_from_diffuse` to pick up the texture /
@@ -3449,12 +3213,16 @@ def _from_translucent(node, writer, textures) -> dict:
     Translucent BSDF: light passing *through* a thin sheet from the side
     opposite the viewer.
     """
-    p = _from_diffuse(node, writer, textures)
+    if context is None:
+        context = ExportContext()
+    p = _from_diffuse(node, writer, textures, context=context)
     p["translucent_weight"] = 1.0
     return p
 
 
-def _from_diffuse(node, writer, textures) -> dict:
+def _from_diffuse(node, writer, textures, *, context=None) -> dict:
+    if context is None:
+        context = ExportContext()
     p = _default_params()
     p["roughness"] = 1.0
     p["metallic"] = 0.0
@@ -3471,7 +3239,7 @@ def _from_diffuse(node, writer, textures) -> dict:
     color_sock = node.inputs["Color"]
     vc_attrs: list[str] = []
     graph = (
-        _try_emit_color_graph(color_sock, writer, textures, vc_attrs=vc_attrs)
+        _try_emit_color_graph(color_sock, writer, textures, vc_attrs=vc_attrs, context=context)
         if color_sock.is_linked else None
     )
     if graph is not None:
@@ -3480,9 +3248,9 @@ def _from_diffuse(node, writer, textures) -> dict:
         if vc_attrs:
             p["_vertex_color_attr"] = vc_attrs[0]
     else:
-        img, chain = _socket_linked_image_with_chain(color_sock)
+        img, chain = _socket_linked_image_with_chain(color_sock, context=context)
         if img is not None:
-            p["base_color_tex"] = export_image_texture(img, writer, textures, "srgb", chain=chain)
+            p["base_color_tex"] = export_image_texture(img, writer, textures, "srgb", chain=chain, context=context)
             p["base_color"] = [1.0, 1.0, 1.0]
         elif color_sock.is_linked:
             attr = _find_base_color_attribute(color_sock)
@@ -3494,11 +3262,11 @@ def _from_diffuse(node, writer, textures) -> dict:
                 p["base_color"] = _socket_rgb(color_sock)
         else:
             p["base_color"] = _socket_rgb(color_sock)
-    _apply_normal_perturbation(p, node.inputs.get("Normal"), writer, textures)
+    _apply_normal_perturbation(p, node.inputs.get("Normal"), writer, textures, context=context)
     return p
 
 
-def _from_hair(node, writer, textures) -> dict:
+def _from_hair(node, writer, textures, *, context=None) -> dict:
     """Map Cycles' classic Hair BSDF (Kajiya-Kay) to Principled params.
 
     Sets `hair_weight = 1.0` so the kernel takes the Kajiya-Kay eval/sample
@@ -3510,17 +3278,20 @@ def _from_hair(node, writer, textures) -> dict:
     doesn't follow the strand direction but gives a qualitatively hair-like
     look on triangle-mesh "hair caps". Proper UV-based tangent is follow-up.
     """
+    if context is None:
+        context = ExportContext()
     p = _default_params()
     p["hair_weight"] = 1.0
     color_sock = node.inputs["Color"]
-    img, chain = _socket_linked_image_with_chain(color_sock)
+    img, chain = _socket_linked_image_with_chain(color_sock, context=context)
     if img is not None:
         p["base_color_tex"] = export_image_texture(
-            img, writer, textures, "srgb", chain=chain
+            img, writer, textures, "srgb", chain=chain,
+            context=context,
         )
         p["base_color"] = [1.0, 1.0, 1.0]
     elif color_sock.is_linked:
-        rgb = _socket_constant_rgb(color_sock)
+        rgb = _socket_constant_rgb(color_sock, context=context)
         if rgb is not None:
             p["base_color"] = rgb
         else:
@@ -3528,15 +3299,17 @@ def _from_hair(node, writer, textures) -> dict:
     else:
         p["base_color"] = _socket_rgb(color_sock)
     if "Offset" in node.inputs:
-        p["hair_offset"] = _warn_linked_scalar(node, "Offset")
+        p["hair_offset"] = _warn_linked_scalar(node, "Offset", context=context)
     if "RoughnessU" in node.inputs:
-        p["hair_roughness_u"] = _warn_linked_scalar(node, "RoughnessU")
+        p["hair_roughness_u"] = _warn_linked_scalar(node, "RoughnessU", context=context)
     if "RoughnessV" in node.inputs:
-        p["hair_roughness_v"] = _warn_linked_scalar(node, "RoughnessV")
+        p["hair_roughness_v"] = _warn_linked_scalar(node, "RoughnessV", context=context)
     return p
 
 
-def _from_glossy(node, writer, textures) -> dict:
+def _from_glossy(node, writer, textures, *, context=None) -> dict:
+    if context is None:
+        context = ExportContext()
     p = _default_params()
     p["metallic"] = 1.0
     # `ShaderNodeBsdfAnisotropic` / `ShaderNodeBsdfGlossy` is Cycles' pure
@@ -3547,44 +3320,46 @@ def _from_glossy(node, writer, textures) -> dict:
     # which over-brightens dark Glossy materials (BMWBlack on the bmw27
     # car body was visibly too bright vs Cycles).
     p["pure_glossy"] = True
-    img, chain = _socket_linked_image_with_chain(node.inputs["Color"])
+    img, chain = _socket_linked_image_with_chain(node.inputs["Color"], context=context)
     if img is not None:
-        p["base_color_tex"] = export_image_texture(img, writer, textures, "srgb", chain=chain)
+        p["base_color_tex"] = export_image_texture(img, writer, textures, "srgb", chain=chain, context=context)
         p["base_color"] = [1.0, 1.0, 1.0]
     else:
         p["base_color"] = _socket_rgb(node.inputs["Color"])
     if "Roughness" in node.inputs:
-        tex = _export_linked_scalar_texture(node.inputs["Roughness"], writer, textures)
+        tex = _export_linked_scalar_texture(node.inputs["Roughness"], writer, textures, context=context)
         if tex is not None:
             p["roughness_tex"] = tex
             p["roughness"] = 1.0
         else:
             p["roughness"] = _socket_f(node.inputs["Roughness"])
     if "Anisotropy" in node.inputs:
-        a = _warn_linked_scalar(node, "Anisotropy")
+        a = _warn_linked_scalar(node, "Anisotropy", context=context)
         if a != 0.0:
             p["anisotropy"] = a
     if "Rotation" in node.inputs:
-        r = _warn_linked_scalar(node, "Rotation")
+        r = _warn_linked_scalar(node, "Rotation", context=context)
         if r != 0.0:
             p["tangent_rotation"] = r * 2.0 * math.pi
-    _apply_normal_perturbation(p, node.inputs.get("Normal"), writer, textures)
+    _apply_normal_perturbation(p, node.inputs.get("Normal"), writer, textures, context=context)
     return p
 
 
-def _from_glass(node, writer, textures) -> dict:
+def _from_glass(node, writer, textures, *, context=None) -> dict:
+    if context is None:
+        context = ExportContext()
     p = _default_params()
     p["transmission"] = 1.0
     if "IOR" in node.inputs:
-        p["ior"] = _warn_linked_scalar(node, "IOR")
-    img, chain = _socket_linked_image_with_chain(node.inputs["Color"])
+        p["ior"] = _warn_linked_scalar(node, "IOR", context=context)
+    img, chain = _socket_linked_image_with_chain(node.inputs["Color"], context=context)
     if img is not None:
-        p["base_color_tex"] = export_image_texture(img, writer, textures, "srgb", chain=chain)
+        p["base_color_tex"] = export_image_texture(img, writer, textures, "srgb", chain=chain, context=context)
         p["base_color"] = [1.0, 1.0, 1.0]
     else:
         p["base_color"] = _socket_rgb(node.inputs["Color"])
     if "Roughness" in node.inputs:
-        tex = _export_linked_scalar_texture(node.inputs["Roughness"], writer, textures)
+        tex = _export_linked_scalar_texture(node.inputs["Roughness"], writer, textures, context=context)
         if tex is not None:
             p["roughness_tex"] = tex
             p["roughness"] = 1.0
@@ -3594,24 +3369,26 @@ def _from_glass(node, writer, textures) -> dict:
     # from a Bump node sampling a noise texture, which is what gives
     # Cycles its rippled-water reflections. Without the bump the water
     # plane reflects with mirror uniformity and looks unnaturally still.
-    _apply_normal_perturbation(p, node.inputs.get("Normal"), writer, textures)
+    _apply_normal_perturbation(p, node.inputs.get("Normal"), writer, textures, context=context)
     return p
 
 
-def _from_refraction(node, writer, textures) -> dict:
+def _from_refraction(node, writer, textures, *, context=None) -> dict:
+    if context is None:
+        context = ExportContext()
     p = _default_params()
     p["transmission"] = 1.0
     p["metallic"] = 0.0
     if "IOR" in node.inputs:
-        p["ior"] = _warn_linked_scalar(node, "IOR")
-    img, chain = _socket_linked_image_with_chain(node.inputs["Color"])
+        p["ior"] = _warn_linked_scalar(node, "IOR", context=context)
+    img, chain = _socket_linked_image_with_chain(node.inputs["Color"], context=context)
     if img is not None:
-        p["base_color_tex"] = export_image_texture(img, writer, textures, "srgb", chain=chain)
+        p["base_color_tex"] = export_image_texture(img, writer, textures, "srgb", chain=chain, context=context)
         p["base_color"] = [1.0, 1.0, 1.0]
     else:
         p["base_color"] = _socket_rgb(node.inputs["Color"])
     if "Roughness" in node.inputs:
-        tex = _export_linked_scalar_texture(node.inputs["Roughness"], writer, textures)
+        tex = _export_linked_scalar_texture(node.inputs["Roughness"], writer, textures, context=context)
         if tex is not None:
             p["roughness_tex"] = tex
             p["roughness"] = 1.0
@@ -3620,7 +3397,7 @@ def _from_refraction(node, writer, textures) -> dict:
     return p
 
 
-def _from_add(node, writer, textures, mat_name: str) -> dict:
+def _from_add(node, writer, textures, mat_name: str, *, context=None) -> dict:
     """Add Shader: sum of emission, max of transmission, p1's surface params.
 
     The renderer has one BSDF slot, so we can't actually add two lobes — the
@@ -3631,12 +3408,14 @@ def _from_add(node, writer, textures, mat_name: str) -> dict:
     promote it to translucent_weight=0.5 on the surface so the kernel splits
     the diffuse budget between forward and back hemispheres.
     """
+    if context is None:
+        context = ExportContext()
     in1 = _follow_reroutes(node.inputs[0])
     in2 = _follow_reroutes(node.inputs[1])
     n1 = in1.links[0].from_node if in1.is_linked else None
     n2 = in2.links[0].from_node if in2.is_linked else None
-    p1 = _resolve_shader(n1, writer, textures, mat_name) if n1 else _default_params()
-    p2 = _resolve_shader(n2, writer, textures, mat_name) if n2 else _default_params()
+    p1 = _resolve_shader(n1, writer, textures, mat_name, context=context) if n1 else _default_params()
+    p2 = _resolve_shader(n2, writer, textures, mat_name, context=context) if n2 else _default_params()
     # Asymmetric Translucent contribution (canonical thin-leaf idiom): keep
     # the opaque-surface side as the base lobe and split the diffuse budget
     # 50/50 between forward Lambert and back-Lambert via translucent_weight.
@@ -3660,7 +3439,7 @@ def _from_add(node, writer, textures, mat_name: str) -> dict:
     e1 = p1.get("emission_tex")
     e2 = p2.get("emission_tex")
     if e1 is not None and e2 is not None:
-        _warn(
+        context.warn(
             f"add-emit-tex:{node.as_pointer()}",
             f"{_node_tag(node)}: both Add Shader inputs have an emission "
             "texture — only the first is kept (one emission_tex slot)",
@@ -3671,14 +3450,16 @@ def _from_add(node, writer, textures, mat_name: str) -> dict:
     return out
 
 
-def _from_transparent(node, writer, textures) -> dict:
+def _from_transparent(node, writer, textures, *, context=None) -> dict:
+    if context is None:
+        context = ExportContext()
     p = _default_params()
     p["transmission"] = 1.0
     p["ior"] = 1.0  # no refraction
     p["roughness"] = 0.0
-    img, chain = _socket_linked_image_with_chain(node.inputs["Color"])
+    img, chain = _socket_linked_image_with_chain(node.inputs["Color"], context=context)
     if img is not None:
-        p["base_color_tex"] = export_image_texture(img, writer, textures, "srgb", chain=chain)
+        p["base_color_tex"] = export_image_texture(img, writer, textures, "srgb", chain=chain, context=context)
         p["base_color"] = [1.0, 1.0, 1.0]
         p["alpha_threshold"] = 0.5
     else:
@@ -3686,11 +3467,13 @@ def _from_transparent(node, writer, textures) -> dict:
     return p
 
 
-def _from_emission(node, writer, textures) -> dict:
+def _from_emission(node, writer, textures, *, context=None) -> dict:
+    if context is None:
+        context = ExportContext()
     p = _default_params()
     color_sock = node.inputs["Color"]
     if "Strength" in node.inputs:
-        strength = _warn_linked_scalar(node, "Strength")
+        strength = _warn_linked_scalar(node, "Strength", context=context)
     else:
         strength = 1.0
     # Per-pixel path first: a Color chain that resolves to a single image
@@ -3699,21 +3482,22 @@ def _from_emission(node, writer, textures) -> dict:
     # the chain to a constant — `_emission_constant_color` warns when the
     # collapse is lossy.
     if color_sock.is_linked:
-        img, chain = _socket_linked_image_with_chain(color_sock)
+        img, chain = _socket_linked_image_with_chain(color_sock, context=context)
         if img is not None:
             p["emission_tex"] = export_image_texture(
-                img, writer, textures, "srgb", chain=chain
+                img, writer, textures, "srgb", chain=chain,
+                context=context,
             )
             p["emission"] = [strength, strength, strength]
             p["base_color"] = [0.0, 0.0, 0.0]
             return p
-    color = _emission_constant_color(node, color_sock)
+    color = _emission_constant_color(node, color_sock, context=context)
     p["emission"] = [c * strength for c in color]
     p["base_color"] = [0.0, 0.0, 0.0]
     return p
 
 
-def _emission_constant_color(node, color_sock) -> list[float]:
+def _emission_constant_color(node, color_sock, *, context=None) -> list[float]:
     """Resolve an Emission-style Color socket to a constant RGB.
 
     Walks the chain through bakeable transforms + procedural/leaf folding. If
@@ -3721,12 +3505,14 @@ def _emission_constant_color(node, color_sock) -> list[float]:
     warn and fall back to the socket's default. The renderer stores emission
     as a constant RGB, so there's no "bake to texture" option here.
     """
+    if context is None:
+        context = ExportContext()
     if not color_sock.is_linked:
         return _socket_rgb(color_sock)
-    rgb = _socket_constant_rgb(color_sock)
+    rgb = _socket_constant_rgb(color_sock, context=context)
     if rgb is not None:
         return rgb
-    _warn(
+    context.warn(
         f"emit-color-linked:{node.as_pointer()}",
         f"{_node_tag(node)}: Color chain isn't foldable to a constant "
         f"(textured emission) — using socket default",
@@ -3734,7 +3520,7 @@ def _emission_constant_color(node, color_sock) -> list[float]:
     return _socket_rgb(color_sock)
 
 
-def _try_alpha_cutout_mixshader(node, n1, n2, p1, p2, fac_sock, writer, textures):
+def _try_alpha_cutout_mixshader(node, n1, n2, p1, p2, fac_sock, writer, textures, *, context=None):
     """Detect `MixShader(Principled, Transparent, fac=texture)` and emit a
     single Principled surface with the leaf base-colour in RGB and the
     opacity mask in alpha, plus an `alpha_threshold` so the kernel cuts
@@ -3744,6 +3530,8 @@ def _try_alpha_cutout_mixshader(node, n1, n2, p1, p2, fac_sock, writer, textures
     (one of the shaders isn't Principled / Transparent, the mask isn't a
     bakeable texture, neither side has a base-colour texture, etc.).
     """
+    if context is None:
+        context = ExportContext()
     import numpy as np
     if n1 is None or n2 is None:
         return None
@@ -3757,7 +3545,7 @@ def _try_alpha_cutout_mixshader(node, n1, n2, p1, p2, fac_sock, writer, textures
     # Resolve the opacity mask. We need a TexImage (with optional chain)
     # so we can sample the per-pixel alpha; folded constants would imply
     # uniform opacity which the kernel already handles via base alpha.
-    mask_img, mask_chain = _socket_linked_image_with_chain(fac_sock)
+    mask_img, mask_chain = _socket_linked_image_with_chain(fac_sock, context=context)
     if mask_img is None or not isinstance(mask_img, bpy.types.Image):
         return None
     if mask_img.size[0] == 0 or mask_img.size[1] == 0:
@@ -3775,6 +3563,7 @@ def _try_alpha_cutout_mixshader(node, n1, n2, p1, p2, fac_sock, writer, textures
             "srgb" if mask_img.colorspace_settings.name.lower().startswith("srgb")
             else "linear",
             mask_chain,
+            context=context,
         )
     mask_rgba = mask_pix.reshape((mh, mw, 4))
     # Convert to a single alpha channel (luminance of RGB).
@@ -3799,7 +3588,7 @@ def _try_alpha_cutout_mixshader(node, n1, n2, p1, p2, fac_sock, writer, textures
     bc_chain = ()
     bc_const = None
     if bc_sock is not None and bc_sock.is_linked:
-        bc_img, bc_chain = _socket_linked_image_with_chain(bc_sock)
+        bc_img, bc_chain = _socket_linked_image_with_chain(bc_sock, context=context)
     if bc_img is None or not isinstance(bc_img, bpy.types.Image):
         # No leaf texture — fall back to the principled side's constant
         # base_color tinted by the alpha mask. The kernel will multiply
@@ -3824,6 +3613,7 @@ def _try_alpha_cutout_mixshader(node, n1, n2, p1, p2, fac_sock, writer, textures
         if bc_chain:
             leaf_pix, leaf_colorspace = _bake_chain(
                 leaf_pix, cw, ch, leaf_colorspace, bc_chain,
+                context=context,
             )
         leaf_rgb = leaf_pix.reshape((ch, cw, 4))[..., :3]
 
@@ -3876,13 +3666,15 @@ def _try_alpha_cutout_mixshader(node, n1, n2, p1, p2, fac_sock, writer, textures
     return out
 
 
-def _find_subtree_color_image(node, depth: int = 0):
+def _find_subtree_color_image(node, depth: int = 0, *, context=None):
     """Walk a shader subtree looking for the first `(image, chain)` feeding a
     Color / Base Color input — used by the generic alpha-cutout path to find
     the leaf RGB image when the opaque side isn't a plain Principled.
 
     Returns (image, chain) or (None, ()).
     """
+    if context is None:
+        context = ExportContext()
     if node is None or depth > 6:
         return None, ()
     bl = node.bl_idname
@@ -3893,7 +3685,7 @@ def _find_subtree_color_image(node, depth: int = 0):
         sock = node.inputs.get(inp_name)
         if sock is None or not sock.is_linked:
             continue
-        img, chain = _socket_linked_image_with_chain(sock)
+        img, chain = _socket_linked_image_with_chain(sock, context=context)
         if img is not None and isinstance(img, bpy.types.Image):
             return img, chain
     # Recurse into MixShader / AddShader children — the leaf is buried under
@@ -3903,13 +3695,13 @@ def _find_subtree_color_image(node, depth: int = 0):
             if inp.type != "SHADER" or not inp.is_linked:
                 continue
             child = inp.links[0].from_node
-            img, chain = _find_subtree_color_image(child, depth + 1)
+            img, chain = _find_subtree_color_image(child, depth + 1, context=context)
             if img is not None:
                 return img, chain
     return None, ()
 
 
-def _try_alpha_cutout_generic_mixshader(node, n1, n2, p1, p2, fac_sock, writer, textures):
+def _try_alpha_cutout_generic_mixshader(node, n1, n2, p1, p2, fac_sock, writer, textures, *, context=None):
     """Detect `MixShader(Transparent, OpaqueSubGraph, fac=texture)` for any
     opaque shader on the non-Transparent side (the dedicated Principled and
     Emission helpers handle their narrower idioms first). Bakes the leaf
@@ -3924,6 +3716,8 @@ def _try_alpha_cutout_generic_mixshader(node, n1, n2, p1, p2, fac_sock, writer, 
     Without this, the generic mix fallback kept the Transparent side's
     params and the leaves rendered as see-through holes.
     """
+    if context is None:
+        context = ExportContext()
     import numpy as np
     if n1 is None or n2 is None:
         return None
@@ -3935,7 +3729,7 @@ def _try_alpha_cutout_generic_mixshader(node, n1, n2, p1, p2, fac_sock, writer, 
     else:
         return None
     # Need a bakeable opacity texture (chain or raw image) on the factor.
-    mask_img, mask_chain = _socket_linked_image_with_chain(fac_sock)
+    mask_img, mask_chain = _socket_linked_image_with_chain(fac_sock, context=context)
     if mask_img is None or not isinstance(mask_img, bpy.types.Image):
         return None
     if mask_img.size[0] == 0 or mask_img.size[1] == 0:
@@ -3953,6 +3747,7 @@ def _try_alpha_cutout_generic_mixshader(node, n1, n2, p1, p2, fac_sock, writer, 
             "srgb" if mask_img.colorspace_settings.name.lower().startswith("srgb")
             else "linear",
             mask_chain,
+            context=context,
         )
     mask_rgba = mask_pix.reshape((mh, mw, 4))
     fac_link = fac_sock.links[0] if fac_sock.is_linked else None
@@ -3984,7 +3779,7 @@ def _try_alpha_cutout_generic_mixshader(node, n1, n2, p1, p2, fac_sock, writer, 
         leaf_colorspace = "linear"
     else:
         # Find the leaf RGB image by walking the opaque subtree.
-        leaf_img, leaf_chain = _find_subtree_color_image(opaque_node)
+        leaf_img, leaf_chain = _find_subtree_color_image(opaque_node, context=context)
         if leaf_img is not None and isinstance(leaf_img, bpy.types.Image):
             if leaf_img.size[0] == 0 or leaf_img.size[1] == 0:
                 leaf_img.update()
@@ -4000,6 +3795,7 @@ def _try_alpha_cutout_generic_mixshader(node, n1, n2, p1, p2, fac_sock, writer, 
             if leaf_chain:
                 leaf_pix, leaf_colorspace = _bake_chain(
                     leaf_pix, cw, ch, leaf_colorspace, leaf_chain,
+                    context=context,
                 )
             leaf_rgb = leaf_pix.reshape((ch, cw, 4))[..., :3]
         else:
@@ -4056,7 +3852,7 @@ def _try_alpha_cutout_generic_mixshader(node, n1, n2, p1, p2, fac_sock, writer, 
     return out
 
 
-def _try_alpha_cutout_emission_mixshader(node, n1, n2, p1, p2, fac_sock, writer, textures):
+def _try_alpha_cutout_emission_mixshader(node, n1, n2, p1, p2, fac_sock, writer, textures, *, context=None):
     """Detect `MixShader(Transparent, Emission, fac=texture)` (or its
     Emission/Transparent reverse) — Cycles' canonical billboard-flame /
     sprite idiom — and emit a single emissive surface with the
@@ -4069,6 +3865,8 @@ def _try_alpha_cutout_emission_mixshader(node, n1, n2, p1, p2, fac_sock, writer,
     of the MixShader our generic fallback picked, dropping either the
     emission or the cutout.
     """
+    if context is None:
+        context = ExportContext()
     import numpy as np
     if n1 is None or n2 is None:
         return None
@@ -4080,7 +3878,7 @@ def _try_alpha_cutout_emission_mixshader(node, n1, n2, p1, p2, fac_sock, writer,
     else:
         return None
     # Need a bakeable opacity texture as the factor.
-    mask_img, mask_chain = _socket_linked_image_with_chain(fac_sock)
+    mask_img, mask_chain = _socket_linked_image_with_chain(fac_sock, context=context)
     if mask_img is None or not isinstance(mask_img, bpy.types.Image):
         return None
     if mask_img.size[0] == 0 or mask_img.size[1] == 0:
@@ -4099,6 +3897,7 @@ def _try_alpha_cutout_emission_mixshader(node, n1, n2, p1, p2, fac_sock, writer,
             "srgb" if mask_img.colorspace_settings.name.lower().startswith("srgb")
             else "linear",
             mask_chain,
+            context=context,
         )
     mask_rgba = mask_pix.reshape((mh, mw, 4))
     # Use the texture's alpha channel when the factor socket is the
@@ -4151,18 +3950,20 @@ def _try_alpha_cutout_emission_mixshader(node, n1, n2, p1, p2, fac_sock, writer,
     return out
 
 
-def _from_mix(node, writer, textures, mat_name: str) -> dict:
+def _from_mix(node, writer, textures, mat_name: str, *, context=None) -> dict:
     """Shader Mix: lerp Principled params by the constant Factor.
 
     A linked Factor is not bakeable into scalar params, so we warn and lerp at
     fac=0.5 — the least-biased collapse (and no side is silently dropped).
     """
+    if context is None:
+        context = ExportContext()
     in1 = _follow_reroutes(node.inputs[1])
     in2 = _follow_reroutes(node.inputs[2])
     n1 = in1.links[0].from_node if in1.is_linked else None
     n2 = in2.links[0].from_node if in2.is_linked else None
-    p1 = _resolve_shader(n1, writer, textures, mat_name) if n1 else _default_params()
-    p2 = _resolve_shader(n2, writer, textures, mat_name) if n2 else _default_params()
+    p1 = _resolve_shader(n1, writer, textures, mat_name, context=context) if n1 else _default_params()
+    p2 = _resolve_shader(n2, writer, textures, mat_name, context=context) if n2 else _default_params()
 
     fac_sock = _follow_reroutes(node.inputs[0])
     view_ior = _view_dependent_ior(fac_sock) if fac_sock.is_linked else None
@@ -4236,7 +4037,8 @@ def _from_mix(node, writer, textures, mat_name: str) -> dict:
         # into its alpha channel and set `alpha_threshold` so the
         # kernel cuts holes through the ribbon.
         baked = _try_alpha_cutout_mixshader(
-            node, n1, n2, p1, p2, fac_sock, writer, textures
+            node, n1, n2, p1, p2, fac_sock, writer, textures,
+            context=context,
         )
         if baked is not None:
             return baked
@@ -4247,7 +4049,8 @@ def _from_mix(node, writer, textures, mat_name: str) -> dict:
         # fallback collapses to shader1's params and either drops the
         # emission or the cutout silhouette.
         baked = _try_alpha_cutout_emission_mixshader(
-            node, n1, n2, p1, p2, fac_sock, writer, textures
+            node, n1, n2, p1, p2, fac_sock, writer, textures,
+            context=context,
         )
         if baked is not None:
             return baked
@@ -4255,15 +4058,16 @@ def _from_mix(node, writer, textures, mat_name: str) -> dict:
         # paired with Transparent. Catches pabellon's `leafs` material —
         # a MixShader whose lit side is itself a MixShader/AddShader.
         baked = _try_alpha_cutout_generic_mixshader(
-            node, n1, n2, p1, p2, fac_sock, writer, textures
+            node, n1, n2, p1, p2, fac_sock, writer, textures,
+            context=context,
         )
         if baked is not None:
             return baked
         # Try to fold the factor to a scalar (constant-driven Math /
         # procedural → mean).
-        fac = _resolve_constant_scalar(fac_sock)
+        fac = _resolve_constant_scalar(fac_sock, context=context)
         if fac is None:
-            _warn(
+            context.warn(
                 f"mixshader-fac-linked:{node.as_pointer()}",
                 f"{_node_tag(node)}: MixShader Factor is linked and not "
                 f"foldable — keeping shader1's params (per-pixel mix not "
@@ -4575,17 +4379,19 @@ def _sides_need_secondary(p1: dict, p2: dict) -> bool:
     return False
 
 
-def _from_group(node, writer, textures, mat_name: str) -> dict:
+def _from_group(node, writer, textures, mat_name: str, *, context=None) -> dict:
+    if context is None:
+        context = ExportContext()
     tree = node.node_tree
     if tree is None:
-        _warn(f"group-empty:{node.as_pointer()}", f"empty node group {_node_tag(node)}")
+        context.warn(f"group-empty:{node.as_pointer()}", f"empty node group {_node_tag(node)}")
         return _default_params()
     group_output = next(
         (n for n in tree.nodes if n.bl_idname == "NodeGroupOutput"),
         None,
     )
     if group_output is None:
-        _warn(f"group-noout:{tree.name}", f"group {tree.name!r} has no output node")
+        context.warn(f"group-noout:{tree.name}", f"group {tree.name!r} has no output node")
         return _default_params()
     for sock in group_output.inputs:
         sock = _follow_reroutes(sock)
@@ -4593,12 +4399,12 @@ def _from_group(node, writer, textures, mat_name: str) -> dict:
             inner = sock.links[0].from_node
             # Push so chain traversal inside the inner BSDF can follow
             # NodeGroupInput → external socket on this group node.
-            _GROUP_STACK.append(node)
+            context.group_stack.append(node)
             try:
-                return _resolve_shader(inner, writer, textures, mat_name)
+                return _resolve_shader(inner, writer, textures, mat_name, context=context)
             finally:
-                _GROUP_STACK.pop()
-    _warn(
+                context.group_stack.pop()
+    context.warn(
         f"group-nolink:{tree.name}",
         f"group {tree.name!r} output has no linked input",
     )
@@ -4606,19 +4412,20 @@ def _from_group(node, writer, textures, mat_name: str) -> dict:
 
 
 def export_material(
-    mat: bpy.types.Material, writer, textures: list
+    mat: bpy.types.Material, writer, textures: list,
+    *, context=None,
 ) -> dict:
     """Dispatch to the surface-node handler; fall back to diffuse_color."""
-    global _CURRENT_MATERIAL
-    # Reset dedup state so each material emits its own set of warnings.
-    _LOGGED_WARNINGS.clear()
-    _CURRENT_MATERIAL = mat.name
+    if context is None:
+        context = ExportContext()
+    previous_material = context.material
+    context.material = mat.name
     # Exclude nested texture/bake children so material_self_s is additive with
     # texture_self_s + pixel_read_s + bake_chain_s in the summary log.
     t_enter = time.perf_counter()
-    tex_before = _STATS["texture_self_s"]
-    pixel_before = _STATS["pixel_read_s"]
-    bake_before = _STATS["bake_chain_s"]
+    tex_before = context.stats["texture_self_s"]
+    pixel_before = context.stats["pixel_read_s"]
+    bake_before = context.stats["bake_chain_s"]
     try:
         if not mat.use_nodes:
             p = _default_params()
@@ -4637,14 +4444,14 @@ def export_material(
                 None,
             )
         if out_node is None:
-            _warn("no-output", "no ShaderNodeOutputMaterial — using default params")
+            context.warn("no-output", "no ShaderNodeOutputMaterial — using default params")
             return _default_params()
 
         # Resolve the (optional) Volume socket first — that decides whether a
         # missing Surface is fatal (return defaults) or the material is just
         # a pure-volume container (return defaults + volume + volume_only).
         volume_sock = out_node.inputs.get("Volume")
-        volume = _resolve_volume(volume_sock)
+        volume = _resolve_volume(volume_sock, context=context)
         surface_sock = _follow_reroutes(out_node.inputs["Surface"])
         surface_linked = surface_sock.is_linked
 
@@ -4669,7 +4476,7 @@ def export_material(
             return params
 
         surface = surface_sock.links[0].from_node
-        params = _resolve_shader_input(surface_sock, writer, textures, mat.name)
+        params = _resolve_shader_input(surface_sock, writer, textures, mat.name, context=context)
         from .shader_graph import compile_aovs
 
         compile_aovs(
@@ -4678,6 +4485,7 @@ def export_material(
             writer,
             textures,
             [a for a in bpy.context.view_layer.aovs if a.is_valid],
+            context=context,
         )
         displacement_method = getattr(mat, "displacement_method", "BUMP")
         if displacement_method == "BUMP":
@@ -4685,10 +4493,11 @@ def export_material(
 
             try:
                 compile_displacement(
-                    out_node.inputs.get("Displacement"), params, writer, textures
+                    out_node.inputs.get("Displacement"), params, writer, textures,
+                    context=context,
                 )
             except UnsupportedNode as exc:
-                _warn(
+                context.warn(
                     f"displacement:{mat.name}",
                     f"{mat.name}: displacement graph limitation: {exc}",
                 )
@@ -4696,7 +4505,7 @@ def export_material(
         # Per-material UV transform: read it off the TexImage nodes rather
         # than picking up any Mapping node (which may drive a Noise procedural,
         # not the actual image sample).
-        affine = _first_teximage_uv_transform(mat.node_tree)
+        affine = _first_teximage_uv_transform(mat.node_tree, context=context)
         if affine is not None:
             params["uv_transform"] = affine
 
@@ -4709,17 +4518,17 @@ def export_material(
 
         return params
     finally:
-        _CURRENT_MATERIAL = ""
+        context.material = previous_material
         dt = time.perf_counter() - t_enter
         children = (
-            (_STATS["texture_self_s"] - tex_before)
-            + (_STATS["pixel_read_s"] - pixel_before)
-            + (_STATS["bake_chain_s"] - bake_before)
+            (context.stats["texture_self_s"] - tex_before)
+            + (context.stats["pixel_read_s"] - pixel_before)
+            + (context.stats["bake_chain_s"] - bake_before)
         )
         self_s = max(0.0, dt - children)
-        _STATS["material_self_s"] += self_s
+        context.stats["material_self_s"] += self_s
         if self_s > 0.10:
-            slow = _STATS["slow_materials"]
+            slow = context.stats["slow_materials"]
             slow.append((mat.name, self_s))
             slow.sort(key=lambda e: e[1], reverse=True)
             del slow[5:]
