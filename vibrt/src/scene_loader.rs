@@ -6,6 +6,7 @@ use crate::transform;
 use anyhow::{anyhow, Context, Result};
 use rayon::prelude::*;
 use std::borrow::Cow;
+use std::sync::OnceLock;
 
 pub struct LoadedMesh<'bin> {
     pub attributes: Vec<(u64, Cow<'bin, [f32]>)>,
@@ -1227,15 +1228,16 @@ fn load_texture<'a>(desc: &TextureDesc, texture_arrays: &[&'a [f32]]) -> Result<
             // pow-2.4 and dominates load_scene on its own. par_chunks_mut
             // gives each worker a contiguous range so there's no false
             // sharing on the output buffer.
+            let table = srgb_byte_table();
             let mut out: Vec<f32> = vec![0.0; src.len()];
             const CHUNK: usize = 1 << 16; // 64K floats = 16K pixels per task
             out.par_chunks_mut(CHUNK)
                 .zip(src.par_chunks(CHUNK))
                 .for_each(|(dst, s)| {
                     for (d, c) in dst.chunks_exact_mut(4).zip(s.chunks_exact(4)) {
-                        d[0] = srgb_to_linear(c[0]);
-                        d[1] = srgb_to_linear(c[1]);
-                        d[2] = srgb_to_linear(c[2]);
+                        d[0] = srgb_to_linear_cached(c[0], table);
+                        d[1] = srgb_to_linear_cached(c[1], table);
+                        d[2] = srgb_to_linear_cached(c[2], table);
                         d[3] = c[3];
                     }
                 });
@@ -1277,11 +1279,122 @@ fn srgb_to_linear(x: f32) -> f32 {
     }
 }
 
+fn srgb_byte_table() -> &'static [(u32, f32); 256] {
+    static TABLE: OnceLock<[(u32, f32); 256]> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        std::array::from_fn(|i| {
+            // Blender expands byte images by multiplying by this reciprocal.
+            // Compute the existing transfer function once for each exact input.
+            let x = i as f32 * (1.0 / 255.0);
+            (x.to_bits(), srgb_to_linear(x))
+        })
+    })
+}
+
+#[inline]
+fn srgb_to_linear_cached(x: f32, table: &[(u32, f32); 256]) -> f32 {
+    if x <= 0.04045 {
+        return x / 12.92;
+    }
+    // The saturating cast is safe for every float, including NaN and HDR.
+    // Quantization only selects a candidate: require exact input bits before
+    // reusing its result so arbitrary float textures keep the original formula.
+    let (bits, linear) = table[(x * 255.0 + 0.5) as u8 as usize];
+    if x.to_bits() == bits {
+        linear
+    } else {
+        srgb_to_linear(x)
+    }
+}
+
 fn normalize3(v: [f32; 3]) -> [f32; 3] {
     let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
     if len < 1e-20 {
         [0.0, 0.0, 1.0]
     } else {
         [v[0] / len, v[1] / len, v[2] / len]
+    }
+}
+
+#[cfg(test)]
+mod texture_color_tests {
+    use super::*;
+
+    #[test]
+    fn cached_srgb_matches_transfer_function_bits() {
+        let table = srgb_byte_table();
+        let check = |x: f32| {
+            assert_eq!(
+                srgb_to_linear_cached(x, table).to_bits(),
+                srgb_to_linear(std::hint::black_box(x)).to_bits(),
+                "sRGB input bits: {:08x}",
+                x.to_bits()
+            );
+        };
+        for i in 0..256 {
+            let x = i as f32 * (1.0 / 255.0);
+            check(x);
+            check(i as f32 / 255.0);
+            check(f32::from_bits(x.to_bits().wrapping_sub(1)));
+            check(f32::from_bits(x.to_bits() + 1));
+        }
+        for x in [
+            0.0,
+            -0.0,
+            0.04045,
+            -0.1,
+            0.5,
+            1.01,
+            100.0,
+            f32::MIN,
+            f32::MAX,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+        ] {
+            check(x);
+        }
+        // Exercise arbitrary non-byte inputs, both signs, subnormals and NaN
+        // payloads; these must not be approximated by the nearest byte value.
+        let mut bits = 0x12345678_u32;
+        for _ in 0..100_000 {
+            bits = bits.wrapping_mul(1664525).wrapping_add(1013904223);
+            check(f32::from_bits(bits));
+        }
+    }
+
+    #[test]
+    fn rgba_texture_conversion_preserves_alpha_and_linear_borrowing() {
+        let mut pixels = Vec::new();
+        for i in 0..256 {
+            pixels.extend_from_slice(&[
+                i as f32 * (1.0 / 255.0),
+                i as f32 / 255.0,
+                i as f32 / 128.0 - 0.5,
+                f32::from_bits(0x80000000 | i),
+            ]);
+        }
+        let mut desc = TextureDesc {
+            width: 256,
+            height: 1,
+            channels: 4,
+            colorspace: "sRGB".into(),
+            array_index: 0,
+        };
+        let result = load_texture(&desc, &[&pixels]).unwrap();
+        assert!(matches!(result.data, Cow::Owned(_)));
+        for (src, dst) in pixels.chunks_exact(4).zip(result.data.chunks_exact(4)) {
+            for channel in 0..3 {
+                assert_eq!(
+                    dst[channel].to_bits(),
+                    srgb_to_linear(src[channel]).to_bits()
+                );
+            }
+            assert_eq!(dst[3].to_bits(), src[3].to_bits());
+        }
+        desc.colorspace = "linear".into();
+        let result = load_texture(&desc, &[&pixels]).unwrap();
+        assert!(matches!(result.data, Cow::Borrowed(_)));
+        assert_eq!(result.data.as_ptr(), pixels.as_ptr());
     }
 }
