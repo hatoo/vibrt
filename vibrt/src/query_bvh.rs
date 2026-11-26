@@ -36,7 +36,7 @@ pub fn build(bounds: &[Bounds]) -> (Vec<QueryNode>, Vec<u32>) {
 // Median splits depend only on primitive count. At the last complete level,
 // each of `width` nodes has 4..=7 primitives; only those with >4 split again.
 // A full binary tree with L leaves has 2*L-1 nodes.
-fn node_count(primitives: usize) -> usize {
+pub(crate) fn node_count(primitives: usize) -> usize {
     if primitives <= 4 {
         return usize::from(primitives != 0);
     }

@@ -1,4 +1,4 @@
-//! Reuse only owning GPU contexts between successful renders on one thread.
+//! Reuse owning GPU contexts and bounded CPU query data on one render thread.
 
 use crate::CudaResultExt;
 use anyhow::{Context, Result};
@@ -11,6 +11,7 @@ use std::sync::Arc;
 pub(super) struct Contexts {
     pub optix: DeviceContext,
     pub cuda: Arc<CudaContext>,
+    pub queries: RefCell<super::query_cache::QueryCache>,
 }
 
 impl Contexts {
@@ -23,7 +24,11 @@ impl Contexts {
             &DeviceContextOptions::default(),
         )
         .context("OptiX context")?;
-        Ok(Self { optix, cuda })
+        Ok(Self {
+            optix,
+            cuda,
+            queries: RefCell::new(super::query_cache::QueryCache::default()),
+        })
     }
 }
 
@@ -35,7 +40,8 @@ impl Drop for Contexts {
 }
 
 thread_local! {
-    // No scene buffers, pipelines, RNA pointers or callbacks survive a render.
+    // Only owned CPU query data accompanies the contexts: no device scene
+    // buffers, pipelines, RNA pointers or callbacks survive a render.
     // Each thread owns at most one idle pair, released when the thread exits.
     static IDLE: RefCell<Option<Contexts>> = const { RefCell::new(None) };
 }

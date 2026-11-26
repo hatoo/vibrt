@@ -7,6 +7,7 @@
 
 mod contexts;
 mod mesh_uploads;
+mod query_cache;
 mod sample_batches;
 
 use crate::gpu_types::*;
@@ -21,7 +22,6 @@ use anyhow::{Context, Result};
 use cudarc::driver::{CudaSlice, CudaStream, DevicePtr};
 use optix::accel::{self, AccelBuildOptions, BuildInput, TriangleArrayInput};
 use optix::*;
-use rayon::prelude::*;
 use std::mem;
 use std::sync::Arc;
 
@@ -433,21 +433,24 @@ fn render_with_contexts(
     let mut mesh_uploads = mesh_uploads::MeshUploads::new(stream.clone())?;
     let mut meshes_gpu: Vec<MeshGpu> = Vec::new();
 
-    // CPU query trees are independent per mesh. Prepare a small batch in
-    // parallel, then consume it in scene order on the render's CUDA thread.
-    // Batching limits temporary host trees to 32 meshes instead of the scene.
-    let meshes_with_queries = scene.meshes.chunks(32).flat_map(|meshes| {
-        let queries: Vec<_> = if scene_queries {
-            meshes
-                .par_iter()
-                .map(|m| crate::query_bvh::build_triangles(&m.vertices, &m.indices))
-                .collect()
-        } else {
-            vec![(Vec::new(), Vec::new()); meshes.len()]
-        };
-        meshes.iter().zip(queries)
-    });
-    for (m, (query_nodes, query_indices)) in meshes_with_queries {
+    // Compare complete geometry against owned query data from the last render.
+    // Cache misses still build in parallel batches of at most 32 meshes.
+    let mut query_cache = contexts.queries.borrow_mut();
+    query_cache.begin(if scene_queries { &scene.meshes } else { &[] });
+    let meshes_with_queries = scene
+        .meshes
+        .chunks(32)
+        .enumerate()
+        .flat_map(|(batch, meshes)| {
+            let queries = if scene_queries {
+                query_cache.batch(batch * 32, meshes)
+            } else {
+                let empty = Arc::new(query_cache::QueryTree::default());
+                vec![empty; meshes.len()]
+            };
+            meshes.iter().zip(queries)
+        });
+    for (m, query) in meshes_with_queries {
         let verts_ptr = mesh_uploads.copy_slice(&m.vertices[..])?;
         let idx_ptr = mesh_uploads.copy_slice(&m.indices[..])?;
 
@@ -509,8 +512,8 @@ fn render_with_contexts(
                 _pad: 0,
             });
         }
-        let query_nodes = mesh_uploads.copy_slice(&query_nodes)?;
-        let query_indices = mesh_uploads.copy_slice(&query_indices)?;
+        let query_nodes = mesh_uploads.copy_slice(&query.nodes)?;
+        let query_indices = mesh_uploads.copy_slice(&query.indices)?;
         meshes_gpu.push(MeshGpu {
             query_nodes,
             query_indices,
@@ -530,6 +533,7 @@ fn render_with_contexts(
         _buffers.push(d_temp);
         _buffers.push(d_output);
     }
+    drop(query_cache);
     mesh_uploads.finish()?;
 
     // Reverse mapping object_idx → mesh_light_idx (or -1 when the object
