@@ -74,3 +74,20 @@ deslop-please --features python       # module boundaries and dependencies
 `make test` uses a POSIX shell and NumPy; native binding tests need a staged extension. `cargo test -p vibrt-nodes` runs the shared CPU core without Blender or CUDA. GPU regression commands are documented in [blender/README.md](blender/README.md) and the [node support matrix](docs/shader-nodes.md).
 
 [deslop-please](https://github.com/deterministic-machines/deslop-please) checks the native workspace's architecture. Python bindings live in `vibrt/src/python/`; the renderer and shader compiler share the independent `Progress` interface in `progress.rs`.
+
+## Continuous optimization with Codex
+
+With Codex CLI installed and logged in, start a manual optimization loop:
+
+```powershell
+py scripts/auto_optimize.py
+```
+
+The loop uses a dedicated worktree, repeats implementation, performance/image
+comparisons and relevant tests, then opens a PR per verified improvement. It fixes failed CI on the
+same PR and merges after CI passes. Use **Ctrl+C** to interrupt or `py scripts/auto_optimize.py --stop` in
+another terminal to finish the current round. See [loop configuration and logs](docs/auto-optimization.md).
+
+Old optimizer build artifacts are cleaned at startup and between rounds, keeping
+the newest three runs and recovery/publication checkpoints. Reports and source
+snapshots remain available; new experiments wait when free space falls below 10 GiB.
