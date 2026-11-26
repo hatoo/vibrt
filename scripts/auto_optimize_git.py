@@ -104,7 +104,8 @@ def sync_workspace(workspace):
             checkpoint_experiment(workspace, head)
         git(workspace, "merge", "--ff-only", "--no-overwrite-ignore", remote)
     if (workspace / ".gitmodules").is_file():
-        git(workspace, "submodule", "update", "--init", "--depth", "1", timeout=900)
+        git(workspace, "-c", "core.longpaths=true", "submodule", "update", "--init",
+            "--depth", "1", timeout=900)
 
 
 def queue_publication(workspace, output, directory, result, baseline, previous=None):
