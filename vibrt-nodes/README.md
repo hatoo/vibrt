@@ -1,7 +1,7 @@
 # vibrt-nodes
 
-Sky and shader value nodes, independent of Blender and the renderer. Rust owns
-buffers, validates inputs and packs graphs; C++ evaluates node values.
+Sky, shader value nodes and surface closures, independent of Blender's runtime.
+Rust owns buffers, validates inputs and packs graphs; C++ evaluates node values.
 
 - `src/graph.rs`, `src/types.rs`: scene-facing graph schema and GPU layout.
 - `native/core.h`: one color implementation compiled for CPU batches and CUDA.
@@ -12,7 +12,10 @@ buffers, validates inputs and packs graphs; C++ evaluates node values.
 - `src/shader.rs`: validated multi-output shader DAG, texture/LUT bindings.
 - `native/shader.h`: shared CPU/CUDA interpreter for typed scalar, vector and
   color sockets, image/procedural textures, normals and shading context.
-- `third_party/cycles/`: pinned Cycles 5.1.1 numerical helpers and provenance.
+- `native/bsdf.h`: Cycles closure assembly from explicit material parameters.
+- `third_party/blender/`: Blender v5.1.1 git submodule; `build.rs` extracts the
+  numerical functions and tables from `intern/cycles` without modifying them.
+- `third_party/cycles/README.md`: source provenance, adapters and license notes.
 
 The Blender addon reads node connections and curve tables. Its `node_ops.py`
 adapter normalizes array shapes and calls the PyO3 bindings in
@@ -29,7 +32,9 @@ No source files or C++ compiler are needed by an installed addon at runtime.
 
 General graphs use Blender socket conversion rules and evaluate each connected
 material parameter at the hit point. Mix/Add Shader retain separate closures.
-Shader closure physics and scene traversal remain renderer responsibilities.
+Closure evaluation, sampling and PDFs reuse Cycles C++ on CPU/CUDA. Principled
+layer assembly adapts Cycles' SVM setup to explicit parameters; scene traversal,
+light sampling and path integration remain renderer responsibilities.
 `ShaderGraph::optimized()` folds pure constant subgraphs through the C++ VM,
 prunes unused nodes and shares identical expressions, including repeated image,
 noise and coordinate calculations. Keys include all float bits, resource IDs,
@@ -48,6 +53,7 @@ Blender atmosphere sources.
 Requires Rust and a C++17 compiler; the core needs no Blender, CUDA or OptiX:
 
 ```sh
+git submodule update --init --depth 1
 cargo test -p vibrt-nodes
 ```
 
@@ -73,4 +79,8 @@ vertex alpha, object attributes, normal maps, group instance defaults and
 Mix/Add closures against Cycles. Run these through Blender with
 `-b --factory-startup --python-exit-code 1 --python SCRIPT`.
 `scripts/test_shader_lighting.py` checks illumination from procedural emissive
-meshes, not just camera-visible emission.
+meshes, not just camera-visible emission. Pass `-- --layered` to check attenuation
+by Principled coat and sheen at sampled light points.
+`scripts/test_surface_closures.py` compares rough Diffuse, both Sheen modes,
+GGX/Beckmann/Multi-GGX, physical/F82 metals, thin film, and linked Principled
+layers under environment and Sun lighting.

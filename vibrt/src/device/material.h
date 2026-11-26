@@ -1,6 +1,4 @@
 // ---------- Colour graph evaluator ----------
-#include "vibrt_nodes_core.h"
-#include "vibrt_shader.h"
 static __device__ float volume_phase_eval(const Volume *vol, float cosine) {
 #if VIBRT_EXTENDED_PHASES
   return vol->phase == 0
@@ -167,6 +165,8 @@ struct MaterialEval {
   float sheen_weight, sheen_roughness, sss_weight, translucent_weight;
   float hair_offset, hair_roughness_u, hair_roughness_v, alpha_blend;
   float3 sheen_tint, sss_radius;
+  float3 specular_tint, coat_tint, coat_normal, conductor_ior, conductor_k;
+  float thin_film_thickness, thin_film_ior, diffuse_roughness;
 #if (VIBRT_CLOSURE_TYPES & (1u << 7))
   float sss_scale, sss_ior, sss_anisotropy;
   bool sss_exit;
@@ -181,6 +181,34 @@ struct MaterialEval {
 #endif
   PrincipledGpu *mat; // raw material ptr for coat/sheen/sss params
 };
+
+static __device__ vibrt_surface::Parameters surface_parameters(const MaterialEval &e, float3 incoming) {
+  using vibrt_cycles::make_float3;
+  auto cv = [](::float3 v) { return make_float3(v.x, v.y, v.z); };
+  vibrt_surface::Parameters p{};
+  p.N = cv(e.Ns); p.Ng = cv(dot3(e.Ng, incoming) < 0 ? -e.Ng : e.Ng);
+  p.T = cv(e.T); p.wi = cv(incoming);
+  p.coat_normal = vibrt_cycles::safe_normalize_fallback(cv(e.coat_normal), p.N);
+  p.color = vibrt_cycles::max(cv(e.base_color), vibrt_cycles::zero_spectrum());
+  p.specular_tint = vibrt_cycles::max(cv(e.specular_tint), vibrt_cycles::zero_spectrum());
+  p.coat_tint = cv(e.coat_tint);
+  p.sheen_tint = vibrt_cycles::max(cv(e.sheen_tint), vibrt_cycles::zero_spectrum());
+  p.conductor_ior = cv(e.conductor_ior); p.conductor_k = cv(e.conductor_k);
+  p.alpha_x = e.alpha_x; p.alpha_y = e.alpha_y; p.alpha = e.alpha; p.roughness = e.roughness;
+  p.backfacing = dot3(e.Ng, incoming) < 0; p.ior = p.backfacing ? 1 / e.ior : e.ior;
+  p.metallic = e.metallic; p.transmission = e.transmission;
+  p.specular_level = fmaxf(e.specular_ior_level, 0);
+  p.diffuse_roughness = __saturatef(e.diffuse_roughness);
+  p.coat = e.coat_weight; p.coat_alpha = e.coat_alpha; p.coat_ior = fmaxf(e.coat_ior, 1);
+  p.sheen = e.sheen_weight; p.sheen_roughness = e.sheen_roughness;
+  p.thin_film_thickness = e.thin_film_thickness; p.thin_film_ior = fmaxf(e.thin_film_ior, 1e-5f);
+  p.subsurface = e.sss_weight; p.translucent = e.translucent_weight;
+  p.model = e.mat->surface_model; p.distribution = e.mat->distribution;
+  if (!p.model && e.mat->pure_glossy) p.model = vibrt_surface::GLOSSY;
+  if (!p.model && e.mat->pure_diffuse)
+    p.model = e.sheen_weight > 0 ? vibrt_surface::SHEEN : vibrt_surface::DIFFUSE;
+  return p;
+}
 
 // Group of leaf MaterialEvals + their per-leaf weights. The weights sum
 // to 1 across the group (modulo per-pixel mix_fac quantisation). Built
@@ -223,6 +251,14 @@ static __device__ __noinline__ MaterialEval eval_material_one(const PathVertex &
   e.portal_direction = -v.incoming;
 #endif
   e.base_color = make_f3(m->base_color);
+  e.specular_tint = make_f3(m->specular_tint);
+  e.coat_tint = make_f3(m->coat_tint);
+  e.coat_normal = make_f3(m->coat_normal);
+  e.thin_film_thickness = m->thin_film_thickness;
+  e.thin_film_ior = m->thin_film_ior;
+  e.conductor_ior = make_f3(m->conductor_ior);
+  e.conductor_k = make_f3(m->conductor_k);
+  e.diffuse_roughness = m->diffuse_roughness;
   e.metallic = m->metallic;
   e.roughness = m->roughness;
   e.ior = m->ior;
@@ -303,6 +339,13 @@ static __device__ __noinline__ MaterialEval eval_material_one(const PathVertex &
     GRAPH_SCALAR(14,sheen_weight);GRAPH_SCALAR(15,sheen_roughness);GRAPH_COLOR(16,sheen_tint);
     GRAPH_SCALAR(17,sss_weight);GRAPH_COLOR(18,sss_radius);GRAPH_SCALAR(19,translucent_weight);
     GRAPH_SCALAR(20,hair_offset);GRAPH_SCALAR(21,hair_roughness_u);GRAPH_SCALAR(22,hair_roughness_v);
+    GRAPH_COLOR(31, conductor_ior);
+#if VIBRT_SHADER_OUTPUT_COUNT > 32
+    GRAPH_COLOR(36, specular_tint); GRAPH_COLOR(37, coat_tint); GRAPH_COLOR(38, coat_normal);
+    GRAPH_SCALAR(39, thin_film_thickness); GRAPH_SCALAR(40, thin_film_ior);
+    GRAPH_COLOR(48, conductor_k);
+    GRAPH_SCALAR(49, diffuse_roughness);
+#endif
 #if (VIBRT_CLOSURE_TYPES & (1u << 7))
     GRAPH_SCALAR(41, sss_scale);
     GRAPH_SCALAR(42, sss_ior);
@@ -374,7 +417,7 @@ static __device__ __noinline__ MaterialEval eval_material_one(const PathVertex &
   // No separate roughness floor — the alpha clamp below is the sampler's
   // numerical safeguard; forcing a minimum roughness on top of it would
   // silently turn artist-authored mirrors into slightly-rough dielectrics.
-  e.alpha = fmaxf(e.roughness * e.roughness, 1e-4f);
+  e.alpha = e.roughness * e.roughness;
   // Filter-glossy: the path tracer raises `min_alpha` once it's already
   // taken at least one glossy / specular bounce so that subsequent
   // near-mirror evals can't refocus the radiance into a tiny solid
@@ -453,16 +496,19 @@ static __device__ __noinline__ MaterialEval eval_material_one(const PathVertex &
     build_frame(e.Ns, e.T, e.B);
   }
 
-  // Anisotropic α. Disney remap: aspect = sqrt(1 - 0.9·|aniso|).
-  float aniso = fminf(fmaxf(e.anisotropy, -1.0f), 1.0f);
-  float aspect = sqrtf(fmaxf(1.0f - 0.9f * fabsf(aniso), 1e-4f));
-  if (aniso >= 0.0f) {
+  // Cycles uses a distinct roughness remapping for the standalone Glossy node.
+  float aniso = fminf(fmaxf(e.anisotropy, -0.99f), 0.99f);
+  if (m->surface_model == vibrt_surface::GLOSSY || (!m->surface_model && m->pure_glossy)) {
+    float aspect = 1 - fabsf(aniso);
+    e.alpha_x = aniso < 0 ? e.alpha / aspect : e.alpha * aspect;
+    e.alpha_y = aniso < 0 ? e.alpha * aspect : e.alpha / aspect;
+  } else {
+    float aspect = sqrtf(1 - 0.9f * fmaxf(aniso, 0));
     e.alpha_x = e.alpha / aspect;
     e.alpha_y = e.alpha * aspect;
-  } else {
-    e.alpha_x = e.alpha * aspect;
-    e.alpha_y = e.alpha / aspect;
   }
+  e.alpha_x = fmaxf(e.alpha_x, min_alpha);
+  e.alpha_y = fmaxf(e.alpha_y, min_alpha);
   // Coat α also gets the filter-glossy floor applied. Pebble materials
   // in pabellon use a Fresnel-driven MixShader → my exporter routes the
   // glossy side onto the coat lobe with a low coat_roughness (~0.45),
@@ -470,7 +516,7 @@ static __device__ __noinline__ MaterialEval eval_material_one(const PathVertex &
   // pool's surface into a sharper cone than the path has already
   // sampled. Same min_alpha as the main lobe — Cycles' filter_glossy
   // is a single state shared across all glossy lobes.
-  e.coat_alpha = fmaxf(e.coat_roughness * e.coat_roughness, 1e-4f);
+  e.coat_alpha = e.coat_roughness * e.coat_roughness;
   if (min_alpha > e.coat_alpha)
     e.coat_alpha = min_alpha;
   // Tangent rotation around Ns.
@@ -482,6 +528,13 @@ static __device__ __noinline__ MaterialEval eval_material_one(const PathVertex &
     float3 Brot = e.B * c - e.T * s;
     e.T = normalize3(Trot);
     e.B = normalize3(Brot);
+  }
+  if (!m->surface_model && !m->pure_diffuse && !m->pure_glossy &&
+      (e.coat_weight > 0 || e.sheen_weight > 0) && dot3(e.emission, e.emission) > 0) {
+    auto p = surface_parameters(e, v.incoming);
+    if (p.backfacing) { p.N = -p.N; p.coat_normal = -p.coat_normal; }
+    auto attenuation = vibrt_surface::emission_weight(p);
+    e.emission = e.emission * make_float3(attenuation.x, attenuation.y, attenuation.z);
   }
   return e;
 }
@@ -509,7 +562,7 @@ static __device__ float compute_level_mix_fac(PrincipledGpu *m, const PathVertex
   // the clearcoat on the curved car body (seen mostly at grazing).
   if (m->mix_fac < 0.0f) {
     float ior = -m->mix_fac;
-    return fminf(fmaxf(fresnel_dielectric(fabsf(NoV), ior), 0.0f), 1.0f);
+    return fminf(fmaxf(vibrt_cycles::fresnel_dielectric_cos(fabsf(NoV), ior), 0.0f), 1.0f);
   }
   const float *M = m->uv_transform;
   float2 uv_xform =
@@ -730,287 +783,12 @@ static __device__ __noinline__ BsdfEval eval_bsdf_one(const MaterialEval &e, flo
   if (e.mat->hair_weight > 0.5f)
     return eval_hair(e, wo, wi);
 
-  float NoL = dot3(e.Ns, wi);
-  bool reflect = NoL > 0.0f;
-  bool transmit = !reflect && e.transmission > 0.0f;
-  // Translucent BSDF: Lambertian on the back hemisphere. Active when wi is
-  // on the side opposite wo (NoL < 0) — light passing through a thin sheet.
-  bool translucent_active =
-      !reflect && e.translucent_weight > 0.0f && e.transmission <= 0.0f;
-
-  // Cycles Principled F0 = ((ior-1)/(ior+1))² × 2 × specular_ior_level.
-  // The user-set Specular IOR Level (default 0.5 → multiplier 1.0)
-  // scales F0 — flat_archiviz's Anta Cucina / Base / Book materials
-  // (Specular IOR Level 0.30-0.35) pushed the dielectric Schlick lift
-  // by 30-40% over Cycles before this fix.
-  float F0_d =
-      ((e.ior - 1.0f) / (e.ior + 1.0f)) * ((e.ior - 1.0f) / (e.ior + 1.0f))
-      * (2.0f * e.specular_ior_level);
-
-  // Coat Fresnel parameters (used both for MIS weighting and the coat BRDF).
-  PrincipledGpu *mc = e.mat;
-  float coat_w_mat = e.coat_weight;
-  float coat_alpha = e.coat_alpha;  // already filter-glossy-clamped
-  float cF0 = ((e.coat_ior - 1.0f) / (e.coat_ior + 1.0f)) *
-              ((e.coat_ior - 1.0f) / (e.coat_ior + 1.0f));
-
-  // Weights for MIS between lobes. Coat gets `coat_weight·F_coat(V)` so its
-  // sampling budget follows the actual lobe intensity at this view angle —
-  // at grazing the coat dominates, at normal it contributes weakly.
-  // translucent_weight steals from the forward diffuse budget: t_w=1 → no
-  // forward Lambert, all diffuse energy on the back hemisphere; t_w=0.5 →
-  // even split (Mix Shader of Diffuse + Translucent).
-  float t_w = e.translucent_weight;
-  float w_base_diff = (1.0f - e.metallic) * (1.0f - e.transmission);
-  float w_diffuse = w_base_diff * (1.0f - t_w) * (1.0f - e.sss_weight);
-  float w_translucent = w_base_diff * t_w;
-  // Cycles' Diffuse BSDF has no specular / coat layer. Force the
-  // associated lobes to zero so we end up with exactly one Lambertian
-  // term — the existing Principled mapping leaks a `(1-VoH)^5 × GGX`
-  // spec contribution at grazing even with metallic=0, which over-
-  // brightens scenes dominated by ShaderNodeBsdfDiffuse (BMW27's car
-  // body).
-  bool pure_diff = (mc->pure_diffuse != 0);
-  float w_spec = pure_diff ? 0.0f
-      : e.metallic + (1.0f - e.metallic) * (1.0f - e.transmission);
-  float w_trans = pure_diff ? 0.0f
-      : (1.0f - e.metallic) * e.transmission;
-  float w_coat = pure_diff ? 0.0f
-      : coat_w_mat * schlick_scalar(NoV, cF0);
-  float w_sum = w_diffuse + w_translucent + w_spec + w_trans + w_coat;
-  if (w_sum <= 0.0f)
-    return r;
-  float p_diff = w_diffuse / w_sum;
-  float p_translucent = w_translucent / w_sum;
-  float p_spec = w_spec / w_sum;
-  float p_trans = w_trans / w_sum;
-  float p_coat = w_coat / w_sum;
-
-  float NoL_std = fmaxf(NoL, 0.0f);
-
-  if (reflect) {
-    // The remaining local diffuse component; SSS is sampled separately.
-    if (w_diffuse > 0.0f) {
-      float effective = NoL_std;
-      // Energy coupling with the dielectric specular layer above the
-      // diffuse. Cycles' Principled attenuates the diffuse by the
-      // specular layer's directional-hemispherical reflectance so the
-      // pair conserves energy: a white-furnace base-0.8 plane reads
-      // albedo 0.750 (= 0.8 * (1 - E_spec)) in Cycles, but vibrt read
-      // 0.803 (the full Lambert) — an unattenuated diffuse that, summed
-      // over multi-bounce GI, ran the closed 0.8-box ~1.18x over. The
-      // attenuation is VIEW-side only (E_spec(NoV), integrated over
-      // incoming) — the earlier directional (1-F(NoV))(1-F(NoL)) form
-      // over-darkened grazing-lit direct shading. `pure_diff` (Cycles'
-      // standalone Diffuse BSDF, no spec layer) keeps the full Lambert.
-      float spec_T = 1.0f;
-      if (!pure_diff) {
-        // Diffuse-under-dielectric energy coupling: reduce the diffuse by
-        // the specular layer's directional-hemispherical reflectance. The
-        // reflectance scale is F0 (the normal-incidence dielectric Fresnel),
-        // NOT the Schlick hemispherical average f_avg_schlick(F0) = (20F0+1)/21
-        // which for F0=0.04 gives 0.086 — ~2× too high (the (1/21) term is the
-        // grazing F90→1 lift, which the ggx_e_lookup directional factor already
-        // accounts for). Using f_avg over-reduced the diffuse → ~4% under on
-        // Principled-dominated scenes (flat_archiviz / pabellon / bmw27).
-        float E_spec_v = F0_d * ggx_e_lookup(NoV, e.alpha) +
-                         ggx_b_lookup(NoV, e.alpha) * (1.0f - F0_d);
-        spec_T = 1.0f - fminf(fmaxf(E_spec_v, 0.0f), 0.99f);
-      }
-      r.f = r.f + e.base_color * (INV_PIf * w_diffuse * effective * spec_T);
-      r.pdf += p_diff * NoL_std * INV_PIf;
-    }
-    // Specular (metallic + dielectric spec layer). Skipped entirely for
-    // pure-Lambertian Diffuse mappings — Cycles' Diffuse BSDF has no
-    // specular layer and the residual `(1-VoH)^5 × GGX` from the
-    // dielectric Schlick lifts diffuse materials toward white at
-    // glancing angles (the BMW27 car body went +0.10 brighter than
-    // Cycles before this gate).
-    if (!pure_diff) {
-    float3 H = normalize3(wo + wi);
-    float NoH = fmaxf(dot3(e.Ns, H), 0.0f);
-    float VoH = fmaxf(dot3(wo, H), 0.0f);
-    float3 Vloc = make_float3(dot3(wo, e.T), dot3(wo, e.B), dot3(wo, e.Ns));
-    float3 Lloc = make_float3(dot3(wi, e.T), dot3(wi, e.B), dot3(wi, e.Ns));
-    float3 Hloc = make_float3(dot3(H, e.T), dot3(H, e.B), dot3(H, e.Ns));
-    float D = ggx_D_aniso(Hloc, e.alpha_x, e.alpha_y);
-    float G1_v = smith_G1_aniso(Vloc, e.alpha_x, e.alpha_y);
-    float G1_l = smith_G1_aniso(Lloc, e.alpha_x, e.alpha_y);
-    float G = G1_v * G1_l;
-    // For Cycles' Glossy / Anisotropic BSDF the GGX lobe carries no
-    // Fresnel — `bsdf_microfacet_ggx_setup` sets MicrofacetFresnel::NONE
-    // and the per-direction reflectance is just `Color × D × G / (4·NoV·NoL)`.
-    // `pure_glossy` short-circuits Schlick to a uniform `base_color` tint;
-    // without this the spec lobe lifts toward white at grazing on dark
-    // metallic mappings (BMWBlack on bmw27 was visibly too bright on the
-    // rounded car body). Default Principled metal still uses Schlick.
-    float3 F_metal = (mc->pure_glossy != 0)
-        ? e.base_color
-        : schlick_rgb(VoH, e.base_color);
-    // Glass / transmissive materials sample the reflect-vs-refract split via
-    // `fresnel_dielectric` (exact), so the eval has to use the same Fresnel
-    // function — Schlick over-predicts F by ~2× at low IOR (1.0–1.2), which
-    // for water (IOR=1.1) at the camera's grazing pool angle made
-    // glass-reflection paths carry too much radiance and transmission paths
-    // too little. The two formulas match within ~1% for IOR≥1.4 (the typical
-    // dielectric range), so non-glass materials don't notice.
-    float F_dielec = (e.transmission > 0.0f)
-        ? fresnel_dielectric(VoH, e.ior)
-        : schlick_scalar(VoH, F0_d);
-    float3 f_metal = F_metal * (D * G / fmaxf(4.0f * NoV * NoL, 1e-8f));
-    float3 f_dielec = make_float3(F_dielec, F_dielec, F_dielec) *
-                      (D * G / fmaxf(4.0f * NoV * NoL, 1e-8f));
-    // Dielectric surface reflection. For a matte material this is the
-    // standard "spec layer on top of diffuse"; for a glass material
-    // (transmission=1) it's the Fresnel-reflective component the
-    // transmission lobe's sampler picked when `rng.next() < F`. Without
-    // this term, a Glass BSDF surface evaluated on a reflected wi
-    // returns f=0 and pdf=0, the path tracer drops the reflection
-    // entirely, and at grazing angles where glass should mirror-reflect
-    // the rays just transmit straight through to the sky — pabellon's
-    // water plane appeared as the bright sunset sky shining through,
-    // not as a reflective pond.
-    float3 f_spec = e.metallic * f_metal +
-                    (1.0f - e.metallic) * f_dielec;
-
-    // Multi-scattering energy compensation — Cycles' exact form
-    // (kernel/closure/bsdf_microfacet.h `microfacet_ggx_preserve_energy`).
-    // Cycles applies `energy_scale = 1 + (1−E)/E` in the BSDF eval and
-    // `darkening = (1 + Fms·(1−E)/E) / energy_scale` in the weight; the
-    // product is exactly `1 + Fms·(1−E)/E`, a MULTIPLIER on the single-
-    // scatter lobe, with Fms = Fss·Eavg/(1 − Fss·(1−Eavg)) and Fss the
-    // LINEAR average reflectance (F_avg, not F_avg²). The previous additive
-    // Kulla-Conty form (F_avg² + a separate diffuse-shaped lobe) is a
-    // different approximation; matching Cycles' exact algorithm here.
-    float E_wo = ggx_e_lookup(NoV, e.alpha);
-    float E_avg = ggx_e_avg_lookup(e.alpha);
-    float missing = (1.0f - E_wo) / fmaxf(E_wo, 1e-4f);
-    float3 one3 = make_float3(1.0f, 1.0f, 1.0f);
-
-    // pure_glossy: F is constant base_color across all angles, so Fss is
-    // just base_color (skip the Schlick-averaged form's F90→1 lift).
-    float3 Fss_m = (mc->pure_glossy != 0)
-        ? e.base_color
-        : f_avg_schlick(e.base_color);
-    float3 Fms_m = make_float3(
-        Fss_m.x * E_avg / fmaxf(1.0f - Fss_m.x * (1.0f - E_avg), 1e-4f),
-        Fss_m.y * E_avg / fmaxf(1.0f - Fss_m.y * (1.0f - E_avg), 1e-4f),
-        Fss_m.z * E_avg / fmaxf(1.0f - Fss_m.z * (1.0f - E_avg), 1e-4f));
-    float3 scale_m = one3 + Fms_m * missing;
-
-    float Fss_d = f_avg_schlick(F0_d);
-    float Fms_d = Fss_d * E_avg / fmaxf(1.0f - Fss_d * (1.0f - E_avg), 1e-4f);
-    float scale_d = 1.0f + Fms_d * missing;
-
-    f_spec = e.metallic * f_metal * scale_m +
-             (1.0f - e.metallic) * f_dielec * scale_d;
-
-    r.f = r.f + f_spec * NoL;
-    float pdf_spec = ggx_vndf_pdf_aniso(Vloc, Hloc, e.alpha_x, e.alpha_y);
-    r.pdf += p_spec * pdf_spec;
-    // Glass reflection samples this same Fresnel lobe via the
-    // transmission branch's `rng.next() < F` decision. Account for that
-    // contribution so MIS-weighted estimators get the right pdf when
-    // we land on a reflected wi for a transmissive surface.
-    if (e.transmission > 0.0f && p_trans > 0.0f) {
-        r.pdf += p_trans * F_dielec * pdf_spec;
-    }
-
-    // --- Coat (clearcoat): additive isotropic GGX dielectric above base. ---
-    if (coat_w_mat > 0.0f) {
-      float Fc = schlick_scalar(VoH, cF0);
-      float cD = ggx_D(NoH, coat_alpha);
-      float cG = smith_G1(NoV, coat_alpha) * smith_G1(NoL, coat_alpha);
-      float coat_f = coat_w_mat * Fc * cD * cG / fmaxf(4.0f * NoV * NoL, 1e-8f);
-      // Round-trip coat transmission attenuates base lobes: (1-F) on entry
-      // and on exit.
-      float T_view = 1.0f - coat_w_mat * schlick_scalar(NoV, cF0);
-      float T_light = 1.0f - coat_w_mat * schlick_scalar(NoL, cF0);
-      r.f = r.f * (T_view * T_light);
-      r.f = r.f + make_float3(coat_f, coat_f, coat_f) * NoL;
-      // Isotropic GGX VNDF density for the coat-sampler. Narrow car-paint
-      // clearcoats (coat_roughness ≈ 0.1) are hard for the broad base-spec
-      // sampler to hit, so without this branch coat contributions arrive
-      // almost entirely through NEE and highlights from environment /
-      // indirect bounces fall several-× short of Cycles.
-      float pdf_coat = cD * smith_G1(NoV, coat_alpha) /
-                       fmaxf(4.0f * NoV, 1e-12f);
-      r.pdf += p_coat * pdf_coat;
-    }
-    } // !pure_diff
-
-    // --- Sheen: soft grazing-angle lobe on top of diffuse. Symmetric in
-    // NoV and NoL so the BRDF is reciprocal, and normalised by 1/π so the
-    // integral stays bounded as sheen_roughness→0. Still an ad-hoc shape
-    // (not Charlie), but energy-sane and reciprocal.
-    float sheen_w = e.sheen_weight;
-    if (sheen_w > 0.0f) {
-      float sr = fmaxf(e.sheen_roughness, 1e-3f);
-      float inv_sr = 1.0f / sr;
-      float sf = powf(fmaxf(1.0f - NoV, 0.0f), inv_sr) *
-                 powf(fmaxf(1.0f - NoL, 0.0f), inv_sr) * sheen_w * INV_PIf;
-      float3 tint = e.sheen_tint;
-      r.f = r.f + tint * sf * NoL;
-    }
-  } else if (transmit) {
-    // Rough dielectric transmission (Walter et al.). Half-vector
-    // h ∝ η_i·ωo + η_t·ωi → divide by η_i, so with eta = η_t/η_i the form is
-    // `wo + wi * eta`. This matches the H the VNDF sampler implicitly used
-    // in sample_bsdf, so eval's pdf can be inverted back to sampler's pdf.
-    float eta = e.ior;
-    float3 n_oriented = NoV > 0.0f ? e.Ns : -e.Ns;
-    if (NoV < 0.0f)
-      eta = 1.0f / eta;
-    float3 H = -normalize3(wo + wi * eta);
-    if (dot3(H, n_oriented) < 0.0f)
-      H = -H;
-    float VoH = dot3(wo, H);
-    float LoH = dot3(wi, H);
-    float abs_VoH = fabsf(VoH);
-    float abs_LoH = fabsf(LoH);
-    float abs_NoH = fabsf(dot3(e.Ns, H));
-    float abs_NoV = fabsf(NoV);
-    float abs_NoL = fabsf(NoL);
-    float F = fresnel_dielectric(VoH, eta);
-    float D = ggx_D(abs_NoH, e.alpha);
-    float G1_v = smith_G1(abs_NoV, e.alpha);
-    float G = G1_v * smith_G1(abs_NoL, e.alpha);
-    float sqrt_den = VoH + eta * LoH;
-    float den2 = fmaxf(sqrt_den * sqrt_den, 1e-8f);
-    float btdf = (1.0f - F) * D * G * eta * eta * abs_VoH * abs_LoH /
-                 (abs_NoV * abs_NoL * den2);
-    r.f = e.base_color * btdf * abs_NoL * w_trans;
-    // pdf_wi = p_trans · P(refract branch) · VNDF(H) · |dH/dwi|.
-    float pdf_h = D * G1_v * abs_VoH / fmaxf(abs_NoV, 1e-12f);
-    float jacobian = eta * eta * abs_LoH / den2;
-    r.pdf += p_trans * (1.0f - F) * pdf_h * jacobian;
-  } else if (translucent_active) {
-    // Back hemisphere (NoL < 0). Refraction is mutually
-    // exclusive (handled above) — Glass + Translucent isn't a Cycles combo.
-    if (translucent_active && w_translucent > 0.0f) {
-      float abs_NoL = -NoL;
-      r.f = r.f + e.base_color * (INV_PIf * w_translucent * abs_NoL);
-      // sample_bsdf uses a cosine-weighted *back* hemisphere, so the pdf
-      // matches the forward-Lambert form with |NoL|.
-      r.pdf += p_translucent * abs_NoL * INV_PIf;
-    }
-  }
-  // Shadow-terminator: applies to reflection lobes only (the geometric
-  // horizon check is for same-side scattering). Transmission / translucent
-  // (wi on the far side) keep their own geometry handling.
-  if (reflect) {
-    r.f = r.f * bump_shadowing_term(e.Ng, e.Ns, wi);
-  }
-  // Cycles Principled `Alpha` socket: `alpha × principled + (1-alpha) ×
-  // transparent` blend. The transparent component is a delta in the
-  // through-surface direction, so it contributes 0 to eval at any finite
-  // wi — we just scale the opaque part by alpha. sample_bsdf handles
-  // the (1-alpha) passthrough branch separately.
-  float ab = e.alpha_blend;
-  if (ab < 1.0f) {
-    r.f = r.f * ab;
-    r.pdf *= ab;
-  }
+  vibrt_surface::Closures closures;
+  vibrt_surface::setup(surface_parameters(e, wo), closures);
+  auto value = vibrt_surface::evaluate(closures, vibrt_cycles::make_float3(wi.x, wi.y, wi.z), &r.pdf);
+  r.f = make_float3(value.x, value.y, value.z);
+  if (dot3(e.Ns, wi) > 0) r.f = r.f * bump_shadowing_term(e.Ng, e.Ns, wi);
+  r.f = r.f * e.alpha_blend; r.pdf *= e.alpha_blend;
   return r;
 }
 
@@ -1037,11 +815,9 @@ struct BsdfSample {
 };
 
 struct BsdfDirectionSample {
-#if (VIBRT_CLOSURE_TYPES & (1u << 5))
   float3 sampled_value;
   float sampled_pdf;
   bool weighted_sample;
-#endif
   float3 wi;
   bool valid;
   bool specular;
@@ -1059,9 +835,7 @@ static __device__ __noinline__ BsdfDirectionSample sample_bsdf_direction(const M
   s.specular = false;
   s.lobe = LOBE_DIFFUSE;
   s.transparent = false;
-#if (VIBRT_CLOSURE_TYPES & (1u << 5))
   s.weighted_sample = false;
-#endif
 #if (VIBRT_CLOSURE_TYPES & (1u << 7))
   if (e.sss_exit) {
     float r = sqrtf(rng.next()), phi = 2 * M_PIf * rng.next();
@@ -1155,120 +929,21 @@ static __device__ __noinline__ BsdfDirectionSample sample_bsdf_direction(const M
 
   // Coat weight mirrors eval_bsdf: scale by F_coat(V) so sampling budget
   // follows the actual coat intensity at this view angle (grazing >> normal).
-  float coat_w_mat = e.coat_weight;
-  float coat_alpha = e.coat_alpha;  // already filter-glossy-clamped
-  float cF0 = ((e.coat_ior - 1.0f) / (e.coat_ior + 1.0f)) *
-              ((e.coat_ior - 1.0f) / (e.coat_ior + 1.0f));
-  float t_w = e.translucent_weight;
-  // Match eval_bsdf_one's lobe gating exactly. Without the `pure_diff`
-  // gate here the sampler picked the (eval-zeroed) specular lobe ~50% of
-  // the time for a `ShaderNodeBsdfDiffuse` surface: those samples were
-  // then evaluated as diffuse-only, biasing the throughput and dropping
-  // the below-horizon spec directions (pdf<=0 break) — a Diffuse-node
-  // white-furnace read 0.70 instead of 0.80. The sampler must see the
-  // same weights as the evaluator or the mixture estimator is biased.
-  bool pure_diff = (e.mat->pure_diffuse != 0);
-  float w_base_diff = (1.0f - e.metallic) * (1.0f - e.transmission);
-  float w_diffuse = w_base_diff * (1.0f - t_w) * (1.0f - e.sss_weight);
-  float w_translucent = w_base_diff * t_w;
-  float w_spec = pure_diff
-                     ? 0.0f
-                     : e.metallic + (1.0f - e.metallic) * (1.0f - e.transmission);
-  float w_trans = pure_diff ? 0.0f : (1.0f - e.metallic) * e.transmission;
-  float w_coat = pure_diff ? 0.0f : coat_w_mat * schlick_scalar(NoV, cF0);
-  float total = w_diffuse + w_translucent + w_spec + w_trans + w_coat;
-  if (total <= 0.0f)
-    return s;
-  float p_diff = w_diffuse / total;
-  float p_translucent = w_translucent / total;
-  float p_spec = w_spec / total;
-  float p_trans = w_trans / total;
-
-  float u = rng.next();
-  float u1 = rng.next();
-  float u2 = rng.next();
-
-  if (u < p_diff) {
-    // Cosine-weighted hemisphere sample
-    float r = sqrtf(u1);
-    float phi = 2.0f * M_PIf * u2;
-    float3 local = make_float3(r * cosf(phi), r * sinf(phi),
-                               sqrtf(fmaxf(0.0f, 1.0f - u1)));
-    s.wi = normalize3(e.T * local.x + e.B * local.y + e.Ns * local.z);
-    s.lobe = LOBE_DIFFUSE;
-  } else if (u < p_diff + p_translucent) {
-    // Translucent: cosine-weighted *back* hemisphere. Negate the local Z so
-    // wi exits the surface on the side opposite Ns. Bucketed as
-    // LOBE_DIFFUSE so it shares Cycles' diffuse-bounces budget — Cycles
-    // categorises Translucent BSDF as a diffuse path-type as well.
-    float r = sqrtf(u1);
-    float phi = 2.0f * M_PIf * u2;
-    float3 local = make_float3(r * cosf(phi), r * sinf(phi),
-                               -sqrtf(fmaxf(0.0f, 1.0f - u1)));
-    s.wi = normalize3(e.T * local.x + e.B * local.y + e.Ns * local.z);
-    s.lobe = LOBE_DIFFUSE;
-  } else if (u < p_diff + p_translucent + p_spec) {
-    // GGX VNDF specular (anisotropic)
-    float3 Vlocal = make_float3(dot3(wo, e.T), dot3(wo, e.B), dot3(wo, e.Ns));
-    float3 Hlocal =
-        sample_ggx_vndf_aniso(Vlocal, e.alpha_x, e.alpha_y, u1, u2);
-    float3 H = normalize3(e.T * Hlocal.x + e.B * Hlocal.y + e.Ns * Hlocal.z);
-    float VoH = dot3(wo, H);
-    float3 wi = normalize3(H * (2.0f * VoH) - wo);
-    if (dot3(e.Ns, wi) <= 0.0f)
-      return s;
-    s.wi = wi;
-    // Fires when roughness has been clamped to the minimum (author asked for
-    // a mirror); NEE can't find such a narrow lobe, so flag as specular and
-    // let trace_path add BSDF-sampled emission directly.
-    if (e.alpha <= 0.02f * 0.02f)
-      s.specular = true;
-    s.lobe = LOBE_GLOSSY;
-  } else if (u < p_diff + p_translucent + p_spec + p_trans) {
-    // Rough-dielectric transmission
-    float eta = e.ior;
-    float3 Vlocal = make_float3(dot3(wo, e.T), dot3(wo, e.B), dot3(wo, e.Ns));
-    float3 Hlocal = sample_ggx_vndf(Vlocal, e.alpha, u1, u2);
-    float3 H = normalize3(e.T * Hlocal.x + e.B * Hlocal.y + e.Ns * Hlocal.z);
-    float VoH = dot3(wo, H);
-    float F = fresnel_dielectric(VoH, eta);
-    // Randomly pick reflect vs transmit by Fresnel.
-    if (rng.next() < F) {
-      float3 wi = normalize3(H * (2.0f * VoH) - wo);
-      if (dot3(e.Ns, wi) <= 0.0f)
-        return s;
-      s.wi = wi;
-    } else {
-      float cosi = VoH;
-      float eta_t = 1.0f / eta;
-      float k = 1.0f - eta_t * eta_t * (1.0f - cosi * cosi);
-      if (k < 0.0f)
-        return s;
-      float3 wt = -wo * eta_t + H * (eta_t * cosi - sqrtf(k));
-      s.wi = normalize3(wt);
-      if (dot3(e.Ns, s.wi) >= 0.0f)
-        return s;
-    }
-    if (e.alpha <= 0.02f * 0.02f)
-      s.specular = true;
-    s.lobe = LOBE_TRANSMISSION;
-  } else {
-    // Coat: isotropic GGX VNDF on coat_alpha. Always reflects, so no
-    // Fresnel reflect/transmit branch here.
-    float3 Vlocal = make_float3(dot3(wo, e.T), dot3(wo, e.B), dot3(wo, e.Ns));
-    float3 Hlocal = sample_ggx_vndf(Vlocal, coat_alpha, u1, u2);
-    float3 H = normalize3(e.T * Hlocal.x + e.B * Hlocal.y + e.Ns * Hlocal.z);
-    float VoH = dot3(wo, H);
-    float3 wi = normalize3(H * (2.0f * VoH) - wo);
-    if (dot3(e.Ns, wi) <= 0.0f)
-      return s;
-    s.wi = wi;
-    if (coat_alpha <= 0.02f * 0.02f)
-      s.specular = true;
-    s.lobe = LOBE_GLOSSY;
-  }
-
-  s.valid = true;
+  vibrt_surface::Closures closures;
+  vibrt_surface::setup(surface_parameters(e, wo), closures);
+  vibrt_cycles::float3 direction, value;
+  float pdf;
+  int label = vibrt_surface::sample(closures, rng.next(),
+      vibrt_cycles::make_float3(rng.next(), rng.next(), rng.next()), &direction, &value, &pdf);
+  s.wi = make_float3(direction.x, direction.y, direction.z);
+  s.valid = label != vibrt_cycles::LABEL_NONE && pdf > 0;
+  s.specular = (label & vibrt_cycles::LABEL_SINGULAR) != 0;
+  s.lobe = label & vibrt_cycles::LABEL_TRANSMIT ? LOBE_TRANSMISSION
+         : label & vibrt_cycles::LABEL_DIFFUSE ? LOBE_DIFFUSE : LOBE_GLOSSY;
+  s.sampled_value = make_float3(value.x, value.y, value.z) * e.alpha_blend;
+  if (dot3(e.Ns, s.wi) > 0) s.sampled_value = s.sampled_value * bump_shadowing_term(e.Ng, e.Ns, s.wi);
+  s.sampled_pdf = pdf * e.alpha_blend;
+  s.weighted_sample = true;
   return s;
 }
 
@@ -1349,7 +1024,6 @@ static __device__ BsdfSample sample_bsdf(const MaterialEvalGroup &g,
   s.lobe = direction.lobe;
   if (!direction.valid)
     return s;
-#if (VIBRT_CLOSURE_TYPES & (1u << 5))
   if (direction.weighted_sample) {
     // Preserve the selected closure's sampled estimate and density.
     // Only the other mixture leaves need a separate evaluation.
@@ -1367,7 +1041,6 @@ static __device__ BsdfSample sample_bsdf(const MaterialEvalGroup &g,
     s.pdf /= total_weight;
     return s;
   }
-#endif
   if (s.transparent) {
     if (g.n == 1) {
       s.f = make_float3(1, 1, 1);
@@ -1401,6 +1074,17 @@ static __device__ __noinline__ float4 emission_alpha(const PathVertex &v,bool in
       float fac=compute_level_mix_fac(m,v,fabsf(dot3(v.Ns,v.incoming)));
       stack[sp++]={m->secondary?m->secondary:m,e.w*(m->add_shader?1:fac),!m->secondary};
       stack[sp++]={m->left_subtree?m->left_subtree:m,e.w*(m->add_shader?1:1-fac),!m->left_subtree};
+      continue;
+    }
+    // Emissive Principled layers must use the same attenuation for light
+    // samples and visible hits; evaluating emission alone skips coat/sheen.
+    if (include_emission && !m->surface_model && !m->pure_diffuse && !m->pure_glossy &&
+        (m->coat_weight > 0 || m->sheen_weight > 0 ||
+         (m->shader_outputs & ((1ull << 11) | (1ull << 14))))) {
+      ShaderEvalCache cache{};
+      MaterialEval material = eval_material_one(v, m, cache);
+      emission = emission + material.emission * e.w;
+      transparent += e.w * (1 - material.alpha_blend);
       continue;
     }
     float3 em=make_f3(m->emission);float alpha=m->alpha_blend;

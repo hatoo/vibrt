@@ -1,4 +1,4 @@
-"""Compare procedural mesh-light illumination with Cycles (headless Blender)."""
+"""Compare procedural mesh-light illumination with Cycles; --layered adds coat/sheen."""
 from pathlib import Path
 import json
 import sys
@@ -55,10 +55,17 @@ checker = tree.nodes.new("ShaderNodeTexChecker")
 checker.inputs["Color1"].default_value = (1, 0.1, 0.1, 1)
 checker.inputs["Color2"].default_value = (0.1, 0.1, 1, 1)
 checker.inputs["Scale"].default_value = 4.5
-emission = tree.nodes.new("ShaderNodeEmission")
-emission.inputs["Strength"].default_value = 20
+layered = "--layered" in sys.argv
+emission = tree.nodes.new("ShaderNodeBsdfPrincipled" if layered else "ShaderNodeEmission")
+if layered:
+    emission.inputs["Base Color"].default_value = (0, 0, 0, 1)
+    emission.inputs["Coat Weight"].default_value = 0.8
+    emission.inputs["Coat Tint"].default_value = (0.2, 0.7, 0.9, 1)
+    emission.inputs["Sheen Weight"].default_value = 0.6
+    emission.inputs["Sheen Tint"].default_value = (0.8, 0.3, 0.5, 1)
+emission.inputs["Emission Strength" if layered else "Strength"].default_value = 20
 out = tree.nodes.new("ShaderNodeOutputMaterial")
-tree.links.new(checker.outputs["Color"], emission.inputs["Color"])
+tree.links.new(checker.outputs["Color"], emission.inputs["Emission Color" if layered else "Color"])
 tree.links.new(emission.outputs[0], out.inputs["Surface"])
 light.data.materials.append(mat)
 
@@ -68,7 +75,7 @@ scene.camera = camera
 camera.location = (4, -6, 4)
 camera.rotation_euler = (Vector((0, 0, 0)) - camera.location).to_track_quat("-Z", "Y").to_euler()
 
-directory = ROOT / "target/shader-lighting"
+directory = ROOT / ("target/shader-lighting-layered" if layered else "target/shader-lighting")
 directory.mkdir(parents=True, exist_ok=True)
 scene.render.filepath = str(directory / "cycles.exr")
 bpy.ops.render.render(write_still=True)

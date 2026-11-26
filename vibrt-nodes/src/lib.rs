@@ -16,5 +16,6 @@ pub mod types;
 pub const DEVICE_TYPES: &str = include_str!("../native/types.h");
 pub const DEVICE_CORE: &str = include_str!("../native/core.h");
 pub const DEVICE_SHADER: &str = include_str!("../native/shader.h");
+pub const DEVICE_BSDF: &str = include_str!("../native/bsdf.h");
 pub const DEVICE_CYCLES_COMPAT: &str = include_str!("../native/cycles_compat.h");
 pub const DEVICE_CYCLES: &str = include_str!(concat!(env!("OUT_DIR"), "/cycles_nodes.h"));

@@ -806,11 +806,6 @@ impl GpuScene<'_> {
                 ),
             };
 
-        // --- GGX LUTs ---
-        let d_ggx_e = uploads.copy_slice(&super::lighting::GGX_ENERGY_LUT)?;
-        let d_ggx_e_avg = uploads.copy_slice(&super::lighting::GGX_ENERGY_AVG_LUT)?;
-        let d_ggx_b = uploads.copy_slice(&super::lighting::GGX_FRESNEL_LUT)?;
-
         let params = LaunchParams {
             query_nodes,
             query_indices,
@@ -866,9 +861,6 @@ impl GpuScene<'_> {
             envmap_conditional_cdf: d_ccdf,
             envmap_integral: env_integral,
             envmap_rotation_z_rad: envmap_rot,
-            ggx_e_lut: d_ggx_e,
-            ggx_e_avg_lut: d_ggx_e_avg,
-            ggx_b_lut: d_ggx_b,
             clamp_indirect: render_settings.clamp_indirect,
             clamp_direct: render_settings.clamp_direct,
             filter_glossy: render_settings.filter_glossy,

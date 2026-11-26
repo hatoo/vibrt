@@ -3,6 +3,7 @@
 #include "core.h"
 #include "cycles_nodes.h"
 #include "shader.h"
+#include "bsdf.h"
 extern "C" float vibrt_shader_math(unsigned int op, float a, float b, float c) {
   return vibrt_cycles::svm_math((vibrt_cycles::NodeMathType)op, a, b, c);
 }

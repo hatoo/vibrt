@@ -6,6 +6,16 @@ pub use vibrt_nodes::types::*;
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct PrincipledGpu {
+    pub surface_model: u32,
+    pub distribution: u32,
+    pub specular_tint: [f32; 3],
+    pub coat_tint: [f32; 3],
+    pub coat_normal: [f32; 3],
+    pub thin_film_thickness: f32,
+    pub thin_film_ior: f32,
+    pub conductor_ior: [f32; 3],
+    pub conductor_k: [f32; 3],
+    pub diffuse_roughness: f32,
     pub aov_shaders: optix_sys::CUdeviceptr,
     pub num_aov_shaders: u32,
     pub base_color: [f32; 3],
@@ -496,10 +506,6 @@ pub struct LaunchParams {
     /// other rays use `envmap_data` (which the loader filled with `a`).
     /// 0 selects the legacy fac-mixed behaviour driven by `envmap_mix_fac`.
     pub envmap_split_by_camera_ray: i32,
-
-    pub ggx_e_lut: optix_sys::CUdeviceptr,
-    pub ggx_e_avg_lut: optix_sys::CUdeviceptr,
-    pub ggx_b_lut: optix_sys::CUdeviceptr,
 
     pub clamp_indirect: f32,
     pub clamp_direct: f32,

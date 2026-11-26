@@ -125,7 +125,7 @@ static __device__ __noinline__ float3 shadow_transmittance(float3 P, float3 dir,
       float F0_d = ((v.mat->ior - 1.0f) / (v.mat->ior + 1.0f)) *
                    ((v.mat->ior - 1.0f) / (v.mat->ior + 1.0f))
                    * (2.0f * v.mat->specular_ior_level);
-      float F = schlick_scalar(cos_i, F0_d);
+      float F = (F0_d + (1 - F0_d) * vibrt_cycles::schlick_fresnel(cos_i));
       float3 t_factor = base * (1.0f - F) * v.mat->transmission;
       // Surfaces with `transmission < 1` (e.g. Principled at 0.5) still
       // partially absorb — fold the missing fraction into 0 so the ray

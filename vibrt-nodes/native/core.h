@@ -1,13 +1,9 @@
 // Shared color-node implementation for CPU batches and CUDA shaders.
 #pragma once
+#include "cycles_nodes.h"
 #ifndef __CUDACC__
 #include <cmath>
 #include <cstring>
-#define VN_INLINE inline
-#define VN_DEVICE inline
-#else
-#define VN_INLINE __device__ __forceinline__
-#define VN_DEVICE static __device__
 #endif
 
 namespace vibrt_nodes {
@@ -87,232 +83,55 @@ VN_DEVICE float3 sample_rgba(const float *data, int w, int h,
   return c0 * (1.0f - dy) + c1 * dy;
 }
 
-// RGB ↔ HSV helpers in the shape Blender uses (HSV channels in [0,1]).
+// The legacy wire format keeps its operation IDs and input conventions.
+// Numerical operations are shared with the general Cycles shader evaluator.
+VN_INLINE vibrt_cycles::float3 cycles_rgb(float3 c) { return vibrt_cycles::make_float3(c.x, c.y, c.z); }
+VN_INLINE float3 legacy_rgb(vibrt_cycles::float3 c) { return {c.x, c.y, c.z}; }
 VN_INLINE float3 rgb_to_hsv_bl(float3 c) {
-  float cmax = fmaxf(c.x, fmaxf(c.y, c.z));
-  float cmin = fminf(c.x, fminf(c.y, c.z));
-  float v = cmax;
-  float d = cmax - cmin;
-  float s = cmax > 0.0f ? d / cmax : 0.0f;
-  float h = 0.0f;
-  if (d > 0.0f) {
-    if (cmax == c.x) {
-      h = (c.y - c.z) / d + (c.y < c.z ? 6.0f : 0.0f);
-    } else if (cmax == c.y) {
-      h = (c.z - c.x) / d + 2.0f;
-    } else {
-      h = (c.x - c.y) / d + 4.0f;
-    }
-    h *= (1.0f / 6.0f);
-  }
-  return make_float3(h, s, v);
+  auto r = vibrt_cycles::rgb_to_hsv(cycles_rgb(c));
+  if (r.z <= 0) r.x = r.y = 0; // historical negative RGB convention
+  return legacy_rgb(r);
 }
-
 VN_INLINE float3 hsv_to_rgb_bl(float3 c) {
-  float h = c.x - floorf(c.x); // wrap to [0,1)
-  float s = fmaxf(0.0f, fminf(1.0f, c.y));
-  float v = c.z;
-  float i = floorf(h * 6.0f);
-  float f = h * 6.0f - i;
-  float p = v * (1.0f - s);
-  float q = v * (1.0f - f * s);
-  float t = v * (1.0f - (1.0f - f) * s);
-  int ii = ((int)i) % 6;
-  if (ii < 0) ii += 6;
-  switch (ii) {
-    case 0: return make_float3(v, t, p);
-    case 1: return make_float3(q, v, p);
-    case 2: return make_float3(p, v, t);
-    case 3: return make_float3(p, q, v);
-    case 4: return make_float3(t, p, v);
-    default: return make_float3(v, p, q);
-  }
+  c.x -= floorf(c.x);
+  c.y = fminf(fmaxf(c.y, 0), 1);
+  return legacy_rgb(vibrt_cycles::hsv_to_rgb(cycles_rgb(c)));
 }
-
-VN_INLINE float3 mix_blend_rgb(
-    float3 a, float3 b, float fac, unsigned int blend, bool clamp_out) {
-  float facm = 1.0f - fac;
-  float3 out;
-  switch (blend) {
-    default:
-    case 0: // MIX
-      out = a * facm + b * fac;
-      break;
-    case 1: // MULTIPLY
-      out = make_float3(a.x * (facm + b.x * fac),
-                        a.y * (facm + b.y * fac),
-                        a.z * (facm + b.z * fac));
-      break;
-    case 2: // ADD
-      out = a + b * fac;
-      break;
-    case 3: // SUBTRACT
-      out = a - b * fac;
-      break;
-    case 4: // SCREEN
-      out = make_float3(1.0f, 1.0f, 1.0f) -
-            (make_float3(facm, facm, facm) + (make_float3(1.0f, 1.0f, 1.0f) - b) * fac) *
-                (make_float3(1.0f, 1.0f, 1.0f) - a);
-      break;
-    case 5: // DIVIDE — per-channel, guard against div-by-zero
-      out.x = b.x == 0.0f ? a.x : a.x * facm + a.x / b.x * fac;
-      out.y = b.y == 0.0f ? a.y : a.y * facm + a.y / b.y * fac;
-      out.z = b.z == 0.0f ? a.z : a.z * facm + a.z / b.z * fac;
-      break;
-    case 6: { // DIFFERENCE
-      float3 d = make_float3(fabsf(a.x - b.x), fabsf(a.y - b.y), fabsf(a.z - b.z));
-      out = a * facm + d * fac;
-      break;
-    }
-    case 7: // DARKEN
-      out.x = a.x * facm + fminf(a.x, b.x) * fac;
-      out.y = a.y * facm + fminf(a.y, b.y) * fac;
-      out.z = a.z * facm + fminf(a.z, b.z) * fac;
-      break;
-    case 8: // LIGHTEN (Blender's asymmetric form)
-      out.x = fmaxf(a.x, b.x * fac);
-      out.y = fmaxf(a.y, b.y * fac);
-      out.z = fmaxf(a.z, b.z * fac);
-      break;
-    case 9: { // OVERLAY per-channel
-      auto ov = [&](float ax, float bx) {
-        return ax < 0.5f ? ax * (facm + 2.0f * fac * bx)
-                         : 1.0f - (facm + 2.0f * fac * (1.0f - bx)) * (1.0f - ax);
-      };
-      out.x = ov(a.x, b.x);
-      out.y = ov(a.y, b.y);
-      out.z = ov(a.z, b.z);
-      break;
-    }
-    case 10: { // SOFT_LIGHT
-      float3 scr = make_float3(1.0f - (1.0f - b.x) * (1.0f - a.x),
-                               1.0f - (1.0f - b.y) * (1.0f - a.y),
-                               1.0f - (1.0f - b.z) * (1.0f - a.z));
-      float3 inner = make_float3(
-          (1.0f - a.x) * b.x * a.x + a.x * scr.x,
-          (1.0f - a.y) * b.y * a.y + a.y * scr.y,
-          (1.0f - a.z) * b.z * a.z + a.z * scr.z);
-      out = a * facm + inner * fac;
-      break;
-    }
-    case 12: // HUE
-    case 13: // SATURATION
-    case 14: // COLOR
-    case 15: { // VALUE
-      float3 ha = rgb_to_hsv_bl(a), hb = rgb_to_hsv_bl(b), target = ha;
-      bool active = true;
-      if (blend == 12) { target.x = hb.x; active = hb.y != 0.0f; }
-      if (blend == 13) { target.y = hb.y; active = ha.y != 0.0f; }
-      if (blend == 14) { target.x = hb.x; target.y = hb.y; active = hb.y != 0.0f; }
-      if (blend == 15) target.z = hb.z;
-      out = active ? a * facm + hsv_to_rgb_bl(target) * fac : a;
-      break;
-    }
-    case 11: // LINEAR_LIGHT
-      out = a + (b * 2.0f - make_float3(1.0f, 1.0f, 1.0f)) * fac;
-      break;
-  }
-  if (clamp_out) {
-    out.x = fmaxf(0.0f, fminf(1.0f, out.x));
-    out.y = fmaxf(0.0f, fminf(1.0f, out.y));
-    out.z = fmaxf(0.0f, fminf(1.0f, out.z));
-  }
-  return out;
+VN_INLINE float3 mix_blend_rgb(float3 a, float3 b, float fac, unsigned int blend, bool clamp_out) {
+  using namespace vibrt_cycles;
+  const NodeMix modes[] = {NODE_MIX_BLEND, NODE_MIX_MUL, NODE_MIX_ADD,
+    NODE_MIX_SUB, NODE_MIX_SCREEN, NODE_MIX_DIV, NODE_MIX_DIFF, NODE_MIX_DARK,
+    NODE_MIX_LIGHT, NODE_MIX_OVERLAY, NODE_MIX_SOFT, NODE_MIX_LINEAR,
+    NODE_MIX_HUE, NODE_MIX_SAT, NODE_MIX_COL, NODE_MIX_VAL};
+  auto r = svm_mix(modes[blend < 16 ? blend : 0], fac, cycles_rgb(a), cycles_rgb(b));
+  return legacy_rgb(clamp_out ? clamp(r, 0, 1) : r);
 }
-
-VN_INLINE float3 math_apply_rgb(
-    float3 inp, unsigned int op, float b, float c, bool swap) {
-  // `swap` flips operand order for non-commutative ops so the node can act as
-  // `b OP input` instead of `input OP b` — mirrors Cycles ShaderNodeMath with
-  // the texture chain on input[1]. Commutative ops ignore swap.
-  float3 o;
-  switch (op) {
-    default:
-    case 0: // ADD
-      o = make_float3(inp.x + b, inp.y + b, inp.z + b);
-      break;
-    case 1: // SUBTRACT
-      if (swap) {
-        o = make_float3(b - inp.x, b - inp.y, b - inp.z);
-      } else {
-        o = make_float3(inp.x - b, inp.y - b, inp.z - b);
-      }
-      break;
-    case 2: // MULTIPLY
-      o = make_float3(inp.x * b, inp.y * b, inp.z * b);
-      break;
-    case 3: // DIVIDE
-      if (swap) {
-        // b / inp, per channel. Cycles returns 0 when the denominator is 0.
-        o = make_float3(inp.x == 0.0f ? 0.0f : b / inp.x,
-                        inp.y == 0.0f ? 0.0f : b / inp.y,
-                        inp.z == 0.0f ? 0.0f : b / inp.z);
-      } else {
-        o = make_float3(b == 0.0f ? 0.0f : inp.x / b,
-                        b == 0.0f ? 0.0f : inp.y / b,
-                        b == 0.0f ? 0.0f : inp.z / b);
-      }
-      break;
-    case 4: // POWER
-      if (swap) {
-        float base = fmaxf(b, 0.0f);
-        o = make_float3(powf(base, inp.x), powf(base, inp.y), powf(base, inp.z));
-      } else {
-        o = make_float3(powf(fmaxf(inp.x, 0.0f), b),
-                        powf(fmaxf(inp.y, 0.0f), b),
-                        powf(fmaxf(inp.z, 0.0f), b));
-      }
-      break;
-    case 5: // MULTIPLY_ADD
-      o = make_float3(inp.x * b + c, inp.y * b + c, inp.z * b + c);
-      break;
-    case 6: // MINIMUM
-      o = make_float3(fminf(inp.x, b), fminf(inp.y, b), fminf(inp.z, b));
-      break;
-    case 7: // MAXIMUM
-      o = make_float3(fmaxf(inp.x, b), fmaxf(inp.y, b), fmaxf(inp.z, b));
-      break;
-  }
-  return o;
-}
-
-
-// Scalar constant folding preserves the exporter's established edge cases;
-// the per-channel image Math path above retains its original eight operations.
 VN_INLINE float scalar_math(float a, unsigned int op, float b, float c) {
-  switch (op) {
-    case 4: return a >= 0.0f || floorf(b) == b ? powf(a, b) : 0.0f;
-    case 8: return a > 0 && b > 0 && b != 1 ? logf(a) / logf(b) : nanf("");
-    case 9: return a < b ? 1.0f : 0.0f;
-    case 10: return a > b ? 1.0f : 0.0f;
-    case 11: return fabsf(a - b) <= c ? 1.0f : 0.0f;
-    case 12: return b != 0 ? fmodf(a, b) : 0.0f;
-    case 13: return fminf(a, b);
-    case 14: return fmaxf(a, b);
-    case 15: return atan2f(a, b);
-    case 16: return sqrtf(fmaxf(0.0f, a));
-    case 17: return a > 0 ? 1.0f / sqrtf(a) : 0.0f;
-    case 18: return fabsf(a);
-    case 19: return expf(a);
-    case 20: return float((a > 0) - (a < 0));
-    case 21: return rintf(a);
-    case 22: return floorf(a);
-    case 23: return ceilf(a);
-    case 24: return a - floorf(a);
-    case 25: return truncf(a);
-    case 26: return sinf(a);
-    case 27: return cosf(a);
-    case 28: return tanf(a);
-    case 29: return asinf(fmaxf(-1.0f, fminf(1.0f, a)));
-    case 30: return acosf(fmaxf(-1.0f, fminf(1.0f, a)));
-    case 31: return atanf(a);
-    case 32: return sinhf(a);
-    case 33: return coshf(a);
-    case 34: return tanhf(a);
-    case 35: return a * 0.01745329251994329577f;
-    case 36: return a * 57.295779513082320877f;
-    default: return math_apply_rgb({a, a, a}, op, b, c, false).x;
-  }
+  using namespace vibrt_cycles;
+  const NodeMathType modes[] = {NODE_MATH_ADD, NODE_MATH_SUBTRACT, NODE_MATH_MULTIPLY,
+    NODE_MATH_DIVIDE, NODE_MATH_POWER, NODE_MATH_MULTIPLY_ADD, NODE_MATH_MINIMUM,
+    NODE_MATH_MAXIMUM, NODE_MATH_LOGARITHM, NODE_MATH_LESS_THAN, NODE_MATH_GREATER_THAN,
+    NODE_MATH_COMPARE, NODE_MATH_MODULO, NODE_MATH_MINIMUM, NODE_MATH_MAXIMUM,
+    NODE_MATH_ARCTAN2, NODE_MATH_SQRT, NODE_MATH_INV_SQRT, NODE_MATH_ABSOLUTE,
+    NODE_MATH_EXPONENT, NODE_MATH_SIGN, NODE_MATH_ROUND, NODE_MATH_FLOOR,
+    NODE_MATH_CEIL, NODE_MATH_FRACTION, NODE_MATH_TRUNC, NODE_MATH_SINE,
+    NODE_MATH_COSINE, NODE_MATH_TANGENT, NODE_MATH_ARCSINE, NODE_MATH_ARCCOSINE,
+    NODE_MATH_ARCTANGENT, NODE_MATH_SINH, NODE_MATH_COSH, NODE_MATH_TANH,
+    NODE_MATH_RADIANS, NODE_MATH_DEGREES};
+  // These legacy folding edge cases are part of the saved color-graph API.
+  if (op == 8 && !(a > 0 && b > 0 && b != 1)) return nanf("");
+  if (op == 21) return rintf(a);
+  if (op == 29 || op == 30) a = fmaxf(-1, fminf(1, a));
+  return svm_math(modes[op < 37 ? op : 0], a, b, c);
+}
+VN_INLINE float3 math_apply_rgb(float3 inp, unsigned int op, float b, float c, bool swap) {
+  auto channel = [&](float a) {
+    float x = swap && (op == 1 || op == 3 || op == 4) ? b : a;
+    float y = swap && (op == 1 || op == 3 || op == 4) ? a : b;
+    if (op == 4) x = fmaxf(x, 0); // legacy image Math clamps the base
+    return scalar_math(x, op, y, c);
+  };
+  return {channel(inp.x), channel(inp.y), channel(inp.z)};
 }
 
 VN_INLINE float3 invert_rgb(float3 rgb, float fac) {
@@ -469,5 +288,3 @@ VN_DEVICE float3 eval_color_graph(
 
 
 } // namespace vibrt_nodes
-#undef VN_INLINE
-#undef VN_DEVICE

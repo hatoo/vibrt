@@ -168,6 +168,10 @@ impl ShaderRequirements {
         }
         fn extended_requirements(m: &PrincipledMaterial) -> Result<(u32, usize)> {
             anyhow::ensure!(
+                m.surface_model <= 8 && m.distribution <= 2,
+                "Invalid Cycles surface model/distribution"
+            );
+            anyhow::ensure!(
                 m.closure_type <= 7 && m.closure_type != 6,
                 "Unsupported closure type {}",
                 m.closure_type

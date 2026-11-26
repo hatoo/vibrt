@@ -478,6 +478,9 @@ PRINCIPLED_INPUTS = {
     "Subsurface Scale": "sss_scale", "Subsurface IOR": "sss_ior",
     "Subsurface Anisotropy": "sss_anisotropy",
     "Normal": "normal", "Tangent": "tangent",
+    "Specular Tint": "specular_tint", "Coat Tint": "coat_tint", "Coat Normal": "coat_normal",
+    "Thin Film Thickness": "thin_film_thickness", "Thin Film IOR": "thin_film_ior",
+    "Diffuse Roughness": "diffuse_roughness",
 }
 
 
@@ -496,7 +499,10 @@ def attach(node, params, writer, textures, group_stack=(), *, context=None):
     if kind == "ShaderNodeBsdfSheen":
         mapping.update(Color="sheen_tint", Roughness="sheen_roughness")
     elif kind == "ShaderNodeBsdfMetallic":
-        mapping["Base Color"] = "base_color"
+        mapping.update({"Base Color": "base_color", "Edge Tint": "specular_tint",
+                        "IOR": "conductor_ior", "Extinction": "conductor_k"})
+    if kind in {"ShaderNodeBsdfGlass", "ShaderNodeBsdfMetallic"}:
+        mapping.update({"Thin Film Thickness": "thin_film_thickness", "Thin Film IOR": "thin_film_ior"})
     outputs = {}
     for name, target in mapping.items():
         sock = node.inputs.get(name)
@@ -504,6 +510,12 @@ def attach(node, params, writer, textures, group_stack=(), *, context=None):
             continue
         # The caller reports precise unsupported sockets rather than guessing a value.
         outputs[target] = compiler.input(sock)
+    anisotropy = node.inputs.get("Anisotropic") or node.inputs.get("Anisotropy")
+    if "tangent" not in outputs and anisotropy is not None and (
+        anisotropy.is_linked or anisotropy.default_value != 0
+    ):
+        # Cycles LINK_TANGENT: spherical tangent from generated coordinates.
+        outputs["tangent"] = compiler.add("tangent", modes=[1, 2])
     if not outputs:
         return params
     # Emission needs its separate strength even when only one input is linked.
@@ -644,9 +656,7 @@ def compile_leaf(node, writer, textures, group_stack=(), *, context=None):
             params["shader_graph"] = compiler.graph(outputs)
         compiler.attach_attributes(params)
         return params
-    if kind == "ShaderNodeBsdfMetallic" and node.fresnel_type != "F82":
-        raise UnsupportedNode("Metallic physical-conductor IOR/extinction requires a conductor closure")
-    if kind not in {"ShaderNodeBsdfPrincipled", "ShaderNodeBsdfDiffuse", "ShaderNodeBsdfAnisotropic", "ShaderNodeBsdfGlossy", "ShaderNodeBsdfGlass", "ShaderNodeBsdfRefraction", "ShaderNodeBsdfTranslucent", "ShaderNodeBsdfTransparent", "ShaderNodeEmission", "ShaderNodeBsdfMetallic"}:
+    if kind not in {"ShaderNodeBsdfPrincipled", "ShaderNodeBsdfDiffuse", "ShaderNodeBsdfAnisotropic", "ShaderNodeBsdfGlossy", "ShaderNodeBsdfGlass", "ShaderNodeBsdfRefraction", "ShaderNodeBsdfTranslucent", "ShaderNodeBsdfTransparent", "ShaderNodeEmission", "ShaderNodeBsdfMetallic", "ShaderNodeBsdfSheen"}:
         return None
     params = {"base_color": [0.8]*3, "metallic": 0.0, "roughness": 0.5, "ior": 1.45, "transmission": 0.0, "emission": [0.0]*3}
     if kind == "ShaderNodeBsdfPrincipled":
@@ -654,16 +664,34 @@ def compile_leaf(node, writer, textures, group_stack=(), *, context=None):
         if socket and (socket.is_linked or socket.default_value > 0):
             params["sss_method"] = _enum(node.subsurface_method, ["BURLEY", "RANDOM_WALK", "RANDOM_WALK_SKIN"]) + 1
     mapping = PRINCIPLED_INPUTS if kind == "ShaderNodeBsdfPrincipled" else {"Color": "emission" if kind == "ShaderNodeEmission" else "base_color", "Roughness": "roughness", "IOR": "ior", "Anisotropy": "anisotropy", "Rotation": "tangent_rotation"}
+    mapping = dict(mapping)
+    models = {"ShaderNodeBsdfDiffuse": 1, "ShaderNodeBsdfTranslucent": 1,
+              "ShaderNodeBsdfGlossy": 2, "ShaderNodeBsdfAnisotropic": 2,
+              "ShaderNodeBsdfGlass": 3, "ShaderNodeBsdfRefraction": 4,
+              "ShaderNodeBsdfSheen": 5, "ShaderNodeBsdfMetallic": 6}
+    params["surface_model"] = models.get(kind, 0)
+    params["distribution"] = _enum(("MULTI_GGX" if kind == "ShaderNodeBsdfSheen" else getattr(node, "distribution", "MULTI_GGX")), ["GGX", "BECKMANN", "MULTI_GGX"])
+    if kind == "ShaderNodeBsdfSheen":
+        if getattr(node, "distribution", "MICROFIBER") == "ASHIKHMIN":
+            params["surface_model"] = 8
+        params.update(sheen_weight=1.0, base_color=[0.0]*3, pure_diffuse=True)
+        mapping.update(Color="sheen_tint", Roughness="sheen_roughness")
+    if kind == "ShaderNodeBsdfMetallic":
+        params["surface_model"] = 6 if node.fresnel_type == "F82" else 7
+        mapping.update({"Base Color": "base_color", "Edge Tint": "specular_tint",
+                        "IOR": "conductor_ior", "Extinction": "conductor_k"})
+    if kind in {"ShaderNodeBsdfMetallic", "ShaderNodeBsdfGlass"}:
+        mapping.update({"Thin Film Thickness": "thin_film_thickness", "Thin Film IOR": "thin_film_ior"})
     for name, field in mapping.items():
         socket = node.inputs.get(name)
-        if socket is None or not socket.enabled or field in {"normal", "tangent", "emission_strength"}:
+        if socket is None or not socket.enabled or field in {"normal", "coat_normal", "tangent", "emission_strength"}:
             continue
         value = socket.default_value
         value = [float(v) for v in value[:3]] if socket.type in {"RGBA", "VECTOR"} else float(value)
         if field == "tangent_rotation":
             value *= 2*math.pi
         params["alpha_blend" if field == "alpha" else field] = value
-    if kind == "ShaderNodeBsdfMetallic":
+    if kind == "ShaderNodeBsdfMetallic" and node.fresnel_type == "F82":
         params["base_color"] = list(node.inputs["Base Color"].default_value[:3])
     if kind in {"ShaderNodeBsdfGlossy", "ShaderNodeBsdfAnisotropic", "ShaderNodeBsdfMetallic"}:
         params.update(metallic=1.0, pure_glossy=True)

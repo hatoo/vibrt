@@ -407,12 +407,22 @@ pub fn make_material_data(
     let (mf_ptr, mf_w, mf_h, mf_c) = lookup(mat.mix_fac_tex);
 
     PrincipledGpu {
+        surface_model: mat.surface_model,
+        distribution: mat.distribution,
+        specular_tint: mat.specular_tint,
+        coat_tint: mat.coat_tint,
+        coat_normal: mat.coat_normal,
+        thin_film_thickness: mat.thin_film_thickness,
+        thin_film_ior: mat.thin_film_ior,
+        conductor_ior: mat.conductor_ior,
+        conductor_k: mat.conductor_k,
+        diffuse_roughness: mat.diffuse_roughness.clamp(0.0, 1.0),
         aov_shaders: 0,
         num_aov_shaders: 0,
         base_color: mat.base_color,
         metallic: mat.metallic.clamp(0.0, 1.0),
         roughness: mat.roughness.clamp(0.0, 1.0),
-        ior: mat.ior.max(1.0),
+        ior: mat.ior.max(1e-5),
         transmission: mat.transmission.clamp(0.0, 1.0),
         specular_ior_level: mat.specular_ior_level.max(0.0),
         emission: mat.emission,
