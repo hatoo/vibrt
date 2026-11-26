@@ -15,6 +15,7 @@ import bpy
 
 from . import _log, exporter, runner, sky_bake, native_scene
 from .progressive import RenderResultDisplay
+from .export_context import ExportContext
 
 
 class VibrtRenderEngine(bpy.types.RenderEngine):
@@ -144,12 +145,12 @@ class VibrtRenderEngine(bpy.types.RenderEngine):
             self.update_stats("vibrt", "Exporting scene...")
             self.report({"INFO"}, f"vibrt: rendering {width}x{height} in-process")
             t_export = time.perf_counter()
-            exporter.clear_sky_bake_cache()
+            export_context = ExportContext()
             # Evaluate supported skies in-process. For unsupported graphs,
             # overlap the isolated Cycles worker with geometry/texture export,
             # then join before the exporter consumes its environment pixels.
             with sky_bake.prepare_scene_async(
-                depsgraph.scene, cancel=self.test_break, log=_to_info,
+                depsgraph.scene, cancel=self.test_break, log=_to_info, context=export_context,
             ) as finish_sky:
                 def prepare_world():
                     self.update_stats("vibrt", "Preparing sky lighting...")
@@ -157,7 +158,7 @@ class VibrtRenderEngine(bpy.types.RenderEngine):
 
                 scene_data, mesh_blobs, texture_arrays = exporter.export_scene_to_memory(
                     depsgraph, serialize=native_scene.accelerator() is None,
-                    prepare_world=prepare_world,
+                    prepare_world=prepare_world, context=export_context,
                 )
             n_blobs = len(mesh_blobs)
             n_arrays = len(texture_arrays)

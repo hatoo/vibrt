@@ -6,19 +6,19 @@ import bpy, os, sys, numpy as np
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(HERE, "blender"))
 import vibrt_blender  # noqa
+from vibrt_blender.export_context import ExportContext
+export_context = ExportContext()
 try:
     bpy.ops.preferences.addon_enable(module="vibrt_blender")
 except Exception:
     pass
 
-from vibrt_blender.exporter import (
-    prebake_sky_envmaps_for_world, _SKY_BAKE_CACHE,
-)
+from vibrt_blender.exporter import prebake_sky_envmaps_for_world
 
-prebake_sky_envmaps_for_world(bpy.context.scene.world, w=1024, h=512)
+prebake_sky_envmaps_for_world(bpy.context.scene.world, w=1024, h=512, context=export_context)
 
-print("\n=== _SKY_BAKE_CACHE entries ===")
-for key, (rgb_bytes, w, h, sun) in _SKY_BAKE_CACHE.items():
+print("\n=== export_context.sky_maps entries ===")
+for key, (rgb_bytes, w, h, sun) in export_context.sky_maps.items():
     if isinstance(rgb_bytes, np.ndarray):
         rgb = rgb_bytes
     else:

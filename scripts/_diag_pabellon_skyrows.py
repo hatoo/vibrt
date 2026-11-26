@@ -15,6 +15,8 @@ for _m in list(sys.modules):
     if _m == "vibrt_blender" or _m.startswith("vibrt_blender."):
         del sys.modules[_m]
 import vibrt_blender  # noqa
+from vibrt_blender.export_context import ExportContext
+export_context = ExportContext()
 try:
     bpy.ops.preferences.addon_enable(module="vibrt_blender")
 except Exception:
@@ -26,9 +28,9 @@ world = scene.world
 sky_node = next(n for n in world.node_tree.nodes if n.bl_idname == "ShaderNodeTexSky")
 
 # --- vibrt bake (sky node alone) ---
-EXP.prebake_sky_envmaps_for_world(world, w=2048, h=1024)
+EXP.prebake_sky_envmaps_for_world(world, w=2048, h=1024, context=export_context)
 key = EXP._sky_node_alone_cache_key(world, sky_node)
-sky_rgb, bw, bh, sun = EXP._SKY_BAKE_CACHE[key]
+sky_rgb, bw, bh, sun = export_context.sky_maps[key]
 vib = np.asarray(sky_rgb, dtype=np.float32).reshape(bh, bw, 3)
 # vibrt bake storage note: foreach_get bottom-up; the diag treats array row 0
 # per how the kernel reads it (v=0 -> row 0). Report as-stored.

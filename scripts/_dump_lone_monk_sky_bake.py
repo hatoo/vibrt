@@ -9,15 +9,17 @@ import numpy as np
 
 sys.path.insert(0, r"C:\Users\hato2\Desktop\vibrt\blender")
 from vibrt_blender import exporter
+from vibrt_blender.export_context import ExportContext
+export_context = ExportContext()
 
 w = bpy.context.scene.world
 print(f"world={w.name}, use_nodes={w.use_nodes}")
-exporter.clear_sky_bake_cache()
-exporter.prebake_sky_envmaps_for_world(w, w_=2048 if False else 2048, h=1024) if False else \
-    exporter.prebake_sky_envmaps_for_world(w, w=2048, h=1024)
+exporter.clear_sky_bake_cache(context=export_context)
+exporter.prebake_sky_envmaps_for_world(w, w_=2048 if False else 2048, h=1024, context=export_context) if False else \
+    exporter.prebake_sky_envmaps_for_world(w, w=2048, h=1024, context=export_context)
 
-print("\n=== _SKY_BAKE_CACHE entries ===")
-for key, val in exporter._SKY_BAKE_CACHE.items():
+print("\n=== export_context.sky_maps entries ===")
+for key, val in export_context.sky_maps.items():
     rgb, bw, bh, sun = val
     rgb_arr = np.asarray(rgb).reshape(bh, bw, 3)
     lum = 0.2126 * rgb_arr[..., 0] + 0.7152 * rgb_arr[..., 1] + 0.0722 * rgb_arr[..., 2]

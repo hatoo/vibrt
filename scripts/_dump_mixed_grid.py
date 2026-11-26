@@ -12,22 +12,20 @@ import numpy as np
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(HERE, "blender"))
 import vibrt_blender  # noqa
+from vibrt_blender.export_context import ExportContext
+export_context = ExportContext()
 try:
     bpy.ops.preferences.addon_enable(module="vibrt_blender")
 except Exception:
     pass
 
-from vibrt_blender.exporter import (
-    prebake_sky_envmaps_for_world, _SKY_BAKE_CACHE,
-    _sky_node_alone_cache_key, _detect_mix_world,
-    _euler_xyz_to_matrix3,
-)
+from vibrt_blender.exporter import prebake_sky_envmaps_for_world, _sky_node_alone_cache_key, _detect_mix_world, _euler_xyz_to_matrix3
 
 scene = bpy.context.scene
 world = scene.world
 
 # Run the prebake so the Sky-alone cache is populated.
-prebake_sky_envmaps_for_world(world, w=1024, h=512)
+prebake_sky_envmaps_for_world(world, w=1024, h=512, context=export_context)
 
 mix = _detect_mix_world(world)
 if mix is None:
@@ -41,7 +39,7 @@ def get_layer(bg):
     rotation = (1, 0, 0, 0, 1, 0, 0, 0, 1)
     if src.bl_idname == "ShaderNodeTexSky":
         key = _sky_node_alone_cache_key(world, src)
-        rgb, w, h, _sun = _SKY_BAKE_CACHE[key]
+        rgb, w, h, _sun = export_context.sky_maps[key]
         rgb = np.frombuffer(rgb, dtype=np.float32).reshape((h, w, 3))
         return ("equirect", rgb, w, h, np.array(rotation).reshape(3, 3),
                 strength, "repeat")

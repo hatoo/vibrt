@@ -15,10 +15,12 @@ except Exception:
     pass
 
 from vibrt_blender import exporter
+from vibrt_blender.export_context import ExportContext
+export_context = ExportContext()
 
 scene = bpy.context.scene
 # Bake without using the cache so we can read the raw bake
-exporter._SKY_BAKE_CACHE.clear()
+export_context.sky_maps.clear()
 world = scene.world
 sky_node = exporter._world_sky_node(world)
 print(f"sky_node = {sky_node}")

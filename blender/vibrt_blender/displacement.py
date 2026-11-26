@@ -1,6 +1,7 @@
 """Geometry displacement through the same C++ graph evaluator used by CUDA."""
 
 import numpy as np
+from .export_context import ExportContext
 from .shader_graph import Compiler, UnsupportedNode
 
 
@@ -37,7 +38,9 @@ def _validate_graph(graph):
             )
 
 
-def apply(mesh, obj, arrays, writer, textures, attribute_loader):
+def apply(mesh, obj, arrays, writer, textures, attribute_loader, *, context=None):
+    if context is None:
+        context = ExportContext()
     targets = []
     for index, slot in enumerate(obj.material_slots):
         mat = slot.material
@@ -57,18 +60,16 @@ def apply(mesh, obj, arrays, writer, textures, attribute_loader):
         )
         socket = output.inputs.get("Displacement") if output else None
         if socket is not None and socket.is_linked:
-            from . import material_export
-
-            compiler = Compiler(writer, textures)
-            previous_material = material_export._CURRENT_MATERIAL
+            compiler = Compiler(writer, textures, context=context)
+            previous_material = context.material
             try:
-                material_export._CURRENT_MATERIAL = mat.name
+                context.material = mat.name
                 graph = compiler.graph({"displacement_vector": compiler.input(socket)})
                 _validate_graph(graph)
             except UnsupportedNode as exc:
                 raise UnsupportedNode(f"{obj.name}/{mat.name}: {exc}") from exc
             finally:
-                material_export._CURRENT_MATERIAL = previous_material
+                context.material = previous_material
             targets.append((index, graph))
     if not targets:
         return False

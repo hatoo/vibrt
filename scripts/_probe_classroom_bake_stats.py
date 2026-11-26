@@ -18,14 +18,16 @@ except Exception:
     pass
 
 from vibrt_blender import exporter
+from vibrt_blender.export_context import ExportContext
+export_context = ExportContext()
 
 scene = bpy.context.scene
-exporter.clear_sky_bake_cache()
-exporter.prebake_sky_envmaps_for_world(scene.world)
-exporter.prebake_portal_emissions_for_scene(scene)
+exporter.clear_sky_bake_cache(context=export_context)
+exporter.prebake_sky_envmaps_for_world(scene.world, context=export_context)
+exporter.prebake_portal_emissions_for_scene(scene, context=export_context)
 
-cache = exporter._SKY_BAKE_CACHE
-print(f"=== _SKY_BAKE_CACHE keys ===")
+cache = export_context.sky_maps
+print(f"=== export_context.sky_maps keys ===")
 for k in cache.keys():
     rgb, w, h, sun = cache[k]
     print(f"  {k!r}")

@@ -4,6 +4,7 @@ Python reads RNA and connections only. Numerical node implementations live in
 vibrt-nodes. Unsupported sockets fail explicitly; they never become mean colors.
 """
 import math
+from .export_context import ExportContext
 
 MATH = "ADD SUBTRACT MULTIPLY DIVIDE SINE COSINE TANGENT ARCSINE ARCCOSINE ARCTANGENT POWER LOGARITHM MINIMUM MAXIMUM ROUND LESS_THAN GREATER_THAN MODULO ABSOLUTE ARCTAN2 FLOOR CEIL FRACT SQRT INVERSE_SQRT SIGN EXPONENT RADIANS DEGREES SINH COSH TANH TRUNC SNAP WRAP COMPARE MULTIPLY_ADD PINGPONG SMOOTH_MIN SMOOTH_MAX FLOORED_MODULO".split()
 VECTOR_MATH = "ADD SUBTRACT MULTIPLY DIVIDE CROSS_PRODUCT PROJECT REFLECT DOT_PRODUCT DISTANCE LENGTH SCALE NORMALIZE SNAP FLOOR CEIL MODULO FRACTION ABSOLUTE MINIMUM MAXIMUM WRAP SINE COSINE TANGENT REFRACT FACEFORWARD MULTIPLY_ADD POWER SIGN ROUND".split()
@@ -23,7 +24,8 @@ def _enum(value, choices):
 
 
 class Compiler:
-    def __init__(self, writer=None, textures=None, group_stack=()):
+    def __init__(self, writer=None, textures=None, group_stack=(), *, context=None):
+        self.export_context = context if context is not None else ExportContext()
         self.writer = writer
         self.textures = textures
         self.groups = tuple(group_stack)
@@ -287,8 +289,8 @@ class Compiler:
                 return self.constant(1.0 if name == "Alpha" else (1.0, 0.0, 1.0, 1.0))
             if n.image.source not in {"FILE", "GENERATED", "SEQUENCE", "MOVIE"}:
                 raise UnsupportedNode(f"Image source {n.image.source} needs a texture manager")
-            from .material_export import export_image_texture
-            tex = export_image_texture(n.image, self.writer, self.textures)
+            from .texture_export import export_image_texture
+            tex = export_image_texture(n.image, self.writer, self.textures, context=self.export_context)
             environment = kind.endswith("Environment")
             associate = n.image.alpha_mode not in {"NONE", "CHANNEL_PACKED"} and not n.image.colorspace_settings.is_data
             return self.add("image", [coord(3 if environment else 0)],
@@ -298,7 +300,7 @@ class Compiler:
                              float(associate and bool(n.outputs.get("Alpha") and n.outputs["Alpha"].is_linked))], texture=tex)
         if kind == "ShaderNodeTexSky":
             from . import vibrt_native
-            from .material_export import _PreBakedTexture, _export_prebaked
+            from .texture_export import _PreBakedTexture, _export_prebaked
             settings = {key: getattr(n, key) for key in (
                 "turbidity", "ground_albedo", "sun_elevation", "sun_rotation", "sun_size", "sun_intensity", "altitude", "air_density", "aerosol_density", "ozone_density", "sun_disc")}
             settings.update(model=n.sky_type, sun_direction=tuple(n.sun_direction))
@@ -306,7 +308,7 @@ class Compiler:
             tex = next((i for i,t in enumerate(self.textures) if t.get("_key") == key), None)
             if tex is None:
                 pixels = vibrt_native.sky_pixels(settings, 2048, 1024)
-                tex = _export_prebaked(_PreBakedTexture(pixels, 2048, 1024, key), self.writer, self.textures)
+                tex = _export_prebaked(_PreBakedTexture(pixels, 2048, 1024, key), self.writer, self.textures, context=self.export_context)
             return self.add("image", [coord(1)], [0, 0, 0, 0], [0, 2], texture=tex)
         if kind in {"ShaderNodeRGBCurve", "ShaderNodeFloatCurve", "ShaderNodeVectorCurve"}:
             cm = n.mapping
@@ -426,8 +428,7 @@ class Compiler:
         if kind == "ShaderNodeObjectInfo":
             if name == "Material Index":
                 import bpy
-                from .material_export import _CURRENT_MATERIAL
-                material = bpy.data.materials.get(_CURRENT_MATERIAL)
+                material = bpy.data.materials.get(self.export_context.material)
                 return self.constant(material.pass_index if material else 0)
             if name == "Location":
                 return self.context(10)
@@ -480,8 +481,10 @@ PRINCIPLED_INPUTS = {
 }
 
 
-def attach(node, params, writer, textures, group_stack=()):
+def attach(node, params, writer, textures, group_stack=(), *, context=None):
     """Attach all connected value sockets, preserving existing closure behavior."""
+    if context is None:
+        context = ExportContext()
     kind = node.bl_idname
     mapping = dict(PRINCIPLED_INPUTS) if kind == "ShaderNodeBsdfPrincipled" else {
         "Color": "emission" if kind == "ShaderNodeEmission" else "base_color",
@@ -489,7 +492,7 @@ def attach(node, params, writer, textures, group_stack=()):
         "Normal": "normal", "Anisotropy": "anisotropy", "Rotation": "tangent_rotation",
         "Tangent": "tangent", "Offset": "hair_offset", "RoughnessU": "hair_roughness_u", "RoughnessV": "hair_roughness_v",
     }
-    compiler = Compiler(writer, textures, group_stack)
+    compiler = Compiler(writer, textures, group_stack, context=context)
     if kind == "ShaderNodeBsdfSheen":
         mapping.update(Color="sheen_tint", Roughness="sheen_roughness")
     elif kind == "ShaderNodeBsdfMetallic":
@@ -523,11 +526,13 @@ def attach(node, params, writer, textures, group_stack=()):
     return params
 
 
-def compile_leaf(node, writer, textures, group_stack=()):
+def compile_leaf(node, writer, textures, group_stack=(), *, context=None):
     """Fast path: compile sockets before the legacy image-baking traversal."""
+    if context is None:
+        context = ExportContext()
     kind = node.bl_idname
     if kind == "ShaderNodeSubsurfaceScattering":
-        compiler = Compiler(writer, textures, group_stack)
+        compiler = Compiler(writer, textures, group_stack, context=context)
         outputs = {
             field: compiler.input(node.inputs[socket])
             for socket, field in (
@@ -562,7 +567,7 @@ def compile_leaf(node, writer, textures, group_stack=()):
             raise UnsupportedNode(
                 "Huang hair has unresolved Cycles comparison differences; only Chiang is supported"
             )
-        compiler = Compiler(writer, textures, group_stack)
+        compiler = Compiler(writer, textures, group_stack, context=context)
         fields = {
             "Color": "base_color",
             "Absorption Coefficient": "hair_sigma",
@@ -607,7 +612,7 @@ def compile_leaf(node, writer, textures, group_stack=()):
         compiler.attach_attributes(params)
         return params
     if kind in {"ShaderNodeBsdfToon", "ShaderNodeHoldout", "ShaderNodeBsdfRayPortal"}:
-        compiler = Compiler(writer, textures, group_stack)
+        compiler = Compiler(writer, textures, group_stack, context=context)
         outputs = {}
         params = {
             "base_color": [0.0] * 3,
@@ -675,12 +680,14 @@ def compile_leaf(node, writer, textures, group_stack=()):
     strength = node.inputs.get("Emission Strength" if kind == "ShaderNodeBsdfPrincipled" else "Strength")
     if strength is not None:
         params["emission"] = [c*float(strength.default_value) for c in params["emission"]]
-    return attach(node, params, writer, textures, group_stack)
+    return attach(node, params, writer, textures, group_stack, context=context)
 
 
-def compile_emission(socket, writer, textures):
+def compile_emission(socket, writer, textures, *, context=None):
     """Compile an emission-only closure tree for analytic light evaluation."""
-    compiler = Compiler(writer, textures)
+    if context is None:
+        context = ExportContext()
+    compiler = Compiler(writer, textures, context=context)
 
     def emission(sock, groups=(), depth=0):
         if depth > 32:
@@ -721,8 +728,10 @@ def compile_emission(socket, writer, textures):
     return compiler.graph({'emission': value})
 
 
-def compile_aovs(tree, params, writer, textures, passes):
+def compile_aovs(tree, params, writer, textures, passes, *, context=None):
     """AOV nodes are graph roots even when disconnected from Material Output."""
+    if context is None:
+        context = ExportContext()
     outputs = []
     attributes = set(params.get("_shader_attributes", ()))
 
@@ -744,7 +753,7 @@ def compile_aovs(tree, params, writer, textures, passes):
                 if match is None:
                     continue
                 i, aov = match
-                compiler = Compiler(writer, textures, groups)
+                compiler = Compiler(writer, textures, groups, context=context)
                 socket = "Color" if aov.type == "COLOR" else "Value"
                 value = compiler.input(node.inputs[socket])
                 outputs.append(
@@ -758,16 +767,18 @@ def compile_aovs(tree, params, writer, textures, passes):
         params["_shader_attributes"] = sorted(attributes)
 
 
-def compile_displacement(socket, params, writer, textures):
+def compile_displacement(socket, params, writer, textures, *, context=None):
     """Evaluate Material Output displacement as spatial bump on every closure."""
+    if context is None:
+        context = ExportContext()
     if socket is None or not socket.is_linked:
         return
     for key in ("left_subtree", "secondary"):
         if params.get(key):
-            compile_displacement(socket, params[key], writer, textures)
+            compile_displacement(socket, params[key], writer, textures, context=context)
     if params.get("left_subtree"):
         return
-    compiler = Compiler(writer, textures)
+    compiler = Compiler(writer, textures, context=context)
     old = params.get("shader_graph", {})
     compiler.nodes.extend(old.get("nodes", []))
     compiler.attributes.update(params.get("_shader_attributes", ()))

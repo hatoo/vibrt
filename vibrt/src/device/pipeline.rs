@@ -1,4 +1,4 @@
-//! Device-code compilation + precomputed lookup tables.
+//! Assemble and cache device-code compilation.
 
 use anyhow::Result;
 
@@ -32,8 +32,45 @@ pub fn compile_ptx(
     has_aovs: bool,
     has_extended_phases: bool,
 ) -> Result<String> {
-    let cu_src = include_str!("devicecode.cu");
-    let header_src = include_str!("devicecode.h");
+    // Include expansion also works in Windows checkouts using CRLF endings.
+    let mut cu_src = include_str!("../devicecode.cu").replace("\r\n", "\n");
+    cu_src = cu_src.replace("#include \"device/math.h\"\n", include_str!("math.h"));
+    cu_src = cu_src.replace("#include \"device/volume.h\"\n", include_str!("volume.h"));
+    cu_src = cu_src.replace("#include \"device/surface.h\"\n", include_str!("surface.h"));
+    cu_src = cu_src.replace(
+        "#include \"device/environment.h\"\n",
+        include_str!("environment.h"),
+    );
+    cu_src = cu_src.replace(
+        "#include \"device/visibility.h\"\n",
+        include_str!("visibility.h"),
+    );
+    cu_src = cu_src.replace(
+        "#include \"device/material.h\"\n",
+        include_str!("material.h"),
+    );
+    cu_src = cu_src.replace(
+        "#include \"device/lighting.h\"\n",
+        include_str!("lighting.h"),
+    );
+    cu_src = cu_src.replace(
+        "#include \"device/geometry.h\"\n",
+        include_str!("geometry.h"),
+    );
+    cu_src = cu_src.replace(
+        "#include \"device/scene_query.h\"\n",
+        include_str!("scene_query.h"),
+    );
+    cu_src = cu_src.replace(
+        "#include \"device/programs.h\"\n",
+        include_str!("programs.h"),
+    );
+    cu_src = cu_src.replace(
+        "#include \"device/integrator.h\"\n",
+        include_str!("integrator.h"),
+    );
+
+    let header_src = include_str!("../devicecode.h");
     let opts = cudarc::nvrtc::CompileOptions {
         include_paths: vec![find_optix_include()],
         use_fast_math: Some(true),
@@ -49,7 +86,7 @@ pub fn compile_ptx(
         ),
         cu_src
             .replace("#include \"devicecode.h\"", "// (inlined above)")
-            .replace("#include \"rect_light_sampling.h\"", include_str!("rect_light_sampling.h"))
+            .replace("#include \"rect_light_sampling.h\"", include_str!("../rect_light_sampling.h"))
             .replace("#include \"vibrt_nodes_core.h\"", vibrt_nodes::DEVICE_CORE)
             .replace("#include \"vibrt_shader.h\"", &vibrt_nodes::DEVICE_SHADER
                 .replace("#include \"cycles_nodes.h\"", &vibrt_nodes::DEVICE_CYCLES
@@ -77,44 +114,4 @@ pub fn compile_ptx(
         }
     }
     Ok(ptx)
-}
-
-// The integration depends only on the BRDF, never on the scene or GPU.
-// Build it once and embed the exact float bits, including for the first render.
-include!(concat!(env!("OUT_DIR"), "/ggx_energy_lut.rs"));
-
-/// Build marginal + conditional CDFs for envmap importance sampling (RGB data).
-pub fn build_envmap_cdf(rgb: &[f32], width: u32, height: u32) -> (Vec<f32>, Vec<f32>, f32) {
-    let w = width as usize;
-    let h = height as usize;
-    let mut cond = vec![0.0f32; h * (w + 1)];
-    let mut row_int = vec![0.0f32; h];
-    for y in 0..h {
-        let sin_t = (std::f32::consts::PI * (y as f32 + 0.5) / h as f32).sin();
-        let ro = y * (w + 1);
-        for x in 0..w {
-            let idx = (y * w + x) * 3;
-            let lum = 0.2126 * rgb[idx] + 0.7152 * rgb[idx + 1] + 0.0722 * rgb[idx + 2];
-            cond[ro + x + 1] = cond[ro + x] + lum * sin_t;
-        }
-        row_int[y] = cond[ro + w];
-        if row_int[y] > 0.0 {
-            let inv = 1.0 / row_int[y];
-            for x in 1..=w {
-                cond[ro + x] *= inv;
-            }
-        }
-    }
-    let mut marg = vec![0.0f32; h + 1];
-    for y in 0..h {
-        marg[y + 1] = marg[y] + row_int[y];
-    }
-    let total = marg[h];
-    if total > 0.0 {
-        let inv = 1.0 / total;
-        for y in 1..=h {
-            marg[y] *= inv;
-        }
-    }
-    (marg, cond, total)
 }

@@ -66,14 +66,18 @@ def _run_worker(command, directory, cancel):
         return wait()
 
 
-def prepare_scene(scene, *, cancel=lambda: False, log=print, width=None, height=None):
+def prepare_scene(scene, *, cancel=lambda: False, log=print, width=None, height=None, context=None):
     """Blocking convenience wrapper for scripts and sky-only preparation."""
-    with prepare_scene_async(scene, cancel=cancel, log=log, width=width, height=height) as wait:
+    from .export_context import ExportContext
+    if context is None:
+        context = ExportContext()
+    with prepare_scene_async(scene, cancel=cancel, log=log, width=width, height=height, context=context) as wait:
         wait()
+    return context
 
 
 @contextmanager
-def prepare_scene_async(scene, *, cancel=lambda: False, log=print, width=None, height=None):
+def prepare_scene_async(scene, *, cancel=lambda: False, log=print, width=None, height=None, context):
     """Evaluate supported sky graphs natively; otherwise snapshot their inputs.
 
     No scenes, objects, node trees, or render results are created/edited in
@@ -94,7 +98,7 @@ def prepare_scene_async(scene, *, cancel=lambda: False, log=print, width=None, h
         raise ValueError("Specify both sky bake dimensions or neither")
     from . import native_sky
 
-    if native_sky.prepare_scene(scene, cancel=cancel, log=log, width=width, height=height):
+    if native_sky.prepare_scene(scene, cancel=cancel, log=log, width=width, height=height, context=context):
         yield lambda: None
         return
     bake_world = _needs_world_bake(scene.world)
@@ -142,7 +146,7 @@ def prepare_scene_async(scene, *, cancel=lambda: False, log=print, width=None, h
                     if line.startswith("[vibrt]"):
                         log(line)
                 # Publish atomically only after every buffer is validated.
-                exporter._SKY_BAKE_CACHE.update(_read_results(directory))
+                context.sky_maps.update(_read_results(directory))
                 published = True
 
             yield finish
@@ -164,7 +168,10 @@ def _read_results(directory):
     return cache
 
 
-def run_worker(directory):
+def run_worker(directory, *, context=None):
+    from .export_context import ExportContext
+    if context is None:
+        context = ExportContext()
     import bpy
     import numpy as np
     from . import exporter
@@ -185,16 +192,16 @@ def run_worker(directory):
         objects=[SimpleNamespace(type="MESH", material_slots=[SimpleNamespace(material=m)])
                  for m in data.materials],
     )
-    exporter.clear_sky_bake_cache()
+    exporter.clear_sky_bake_cache(context=context)
     # Preserve the exporter's distinct defaults: worlds use 2048x1024,
     # while portal skies use 1024x512. Tests can override both explicitly.
     resolution = {} if request["width"] is None else {
         "w": request["width"], "h": request["height"],
     }
-    exporter.prebake_sky_envmaps_for_world(world, **resolution)
-    exporter.prebake_portal_emissions_for_scene(scene, **resolution)
+    exporter.prebake_sky_envmaps_for_world(world, **resolution, context=context)
+    exporter.prebake_portal_emissions_for_scene(scene, **resolution, context=context)
     manifest = []
-    for index, (key, (pixels, w, h, sun)) in enumerate(exporter._SKY_BAKE_CACHE.items()):
+    for index, (key, (pixels, w, h, sun)) in enumerate(context.sky_maps.items()):
         np.save(directory / f"bake-{index}.npy", pixels, allow_pickle=False)
         manifest.append({"key": key, "width": w, "height": h, "sun": sun})
     (directory / "result.json").write_text(json.dumps(manifest), encoding="utf-8")

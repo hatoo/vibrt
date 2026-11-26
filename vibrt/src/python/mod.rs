@@ -285,7 +285,7 @@ fn precompile_shaders<'py>(
     };
     let result = py.allow_threads(|| -> anyhow::Result<_> {
         let started = std::time::Instant::now();
-        shader_compile::optimize_materials(&mut scene.materials)?;
+        crate::material::optimize_materials(&mut scene.materials)?;
         let requirements = ShaderRequirements::new(
             &scene.materials,
             scene.aov_names.len(),

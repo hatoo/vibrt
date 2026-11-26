@@ -134,7 +134,7 @@ fn default_transparent_bounces() -> u32 {
     8
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 pub struct CameraDesc {
     /// 4x4 row-major matrix_world from Blender. Camera looks down local -Z.
     pub transform: [f32; 16],

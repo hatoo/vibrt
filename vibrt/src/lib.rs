@@ -9,8 +9,11 @@
 #![allow(clippy::missing_transmute_annotations)]
 
 pub mod camera;
+pub mod device;
+// Preserve the existing public module paths.
+pub use device::{pipeline, shaders as shader_compile};
 pub mod gpu_types;
-pub mod pipeline;
+pub mod material;
 #[cfg(any(feature = "python", test))]
 mod pointiness;
 pub mod principled;
@@ -19,7 +22,6 @@ mod query_bvh;
 pub mod render;
 pub mod scene_format;
 pub mod scene_loader;
-pub mod shader_compile;
 pub use vibrt_nodes::sky;
 pub mod transform;
 

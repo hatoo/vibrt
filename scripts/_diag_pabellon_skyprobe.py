@@ -20,6 +20,8 @@ for _m in list(sys.modules):
     if _m == "vibrt_blender" or _m.startswith("vibrt_blender."):
         del sys.modules[_m]
 import vibrt_blender  # noqa
+from vibrt_blender.export_context import ExportContext
+export_context = ExportContext()
 try:
     bpy.ops.preferences.addon_enable(module="vibrt_blender")
 except Exception:
@@ -31,15 +33,15 @@ world = scene.world
 mix = next(n for n in world.node_tree.nodes if n.bl_idname == "ShaderNodeMixShader")
 mix.inputs[0].default_value = 0.0  # sky only (first shader = sky, strength 0.5)
 
-# --- 3. Bake vibrt's sky (populates _SKY_BAKE_CACHE) ---
-EXP.prebake_sky_envmaps_for_world(world, w=2048, h=1024)
+# --- 3. Bake vibrt's sky (populates export_context.sky_maps) ---
+EXP.prebake_sky_envmaps_for_world(world, w=2048, h=1024, context=export_context)
 # Find the sky-alone bake in the cache.
 sky_node = next(n for n in world.node_tree.nodes if n.bl_idname == "ShaderNodeTexSky")
 key = EXP._sky_node_alone_cache_key(world, sky_node)
-entry = EXP._SKY_BAKE_CACHE.get(key)
+entry = export_context.sky_maps.get(key)
 if entry is None:
     print("NO BAKE ENTRY for", key)
-    for k in EXP._SKY_BAKE_CACHE:
+    for k in export_context.sky_maps:
         print("  have:", k)
     sys.exit(1)
 sky_rgb, bw, bh, sun = entry
