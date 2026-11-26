@@ -427,6 +427,10 @@ def optimize(args, codex):
 
 
 def main(argv=None):
+    # Captured Windows stdout can use a locale unable to represent workspace paths.
+    for stream in (sys.stdout, sys.stderr):
+        if not stream.isatty() and hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--repo", type=Path, default=ROOT)
     parser.add_argument("--codex", help="Native Codex executable; default: installed CLI")
