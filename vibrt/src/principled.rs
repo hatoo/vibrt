@@ -2,7 +2,7 @@
 
 use crate::gpu_types::{PrincipledGpu, TextureBinding, VolumeGpu};
 use crate::scene_format::{ColorGraph, ColorNode, PrincipledMaterial, VolumeParams};
-use crate::scene_loader::LoadedTexture;
+use crate::scene_loader::{texture_pixel_flags, LoadedTexture};
 use crate::CudaResultExt;
 use anyhow::{anyhow, Result};
 use cudarc::driver::{CudaSlice, CudaStream, DevicePtr};
@@ -94,19 +94,22 @@ pub fn surface_requirements(mat: &PrincipledMaterial) -> Result<(u32, bool)> {
 /// Remove only bit-identical channels; keep the original f32 samples and size.
 /// Layouts are luminance, luminance/alpha, RGB and RGBA (1..=4 channels).
 /// Reuse initialized storage across uploads; RGBA borrows the source directly.
-fn compact_texture<'a>(rgba: &'a [f32], scratch: &'a mut Vec<f32>) -> (&'a [f32], i32) {
-    let flags = rgba
-        .par_chunks(16_384)
-        .map(|chunk| {
-            chunk.as_chunks::<4>().0.iter().fold(0, |flags, p| {
-                flags
-                    | u32::from(
-                        p[0].to_bits() != p[1].to_bits() || p[0].to_bits() != p[2].to_bits(),
-                    )
-                    | (u32::from(p[3].to_bits() != 1.0f32.to_bits()) << 1)
+fn compact_texture<'a>(
+    rgba: &'a [f32],
+    channel_flags: Option<u32>,
+    scratch: &'a mut Vec<f32>,
+) -> (&'a [f32], i32) {
+    let flags = channel_flags.unwrap_or_else(|| {
+        rgba.par_chunks(16_384)
+            .map(|chunk| {
+                chunk
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .fold(0, |flags, p| flags | texture_pixel_flags(p))
             })
-        })
-        .reduce(|| 0, |a, b| a | b);
+            .reduce(|| 0, |a, b| a | b)
+    });
     let channels = match flags {
         0 => 1,
         1 => 3,
@@ -142,7 +145,7 @@ pub fn upload_textures(
     let mut out = Vec::with_capacity(textures.len());
     let mut scratch = Vec::new();
     for tex in textures {
-        let (pixels, channels) = compact_texture(&tex.data, &mut scratch);
+        let (pixels, channels) = compact_texture(tex.data(), tex.channel_flags(), &mut scratch);
         let slice = stream.clone_htod(pixels).cuda()?;
         // The driver may return before consuming the packed pixels. Finish the
         // copy before scratch can be reused, resized or dropped. RGBA continues
@@ -554,7 +557,7 @@ mod tests {
             // Exercise the boundary between parallel chunks as well as small inputs.
             for repeat in [1, 4097] {
                 let source = rgba.repeat(repeat);
-                let (packed, channels) = compact_texture(&source, &mut scratch);
+                let (packed, channels) = compact_texture(&source, None, &mut scratch);
                 assert_eq!(channels, expected_channels);
                 assert_eq!(packed.len(), repeat * channels as usize);
                 for pixel in packed.chunks_exact(channels as usize) {
@@ -571,9 +574,33 @@ mod tests {
         let mut mixed = vec![0.0, 0.0, 0.0, 1.0].repeat(8193);
         mixed[4096 * 4 + 1] = 0.25;
         mixed[8192 * 4 + 3] = 0.5;
-        let (packed, channels) = compact_texture(&mixed, &mut scratch);
+        let (packed, channels) = compact_texture(&mixed, None, &mut scratch);
         assert_eq!(channels, 4);
         assert_eq!(packed.as_ptr(), mixed.as_ptr());
+    }
+
+    #[test]
+    fn texture_preclassified_compaction_matches_scanned_layouts() {
+        let mut scanned_scratch = Vec::new();
+        let mut cached_scratch = Vec::new();
+        for (pixel, flags) in [
+            ([0.25, 0.25, 0.25, 1.0], 0),
+            ([0.25, 0.5, 8.0, 1.0], 1),
+            ([f32::from_bits(0x7fc0_0001); 4], 2),
+            ([-0.0, 0.0, -0.0, 0.5], 3),
+        ] {
+            for count in [1, 4097, 8193] {
+                let source = pixel.repeat(count);
+                let (scanned, scan_channels) = compact_texture(&source, None, &mut scanned_scratch);
+                let (cached, cache_channels) =
+                    compact_texture(&source, Some(flags), &mut cached_scratch);
+                assert_eq!(scan_channels, cache_channels);
+                assert_eq!(
+                    scanned.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                    cached.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
+                );
+            }
+        }
     }
 
     #[test]
@@ -607,7 +634,7 @@ mod tests {
                                 let alpha = if layout == 2 || layout == 4 { 0.5 } else { 1.0 };
                                 rgba.extend_from_slice(&[value, g, b, alpha]);
                             }
-                            let (packed, channels) = compact_texture(&rgba, &mut scratch);
+                            let (packed, channels) = compact_texture(&rgba, None, &mut scratch);
                             assert_eq!(channels, if count == 0 { 1 } else { layout });
                             assert_eq!(packed.len(), count * channels as usize);
                             for (pixel, expected) in packed

@@ -35,9 +35,35 @@ pub struct LoadedTexture<'bin> {
     /// borrow directly from the caller's pixel array. sRGB textures get
     /// an owned `Vec<f32>` because the linearisation has to write into a
     /// fresh buffer; that pass folds the copy and the conversion together.
-    pub data: Cow<'bin, [f32]>,
+    data: Cow<'bin, [f32]>,
+    // Exact channel redundancy, computed while writing converted pixels.
+    // Borrowed linear images are classified at upload as before.
+    channel_flags: Option<u32>,
     pub width: u32,
     pub height: u32,
+}
+
+impl LoadedTexture<'_> {
+    pub fn data(&self) -> &[f32] {
+        &self.data
+    }
+
+    /// Editing pixels invalidates any classification from their conversion.
+    pub fn data_mut(&mut self) -> &mut [f32] {
+        self.channel_flags = None;
+        self.data.to_mut()
+    }
+
+    pub(crate) fn channel_flags(&self) -> Option<u32> {
+        self.channel_flags
+    }
+}
+
+/// Bit 0 requires RGB; bit 1 requires alpha. Compare converted sample bits,
+/// including signed zero and NaN payloads, rather than float equality.
+pub(crate) fn texture_pixel_flags(p: &[f32]) -> u32 {
+    u32::from(p[0].to_bits() != p[1].to_bits() || p[0].to_bits() != p[2].to_bits())
+        | (u32::from(p[3].to_bits() != 1.0f32.to_bits()) << 1)
 }
 
 pub struct LoadedObject {
@@ -1213,6 +1239,7 @@ fn load_texture<'a>(desc: &TextureDesc, texture_arrays: &[&'a [f32]]) -> Result<
 
     let srgb = desc.colorspace.eq_ignore_ascii_case("srgb");
     let pixel_count = (desc.width * desc.height) as usize;
+    let mut channel_flags = None;
 
     let data: Cow<'a, [f32]> = match desc.channels {
         4 if !srgb => {
@@ -1231,16 +1258,22 @@ fn load_texture<'a>(desc: &TextureDesc, texture_arrays: &[&'a [f32]]) -> Result<
             let table = srgb_byte_table();
             let mut out: Vec<f32> = vec![0.0; src.len()];
             const CHUNK: usize = 1 << 16; // 64K floats = 16K pixels per task
-            out.par_chunks_mut(CHUNK)
-                .zip(src.par_chunks(CHUNK))
-                .for_each(|(dst, s)| {
-                    for (d, c) in dst.chunks_exact_mut(4).zip(s.chunks_exact(4)) {
-                        d[0] = srgb_to_linear_cached(c[0], table);
-                        d[1] = srgb_to_linear_cached(c[1], table);
-                        d[2] = srgb_to_linear_cached(c[2], table);
-                        d[3] = c[3];
-                    }
-                });
+            channel_flags = Some(
+                out.par_chunks_mut(CHUNK)
+                    .zip(src.par_chunks(CHUNK))
+                    .map(|(dst, s)| {
+                        let mut flags = 0;
+                        for (d, c) in dst.chunks_exact_mut(4).zip(s.chunks_exact(4)) {
+                            d[0] = srgb_to_linear_cached(c[0], table);
+                            d[1] = srgb_to_linear_cached(c[1], table);
+                            d[2] = srgb_to_linear_cached(c[2], table);
+                            d[3] = c[3];
+                            flags |= texture_pixel_flags(d);
+                        }
+                        flags
+                    })
+                    .reduce(|| 0, |a, b| a | b),
+            );
             Cow::Owned(out)
         }
         3 => {
@@ -1248,12 +1281,16 @@ fn load_texture<'a>(desc: &TextureDesc, texture_arrays: &[&'a [f32]]) -> Result<
             // images from the addon are always 4-channel, so this path is
             // only hit by hand-written test scenes.
             let mut out = Vec::with_capacity(pixel_count * 4);
+            let mut flags = 0;
             for c in src.chunks_exact(3) {
                 let r = if srgb { srgb_to_linear(c[0]) } else { c[0] };
                 let g = if srgb { srgb_to_linear(c[1]) } else { c[1] };
                 let b = if srgb { srgb_to_linear(c[2]) } else { c[2] };
-                out.extend_from_slice(&[r, g, b, 1.0]);
+                let pixel = [r, g, b, 1.0];
+                flags |= texture_pixel_flags(&pixel);
+                out.extend_from_slice(&pixel);
             }
+            channel_flags = Some(flags);
             Cow::Owned(out)
         }
         _ => {
@@ -1266,6 +1303,7 @@ fn load_texture<'a>(desc: &TextureDesc, texture_arrays: &[&'a [f32]]) -> Result<
 
     Ok(LoadedTexture {
         data,
+        channel_flags,
         width: desc.width,
         height: desc.height,
     })
@@ -1396,5 +1434,103 @@ mod texture_color_tests {
         let result = load_texture(&desc, &[&pixels]).unwrap();
         assert!(matches!(result.data, Cow::Borrowed(_)));
         assert_eq!(result.data.as_ptr(), pixels.as_ptr());
+    }
+
+    #[test]
+    fn texture_conversion_classifies_result_bits_across_chunks() {
+        for threads in [1, 4] {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(|| {
+                    for count in [0, 1, 16383, 16384, 16385, 32769] {
+                        for (pixel, expected_flags) in [
+                            ([0.5, 0.5, 0.5, 1.0], 0),
+                            ([0.25, 0.5, 2.0, 1.0], 1),
+                            ([0.5, 0.5, 0.5, 0.75], 2),
+                            ([0.25, 0.5, 2.0, 0.75], 3),
+                            ([-0.0, 0.0, -0.0, 1.0], 1),
+                            // These distinct input bits all round to +0.0.
+                            ([0.0, f32::from_bits(1), f32::from_bits(2), 1.0], 0),
+                            ([f32::from_bits(0x7fc0_0123); 4], 2),
+                            ([f32::NAN, f32::from_bits(0x7fc0_0123), 0.0, -0.0], 3),
+                        ] {
+                            let mut source = vec![0.0, 0.0, 0.0, 1.0].repeat(count);
+                            // Sparse differences in the last chunk must survive
+                            // the reduction, including an incomplete final task.
+                            if count != 0 {
+                                source[4 * (count - 1)..].copy_from_slice(&pixel);
+                            }
+                            let desc = TextureDesc {
+                                width: count as u32,
+                                height: 1,
+                                channels: 4,
+                                colorspace: "srgb".into(),
+                                array_index: 0,
+                            };
+                            let result = load_texture(&desc, &[&source]).unwrap();
+                            assert_eq!(
+                                result.channel_flags(),
+                                Some(if count == 0 { 0 } else { expected_flags })
+                            );
+                            for (src, dst) in
+                                source.chunks_exact(4).zip(result.data().chunks_exact(4))
+                            {
+                                let expected = [
+                                    srgb_to_linear(src[0]),
+                                    srgb_to_linear(src[1]),
+                                    srgb_to_linear(src[2]),
+                                    src[3],
+                                ];
+                                assert_eq!(
+                                    dst.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                                    expected.map(f32::to_bits)
+                                );
+                            }
+                        }
+                    }
+                });
+        }
+    }
+
+    #[test]
+    fn texture_expansion_and_mutation_preserve_classification_validity() {
+        for colorspace in ["linear", "sRGB"] {
+            for pixel in [[0.5, 0.5, 0.5], [-0.0, 0.0, 0.0], [0.25, 0.5, 2.0]] {
+                let desc = TextureDesc {
+                    width: 2,
+                    height: 1,
+                    channels: 3,
+                    colorspace: colorspace.into(),
+                    array_index: 0,
+                };
+                let source = pixel.repeat(2);
+                let mut texture = load_texture(&desc, &[&source]).unwrap();
+                assert_eq!(
+                    texture.channel_flags(),
+                    Some(u32::from(pixel[0].to_bits() != pixel[1].to_bits()))
+                );
+                assert_eq!(texture.data()[3].to_bits(), 1.0f32.to_bits());
+                texture.data_mut()[3] = 0.5;
+                assert_eq!(texture.channel_flags(), None);
+                assert_eq!(texture.data()[3], 0.5);
+            }
+        }
+        let source = [0.25, 0.25, 0.25, 1.0];
+        let desc = TextureDesc {
+            width: 1,
+            height: 1,
+            channels: 4,
+            colorspace: "linear".into(),
+            array_index: 0,
+        };
+        let mut texture = load_texture(&desc, &[&source]).unwrap();
+        assert_eq!(texture.data().as_ptr(), source.as_ptr());
+        assert_eq!(texture.channel_flags(), None);
+        texture.data_mut()[0] = 0.5;
+        assert_ne!(texture.data().as_ptr(), source.as_ptr());
+        assert_eq!(source[0], 0.25);
+        assert_eq!(texture.channel_flags(), None);
     }
 }

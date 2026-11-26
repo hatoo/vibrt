@@ -276,7 +276,7 @@ fn render_with_contexts(
     let mut _tex_buffers: Vec<CudaSlice<f32>> = Vec::new();
     let tex_slots = principled::upload_textures(&scene.textures, &stream, &mut _tex_buffers)?;
     let texture_bytes: usize = _tex_buffers.iter().map(|b| b.len() * 4).sum();
-    let source_bytes: usize = scene.textures.iter().map(|t| t.data.len() * 4).sum();
+    let source_bytes: usize = scene.textures.iter().map(|t| t.data().len() * 4).sum();
     progress.log(&format!(
         "GPU textures: {:.2} MiB (source {:.2} MiB)",
         texture_bytes as f64 / 1_048_576.0,
