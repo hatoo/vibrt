@@ -25,18 +25,8 @@ static __device__ bool shadow_visible(float3 P, float3 dir, float tmax) {
 // crossings); past that we conservatively assume the light is unreachable
 // — pathological scenes only.
 static __device__ __noinline__ float4 emission_alpha(const PathVertex &v, bool include_emission);
-static __device__ __noinline__ float3 shadow_transmittance(float3 P, float3 dir, float tmax,
-                                              VolumeStack stack) {
-  // Fast path: no volumes anywhere. Standard binary visibility — the
-  // any-hit handler already lets transmissive surfaces pass through
-  // (`m->transmission > 0.5f -> optixIgnoreIntersection`), so direct
-  // light reaches the pool floor through clear water without paying
-  // for the iterative loop on every shadow ray.
-  if (params.world_volume == nullptr && stack.depth == 0) {
-    return shadow_visible(P, dir, tmax) ? make_float3(1, 1, 1)
-                                        : make_float3(0, 0, 0);
-  }
-
+static __device__ __noinline__ float3 shadow_volume_transmittance(
+    float3 P, float3 dir, float tmax, VolumeStack stack) {
   float3 tr = make_float3(1, 1, 1);
   float3 cur_origin = P;
   float remaining = tmax;
@@ -144,4 +134,17 @@ static __device__ __noinline__ float3 shadow_transmittance(float3 P, float3 dir,
   }
   // Exceeded the iteration cap — conservatively block.
   return make_float3(0, 0, 0);
+}
+
+static __device__ __forceinline__ float3 shadow_transmittance(
+    float3 P, float3 dir, float tmax, const VolumeStack &stack) {
+  // Keep binary visibility outside the volume walk's call frame. Most shadow
+  // rays need neither its private stack copy nor its boundary-hit storage.
+  // The any-hit handler still applies the same transparent/cutout filtering.
+  if (params.world_volume == nullptr && stack.depth == 0) {
+    return shadow_visible(P, dir, tmax) ? make_float3(1, 1, 1)
+                                      : make_float3(0, 0, 0);
+  }
+  // Copy only for the volume walk, which mutates its own boundary stack.
+  return shadow_volume_transmittance(P, dir, tmax, stack);
 }
