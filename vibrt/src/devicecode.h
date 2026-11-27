@@ -298,24 +298,8 @@ struct MeshLight {
   unsigned int _pad;
 };
 
-struct QueryNode {
-  float lo[3];
-  unsigned int first;
-  float hi[3];
-  unsigned int count;
-};
-struct QueryObject {
-  HitGroupData *geometry;
-  QueryNode *nodes;
-  unsigned int *indices;
-  unsigned int mask;
-  unsigned int _pad;
-};
 struct LaunchParams {
-  QueryNode *query_nodes;
-  unsigned int *query_indices;
-  QueryObject *query_objects;
-  QueryObject *initial_volumes;
+  HitGroupData **initial_volumes;
   unsigned int num_initial_volumes;
   float *aov_data;
   unsigned int num_aovs;

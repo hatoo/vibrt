@@ -255,10 +255,6 @@ impl ShaderRequirements {
             has_extended_phases: extended_phases,
         })
     }
-
-    pub fn scene_queries(self) -> bool {
-        self.shader_ops & (7u64 << 41) != 0 || self.closure_types & (1 << 7) != 0
-    }
 }
 
 #[cfg(test)]
@@ -289,13 +285,13 @@ mod tests {
     }
 
     #[test]
-    fn principled_subsurface_enables_queries_without_a_standalone_closure() {
+    fn principled_subsurface_enables_closure_without_a_standalone_node() {
         let material: PrincipledMaterial = serde_json::from_value(json!({
             "base_color":[0.2,0.4,0.7],"sss_weight":1,"sss_method":2
         }))
         .unwrap();
         let requirements = ShaderRequirements::new(&[material], 0, None).unwrap();
-        assert!(requirements.scene_queries());
+        assert_ne!(requirements.closure_types & (1 << 7), 0);
         assert_eq!(requirements.shader_output_count, 64);
     }
 

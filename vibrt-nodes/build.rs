@@ -279,13 +279,6 @@ fn main() {
             }
         }
     }
-    source.push_str("\nstruct Intersection { float t, u, v; };\n");
-    for signature in [
-        "ccl_device_inline bool cone_sphere_intersect(",
-        "ccl_device bool linear_curve_intersect(",
-    ] {
-        function(&mut source, "kernel/geom/curve_intersect.h", signature);
-    }
     source.push_str("\n#undef __HAIR__\n#undef SHADER_CLOSURE_BASE\n} // namespace vibrt_cycles\n");
     let bssrdf = cycles("kernel/closure/bssrdf.h");
     let start = bssrdf.find("ccl_device float bssrdf_burley_eval").unwrap();

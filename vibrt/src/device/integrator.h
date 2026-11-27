@@ -145,7 +145,7 @@ static __device__ __noinline__ float3 trace_path(float3 origin, float3 dir,
     optixTrace(params.traversable, origin, dir, ray_tmin, 1e20f, 0.0f,
                OptixVisibilityMask(rad_mask), OPTIX_RAY_FLAG_NONE,
                0, // SBT offset (radiance ray type)
-               2, // SBT stride (radiance and shadow)
+               3, // SBT stride (radiance, shadow and query)
                0, // miss index (radiance miss)
                hi, lo);
     if (bounce == 0 && transparent_bounces == 0 && volume_boundaries == 0 &&
@@ -775,7 +775,7 @@ extern "C" __global__ void __raygen__rg() {
       unsigned int hi, lo;
       pack_ptr(&v, hi, lo);
       optixTrace(params.traversable, origin, dir0, ray_tmin, 1e20f, 0.0f,
-                 OptixVisibilityMask(0x01), OPTIX_RAY_FLAG_NONE, 0, 2, 0, hi, lo);
+                 OptixVisibilityMask(0x01), OPTIX_RAY_FLAG_NONE, 0, 3, 0, hi, lo);
       if (v.hit == 0)
         break;
       if (v.mat == nullptr || v.mat->volume == nullptr ||

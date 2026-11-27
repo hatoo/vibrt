@@ -12,6 +12,12 @@ pub struct CompiledShaders {
     pub raygen: ProgramGroup,
     pub miss_radiance: ProgramGroup,
     pub miss_shadow: ProgramGroup,
+    pub miss_query: ProgramGroup,
+    pub hit_query: ProgramGroup,
+    pub curve_query: ProgramGroup,
+    pub shader_callable: Option<ProgramGroup>,
+    pub query_callable: ProgramGroup,
+    pub material_callables: Vec<ProgramGroup>,
     pub hit_radiance: ProgramGroup,
     pub hit_shadow: ProgramGroup,
     pub curve_radiance: ProgramGroup,
@@ -86,7 +92,51 @@ pub fn compile(
         .intersection(&curve_module, "")
         .build()?
         .value;
-    let all_pgs: Vec<&ProgramGroup> = vec![
+    let miss_query = ProgramGroup::miss(ctx, &module, "__miss__query")?.value;
+    let hit_query = ProgramGroup::hitgroup(ctx)
+        .closest_hit(&module, "__closesthit__query")
+        .any_hit(&module, "__anyhit__query")
+        .build()?
+        .value;
+    let curve_query = ProgramGroup::hitgroup(ctx)
+        .closest_hit(&module, "__closesthit__query")
+        .any_hit(&module, "__anyhit__query")
+        .intersection(&curve_module, "")
+        .build()?
+        .value;
+    let query_callable = ProgramGroup::callables(ctx)
+        .continuation_callable(&module, "__continuation_callable__query")
+        .build()
+        .context("query callable")?
+        .value;
+    let shader_callable = if requirements.shader_ops & (7u64 << 41) != 0 {
+        Some(
+            ProgramGroup::callables(ctx)
+                .continuation_callable(&module, "__continuation_callable__shader")
+                .build()
+                .context("shader callable")?
+                .value,
+        )
+    } else {
+        None
+    };
+    let mut material_callables = Vec::new();
+    if shader_callable.is_some() {
+        for name in [
+            "__continuation_callable__material",
+            "__continuation_callable__emission",
+            "__continuation_callable__shadow",
+        ] {
+            material_callables.push(
+                ProgramGroup::callables(ctx)
+                    .continuation_callable(&module, name)
+                    .build()
+                    .with_context(|| name)?
+                    .value,
+            );
+        }
+    }
+    let mut all_pgs: Vec<&ProgramGroup> = vec![
         &raygen_pg,
         &miss_rg_pg,
         &miss_shadow_pg,
@@ -94,7 +144,13 @@ pub fn compile(
         &hit_shadow_pg,
         &curve_radiance,
         &curve_shadow,
+        &miss_query,
+        &hit_query,
+        &curve_query,
+        &query_callable,
     ];
+    all_pgs.extend(shader_callable.iter());
+    all_pgs.extend(material_callables.iter());
     let pipeline = Pipeline::new(
         ctx,
         &pipeline_options,
@@ -104,7 +160,9 @@ pub fn compile(
     .context("pipeline")?
     .value;
     // Node graphs and closure trees change stack use; query the compiled programs.
-    pipeline.set_stack_size_for_programs(&all_pgs, 2, 2)?;
+    pipeline
+        .set_stack_size_for_programs(&all_pgs, 2, 1 + 2 * u32::from(shader_callable.is_some()), 2)
+        .context("pipeline stack")?;
 
     anyhow::ensure!(!progress.cancelled(), "shader compilation cancelled");
     Ok(CompiledShaders {
@@ -116,6 +174,12 @@ pub fn compile(
         hit_shadow: hit_shadow_pg,
         curve_radiance,
         curve_shadow,
+        miss_query,
+        hit_query,
+        curve_query,
+        shader_callable,
+        query_callable,
+        material_callables,
         _module: module,
         _curve_module: curve_module,
         ptx_time,

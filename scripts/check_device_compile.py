@@ -58,7 +58,7 @@ def main():
     program = ct.c_void_p()
     assert nvrtc.nvrtcCreateProgram(ct.byref(program), source.encode(), b"vibrt.cu", 0, None, None) == 0
     optix = Path(os.environ.get("OPTIX_ROOT", "C:/ProgramData/NVIDIA Corporation/OptiX SDK 9.0.0"))
-    flags = [b"--std=c++17", b"--use_fast_math", f"--include-path={optix / 'include'}".encode()]
+    flags = [b"--relocatable-device-code=true", b"--std=c++17", b"--use_fast_math", f"--include-path={optix / 'include'}".encode()]
     options = (ct.c_char_p * len(flags))(*flags)
     result = nvrtc.nvrtcCompileProgram(program, len(flags), options)
     size = ct.c_size_t()
@@ -73,6 +73,11 @@ def main():
         ptx = ct.create_string_buffer(size.value)
         nvrtc.nvrtcGetPTX(program, ptx)
         (directory / "kernel.ptx").write_bytes(ptx.value)
+        # OptiX looks up these unreferenced device functions by name at runtime.
+        for entry in (b"__continuation_callable__query", b"__continuation_callable__shader",
+                      b"__continuation_callable__material", b"__continuation_callable__emission",
+                      b"__continuation_callable__shadow"):
+            assert entry in ptx.value, f"NVRTC removed {entry.decode()}"
         variant = "minimal closures" if args.minimal else "all closure/node branches"
         print(f"NVRTC compiled {variant} ({size.value} PTX bytes); no GPU context created.")
     nvrtc.nvrtcDestroyProgram(ct.byref(program))

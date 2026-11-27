@@ -227,24 +227,6 @@ pub struct ShaderAttribute {
 }
 
 #[repr(C)]
-#[derive(Copy, Clone, Default)]
-pub struct QueryNode {
-    pub lo: [f32; 3],
-    pub first: u32,
-    pub hi: [f32; 3],
-    pub count: u32,
-}
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct QueryObject {
-    pub geometry: optix_sys::CUdeviceptr,
-    pub nodes: optix_sys::CUdeviceptr,
-    pub indices: optix_sys::CUdeviceptr,
-    pub mask: u32,
-    pub _pad: u32,
-}
-
-#[repr(C)]
 #[derive(Copy, Clone)]
 pub struct AovShader {
     pub material: optix_sys::CUdeviceptr,
@@ -396,9 +378,6 @@ pub struct MeshLight {
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct LaunchParams {
-    pub query_nodes: optix_sys::CUdeviceptr,
-    pub query_indices: optix_sys::CUdeviceptr,
-    pub query_objects: optix_sys::CUdeviceptr,
     pub initial_volumes: optix_sys::CUdeviceptr,
     pub num_initial_volumes: u32,
     pub aov_data: optix_sys::CUdeviceptr,

@@ -56,7 +56,7 @@ impl MeshUploads {
         if size == 0 {
             return Ok(0);
         }
-        // Callers supply primitive arrays or padding-free repr(C) QueryNodes,
+        // Callers supply primitive arrays or padding-free repr(C) structs,
         // matching the renderer's raw ABI uploads.
         let bytes = unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), size) };
         let mut buffer = unsafe { self.stream.alloc::<u8>(size) }.cuda()?;

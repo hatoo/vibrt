@@ -96,9 +96,14 @@ light hits remain unsupported.
 
 ## Scene-dependent additions
 
-AO, Bevel, Raycast, SSS and initial volume containment use compact software BVHs;
-ordinary path tracing continues to use OptiX. These extra BVHs are allocated only
-when needed. AOV and extended volume-phase kernels are also compiled only for
+AO, Bevel, Raycast, SSS and initial volume containment share the OptiX acceleration
+structures used by ordinary path tracing. A dedicated geometry-query ray type
+preserves local-instance and self-hit filtering without applying material alpha.
+No separate software BVH is built, uploaded or cached. The material evaluators, interpreter and
+query service use OptiX continuation callables to bound code expansion when
+shaders trace rays. NVRTC retains their entry points with relocatable device code.
+OptiX uses the default optimization level.
+AOV and extended volume-phase kernels are compiled only for
 scenes using them. Device uploads are owned by each render and released on
 success, cancellation or errors.
 

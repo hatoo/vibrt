@@ -183,6 +183,3 @@ static __device__ void fill_path_vertex(PathVertex *v) {
   fill_surface_vertex(v, hg, optixGetPrimitiveIndex(), bary, -optixGetWorldRayDirection(),
                       optixGetRayTmax(), (optixGetRayFlags()&OPTIX_RAY_FLAG_TERMINATE_ON_FIRST_HIT)?2u:1u, &hit_point);
 }
-
-// Geometry-only node queries use compact software BVHs. No OptiX trace or
-// continuation is entered from the interpreter (including shadow any-hit).

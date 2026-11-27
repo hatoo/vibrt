@@ -1,5 +1,5 @@
 //! GPU scene ownership. Uploads never borrow Blender or Python buffers.
-use super::{mesh_uploads, query_cache, session::RenderSession, upload::*};
+use super::{mesh_uploads, session::RenderSession, upload::*};
 use crate::{
     camera,
     gpu_types::*,
@@ -55,8 +55,6 @@ impl GpuScene<'_> {
             scene.file.aov_names.len(),
             scene.file.world_volume.as_ref(),
         )?;
-        let scene_queries =
-            requirements.scene_queries() || scene.file.materials.iter().any(|m| m.volume.is_some());
         let (shaders, ptx_time, pipeline_time) = session.shaders(requirements, progress)?;
         let raygen_pg = &shaders.raygen;
         let miss_rg_pg = &shaders.miss_radiance;
@@ -222,8 +220,6 @@ impl GpuScene<'_> {
         };
 
         struct MeshGpu {
-            query_nodes: u64,
-            query_indices: u64,
             attributes: Vec<crate::gpu_types::ShaderAttribute>,
             handle: optix_sys::OptixTraversableHandle,
             d_verts: optix_sys::CUdeviceptr,
@@ -242,24 +238,7 @@ impl GpuScene<'_> {
         let mut mesh_uploads = mesh_uploads::MeshUploads::new(stream.clone())?;
         let mut meshes_gpu: Vec<MeshGpu> = Vec::new();
 
-        // Compare complete geometry against owned query data from the last render.
-        // Cache misses still build in parallel batches of at most 32 meshes.
-        session.begin_queries(if scene_queries { &scene.meshes } else { &[] });
-        let meshes_with_queries =
-            scene
-                .meshes
-                .chunks(32)
-                .enumerate()
-                .flat_map(|(batch, meshes)| {
-                    let queries = if scene_queries {
-                        session.query_batch(batch * 32, meshes)
-                    } else {
-                        let empty = Arc::new(query_cache::QueryTree::default());
-                        vec![empty; meshes.len()]
-                    };
-                    meshes.iter().zip(queries)
-                });
-        for (m, query) in meshes_with_queries {
+        for m in &scene.meshes {
             let verts_ptr = mesh_uploads.copy_slice(&m.vertices[..])?;
             let idx_ptr = mesh_uploads.copy_slice(&m.indices[..])?;
 
@@ -320,11 +299,7 @@ impl GpuScene<'_> {
                     _pad: 0,
                 });
             }
-            let query_nodes = mesh_uploads.copy_slice(&query.nodes)?;
-            let query_indices = mesh_uploads.copy_slice(&query.indices)?;
             meshes_gpu.push(MeshGpu {
-                query_nodes,
-                query_indices,
                 attributes,
                 handle,
                 d_verts: verts_ptr,
@@ -360,10 +335,8 @@ impl GpuScene<'_> {
             m
         };
 
-        // --- Per-object SBT records: radiance and shadow ---
+        // --- Per-object SBT records: radiance, shadow and geometry query ---
         let mut tri_hg_records: Vec<SbtRecord<HitGroupData>> = Vec::new();
-        let mut query_objects = Vec::new();
-        let mut query_bounds = Vec::new();
         let mut gas_entries: Vec<GasEntry> = Vec::new();
         let mut _mat_table_bufs: Vec<CudaSlice<u64>> = Vec::new();
         let mesh_bounds: Vec<_> = scene
@@ -479,38 +452,6 @@ impl GpuScene<'_> {
                     }
                 },
             };
-            if scene_queries {
-                // Local GPU queries index this table by HitGroupData::instance_id.
-                // Only query_indices may be reordered by the top-level BVH build.
-                debug_assert_eq!(query_objects.len(), obj_idx);
-                let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
-                for corner in 0..8 {
-                    let p = std::array::from_fn(|a| {
-                        if corner & (1 << a) == 0 {
-                            hg.bounds_min[a]
-                        } else {
-                            hg.bounds_max[a]
-                        }
-                    });
-                    let p = crate::transform::transform_point(&obj.transform, p);
-                    for a in 0..3 {
-                        lo[a] = lo[a].min(p[a]);
-                        hi[a] = hi[a].max(p[a]);
-                    }
-                }
-                query_bounds.push((lo, hi));
-                query_objects.push(QueryObject {
-                    geometry: 0,
-                    nodes: m.query_nodes,
-                    indices: m.query_indices,
-                    mask: if scene.file.objects[obj_idx].cast_shadow {
-                        7
-                    } else {
-                        5
-                    },
-                    _pad: 0,
-                });
-            }
             let (hit_rg_pg, hit_shadow_pg) = if m.d_curve_radii == 0 {
                 (hit_rg_pg, hit_shadow_pg)
             } else {
@@ -518,9 +459,15 @@ impl GpuScene<'_> {
             };
             tri_hg_records.push(SbtRecord::new(hit_rg_pg, hg)?);
             tri_hg_records.push(SbtRecord::new(hit_shadow_pg, hg)?);
+            let query_pg = if m.d_curve_radii == 0 {
+                &shaders.hit_query
+            } else {
+                &shaders.curve_query
+            };
+            tri_hg_records.push(SbtRecord::new(query_pg, hg)?);
             gas_entries.push(GasEntry {
                 handle: m.handle,
-                sbt_offset: (obj_idx as u32) * 2,
+                sbt_offset: (obj_idx as u32) * 3,
                 transform: obj.transform,
                 cast_shadow: scene.file.objects[obj_idx].cast_shadow,
                 camera_visible: scene.file.objects[obj_idx].camera_visible,
@@ -604,6 +551,10 @@ impl GpuScene<'_> {
         miss_bytes.extend_from_slice(unsafe {
             std::slice::from_raw_parts(&miss_shadow_record as *const _ as *const u8, miss_stride)
         });
+        let miss_query_record = SbtRecord::new(&shaders.miss_query, MissData { _unused: 0 })?;
+        miss_bytes.extend_from_slice(unsafe {
+            std::slice::from_raw_parts(&miss_query_record as *const _ as *const u8, miss_stride)
+        });
         let d_miss = uploads.copy_slice(&miss_bytes)?;
 
         let hg_stride = mem::size_of::<SbtRecord<HitGroupData>>();
@@ -614,30 +565,13 @@ impl GpuScene<'_> {
             });
         }
         let d_hg = uploads.copy_slice(&hg_bytes)?;
-        let (query_nodes, query_indices, query_objects_ptr) =
-            if scene_queries && !query_objects.is_empty() {
-                for (i, obj) in query_objects.iter_mut().enumerate() {
-                    obj.geometry = d_hg
-                        + (i * 2 * hg_stride + std::mem::offset_of!(SbtRecord<HitGroupData>, data))
-                            as u64;
-                }
-                let (nodes, indices) = crate::query_bvh::build(&query_bounds);
-                (
-                    uploads.copy_slice(&nodes)?,
-                    uploads.copy_slice(&indices)?,
-                    uploads.copy_slice(&query_objects)?,
-                )
-            } else {
-                (0, 0, 0)
-            };
-
-        // Only bounded media need per-camera containment queries. Reuse their
-        // geometry BVHs; do not trace every object for every camera sample.
-        let initial_volumes: Vec<_> = query_objects
+        // Retain only SBT geometry pointers for camera containment in bounded media.
+        let initial_volumes: Vec<u64> = scene
+            .file
+            .objects
             .iter()
             .enumerate()
-            .filter_map(|(i, q)| {
-                let object = &scene.file.objects[i];
+            .filter_map(|(i, object)| {
                 std::iter::once(&object.material)
                     .chain(object.materials.iter())
                     .any(|m| {
@@ -647,14 +581,33 @@ impl GpuScene<'_> {
                             .get(*m as usize)
                             .is_some_and(|m| m.volume.is_some())
                     })
-                    .then_some(*q)
+                    .then_some(
+                        d_hg + (i * 3 * hg_stride
+                            + std::mem::offset_of!(SbtRecord<HitGroupData>, data))
+                            as u64,
+                    )
             })
             .collect();
         let initial_volumes_ptr = uploads.copy_slice(&initial_volumes)?;
 
-        let sbt_builder = ShaderBindingTableBuilder::new(d_rg)
-            .miss_records(d_miss, miss_stride as u32, 2)
+        let mut sbt_builder = ShaderBindingTableBuilder::new(d_rg)
+            .miss_records(d_miss, miss_stride as u32, 3)
             .hitgroup_records(d_hg, hg_stride as u32, tri_hg_records.len() as u32);
+        let mut callable_records = vec![SbtRecord::new(
+            &shaders.query_callable,
+            MissData { _unused: 0 },
+        )?];
+        if let Some(callable) = &shaders.shader_callable {
+            callable_records.push(SbtRecord::new(callable, MissData { _unused: 0 })?);
+        }
+        for callable in &shaders.material_callables {
+            callable_records.push(SbtRecord::new(callable, MissData { _unused: 0 })?);
+        }
+        sbt_builder = sbt_builder.callables_records(
+            uploads.copy_slice(&callable_records)?,
+            mem::size_of::<SbtRecord<MissData>>() as u32,
+            callable_records.len() as u32,
+        );
         let sbt = sbt_builder.build()?;
 
         // --- Lights ---
@@ -765,7 +718,7 @@ impl GpuScene<'_> {
                     };
                     MeshLightTri {
                         geometry: d_hg
-                            + (ml.object_idx as usize * 2 * hg_stride
+                            + (ml.object_idx as usize * 3 * hg_stride
                                 + mem::offset_of!(SbtRecord<HitGroupData>, data))
                                 as u64,
                         primitive: t.primitive,
@@ -870,9 +823,6 @@ impl GpuScene<'_> {
             };
 
         let params = LaunchParams {
-            query_nodes,
-            query_indices,
-            query_objects: query_objects_ptr,
             initial_volumes: initial_volumes_ptr,
             num_initial_volumes: initial_volumes.len() as u32,
             aov_data: 0,

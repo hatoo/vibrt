@@ -1,5 +1,5 @@
 // ---------- Visibility (shadow rays) ----------
-// Ray types: 0 = radiance, 1 = shadow. SBT stride = 2.
+// Ray types: 0 = radiance, 1 = shadow, 2 = query. SBT stride = 3.
 // Shadow hit group
 // is a dummy (CH disabled, no AH) so only the miss program runs, which sets
 // payload[0]=1 meaning "reached infinity = light visible".
@@ -8,7 +8,7 @@ static __device__ bool shadow_visible(float3 P, float3 dir, float tmax) {
   // Mask bit 1 = "blocks shadow rays"; instances with cast_shadow=false clear
   // it (e.g. classroom's paper-lantern drum) so NEE sees through them.
   optixTrace(params.traversable, P, dir, 0.0f, tmax, 0.0f, OptixVisibilityMask(0x02),
-             OPTIX_RAY_FLAG_TERMINATE_ON_FIRST_HIT | OPTIX_RAY_FLAG_DISABLE_CLOSESTHIT, 1, 2, 1,
+             OPTIX_RAY_FLAG_TERMINATE_ON_FIRST_HIT | OPTIX_RAY_FLAG_DISABLE_CLOSESTHIT, 1, 3, 1,
              miss_flag);
   return miss_flag != 0;
 }
@@ -42,7 +42,7 @@ static __device__ __noinline__ float3 shadow_volume_transmittance(
     unsigned int hi, lo;
     pack_ptr(&v, hi, lo);
     optixTrace(params.traversable, cur_origin, dir, 0.0f, remaining, 0.0f,
-               OptixVisibilityMask(0x02), OPTIX_RAY_FLAG_NONE, 0, 2, 0, hi, lo);
+               OptixVisibilityMask(0x02), OPTIX_RAY_FLAG_NONE, 0, 3, 0, hi, lo);
 
     const Volume *cur_vol = volume_stack_top(stack);
     float t_seg;
