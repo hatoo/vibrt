@@ -21,6 +21,80 @@ extern "C" float vibrt_tree_pdf(const vibrt_light_tree::KernelLightTreeNode *nod
   return __LINE__
 extern "C" int vibrt_reuse_checks() {
   using namespace vibrt_cycles;
+  // Continuous environment samples must reconstruct their density away from
+  // CDF discontinuities, including distributions with empty rows/columns.
+  const float marginal[] = {0, 0, 0.4f, 1};
+  const float conditional[] = {0, 0.5f, 1, 0, 0, 1, 0, 0.2f, 1};
+  vibrt_background::Distribution env{{2, 3}, marginal, conditional};
+  double inverse_pdf = 0;
+  for (int i = 0; i < 16384; ++i) {
+    auto u = sobol_burley_sample_2D(i, 0, 27, 0xffffffffu);
+    u.x = fmaxf(u.x, 1e-7f);
+    u.y = fmaxf(u.y, 1e-7f);
+    float pdf;
+    auto d = vibrt_background::background_map_sample(&env, u, &pdf);
+    auto evaluated = vibrt_background::background_map_pdf(&env, d);
+    CHECK(pdf > 0 && fabsf(pdf - evaluated) < 2e-3f * pdf);
+    inverse_pdf += 1 / pdf;
+  }
+  // Support: half of the middle latitude band plus all of the bottom band.
+  CHECK(fabs(inverse_pdf / 16384 - 2 * M_PI_F) < 0.01);
+  const float pixels[] = {1, 1, 1, 0, 0, 0};
+  vibrt_image::ImageView image{pixels, 3, false, true};
+  vibrt_image::KernelImageInfo info{1, 2, vibrt_image::EXTENSION_CLIP, 0, &image};
+  CHECK(vibrt_image::Interpolator::interp(info, 0, 0).x == 1);
+  CHECK(vibrt_image::Interpolator::interp(info, 1, 1).x == 0);
+  for (int blades : {0, 3, 6}) {
+    KernelCamera camera{(float)blades, 0.4f, 0.5f};
+    double x2 = 0, y2 = 0;
+    for (int i = 0; i < 4096; ++i) {
+      auto p = camera_sample_aperture(&camera, sobol_burley_sample_2D(i, 0, 8, 0xffffffffu));
+      CHECK(4 * p.x * p.x + p.y * p.y <= 1.00001f);
+      x2 += p.x * p.x; y2 += p.y * p.y;
+    }
+    CHECK(fabs(4 * x2 / y2 - 1) < 0.01);
+  }
+  vibrt_scene_nodes::ShaderData sd{};
+  sd.N = sd.Ng = sd.normal = make_float3(0, 0, 1);
+  sd.tangent = make_float3(1, 0, 0);
+  sd.sign = 1;
+  auto mapped = vibrt_scene_nodes::normal_map(sd, make_float3(0.8f, 0.5f, 0.9f), 1, 0, false, false);
+  CHECK(len(mapped - normalize(make_float3(0.6f, 0, 0.8f))) < 1e-6f);
+  vibrt_differential::differential3 derivative{make_float3(0.02f, 0, 0), make_float3(0, 0.03f, 0)};
+  auto bumped = vibrt_scene_nodes::bump(sd, derivative, 0, 0.00002f, 0, 1, 0.2f, 0.001f, false, false);
+  CHECK(len(bumped - normalize(make_float3(-0.2f, 0, 1))) < 1e-6f);
+  float film[9 * 9] = {};
+  for (int p = 0; p < 9; ++p) {
+    film[p * 9] = film[p * 9 + 4] = 16;
+    film[p * 9 + 8] = __uint_as_float(16);
+    CHECK(vibrt_adaptive::film_adaptive_sampling_convergence_check(0, film, p % 3, p / 3, 0.05f, 0, 0, 3));
+  }
+  film[4 * 9 + 4] = 0;
+  CHECK(!vibrt_adaptive::film_adaptive_sampling_convergence_check(0, film, 1, 1, 0.05f, 1, 0, 3));
+  for (int y = 0; y < 3; ++y) vibrt_adaptive::film_adaptive_sampling_filter_x(0, film, y, 0, 3, 0, 3);
+  for (int x = 0; x < 3; ++x) vibrt_adaptive::film_adaptive_sampling_filter_y(0, film, x, 0, 3, 0, 3);
+  for (int p = 0; p < 9; ++p) CHECK(film[p * 9 + 7] == 0);
+  vibrt_shadow::ShaderData shadow{0, make_float3(0.2f, 0.5f, 0.9f)};
+  CHECK(is_zero(vibrt_shadow::surface_shader_transparency(&shadow)));
+  shadow.flag = vibrt_shadow::SD_TRANSPARENT;
+  CHECK(len(vibrt_shadow::surface_shader_transparency(&shadow) - shadow.closure_transparent_extinction) == 0);
+  // The mixture includes the exponential survival mass at the endpoint.
+  // Integrating constant incoming radiance yields 1 - exp(-sigma * length).
+  vibrt_volume::Ray ray{make_float3(0), make_float3(0, 0, 1)};
+  vibrt_volume::EquiangularCoefficients coeffs{make_float3(1, 0, 2), {0, 5}};
+  double estimate = 0;
+  for (int i = 0; i < 32768; ++i) {
+    float u = (i + 0.5f) / 32768, pdf, t;
+    if (u < 0.5f) {
+      t = vibrt_volume::volume_equiangular_sample(&ray, coeffs, 2 * u, &pdf);
+      CHECK(fabsf(pdf - vibrt_volume::volume_equiangular_pdf(&ray, coeffs, t)) < 1e-5f);
+    }
+    else t = -logf(2 - 2 * u) / 0.2f;
+    if (t >= 5) continue;
+    pdf = 0.5f * (0.2f * expf(-0.2f * t) + vibrt_volume::volume_equiangular_pdf(&ray, coeffs, t));
+    estimate += 0.2f * expf(-0.2f * t) / pdf;
+  }
+  CHECK(fabs(estimate / 32768 - (1 - exp(-1.0))) < 0.0001);
   const float3 normal = make_float3(0, 0, 1), incoming = normalize(make_float3(0.2f, 0.3f, 1));
   // Sobol: deterministic, bounded, and exactly stratified in each dimension.
   int bins[4][32] = {};

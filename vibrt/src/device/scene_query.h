@@ -63,6 +63,20 @@ static __device__ __noinline__ void query_mesh(const QueryObject &obj,
           prim == v.primitive)
         continue;
       const int *ids = hg->indices + prim * 3;
+      if (hg->curve_radii) {
+        vibrt_cycles::float4 keys[4];
+        for (int j = 0; j < 2; ++j) {
+          int key = ids[j];
+          keys[j + 1] = vibrt_cycles::make_float4(cycles_vector(make_f3(hg->vertices + 3 * key)), hg->curve_radii[key]);
+        }
+        keys[0] = keys[1]; keys[3] = keys[2];
+        vibrt_cycles::Intersection isect;
+        if (vibrt_cycles::linear_curve_intersect(cycles_vector(P), cycles_vector(D), tmin, q.distance, keys, &isect)) {
+          q.hit = true; q.distance = isect.t; q.geometry = hg;
+          q.hit_primitive = prim; q.bary = make_float2(isect.u, 0);
+        }
+        continue;
+      }
       float3 A = make_f3(hg->vertices + 3 * ids[0]);
       float3 E1 = make_f3(hg->vertices + 3 * ids[1]) - A,
              E2 = make_f3(hg->vertices + 3 * ids[2]) - A;
@@ -138,8 +152,10 @@ query_scene(const PathVertex &v, float3 origin, float3 direction,
            B = make_f3(hg->vertices + 3 * ids[1]),
            C = make_f3(hg->vertices + 3 * ids[2]);
     float3 N = cross3(B - A, C - A);
+    if (hg->curve_radii)
+      N = transform_point(hg->world_to_object, origin + direction * q.distance) - (A * (1 - q.bary.x) + B * q.bary.x);
     q.Ng = normalize3(transform_normal(hg->world_to_object, N));
-    if (hg->normals)
+    if (hg->normals && !hg->curve_radii)
       N = make_f3(hg->normals + 3 * ids[0]) * (1 - q.bary.x - q.bary.y) +
           make_f3(hg->normals + 3 * ids[1]) * q.bary.x +
           make_f3(hg->normals + 3 * ids[2]) * q.bary.y;
@@ -432,6 +448,37 @@ static __device__ __noinline__ bool scatter_subsurface(PathVertex &v,
 
 #if (VIBRT_SHADER_OPS & ((255ull << 40) | (1ull << 51)))
 namespace vibrt_shader {
+VN_INLINE vibrt_scene_nodes::ShaderData normal_map_data(const float4 *ctx, float4 tangent,
+                                                        bool named, const SceneServices &services) {
+  const PathVertex &v = *(const PathVertex *)services.vertex;
+  vibrt_scene_nodes::ShaderData sd{};
+  bool back = ctx[16].x != 0;
+  sd.N = ::cycles_vector(back ? -v.Ns : v.Ns);
+  sd.Ng = ::cycles_vector(back ? -v.Ng : v.Ng);
+  sd.flag = back ? vibrt_scene_nodes::SD_BACKFACING : 0;
+  sd.normal = ::cycles_vector(v.Ns);
+  sd.tangent = xyz(tangent);
+  sd.sign = tangent.w;
+  sd.object_to_world = ctx + 22;
+  sd.world_to_object = ctx + 25;
+  if (v.geometry) {
+    if (v.geometry->curve_radii) sd.type = vibrt_scene_nodes::PRIMITIVE_CURVE;
+    sd.world_basis = false;
+    sd.tangent = vibrt_scene_nodes::matrix_direction(sd.world_to_object, sd.tangent);
+    if (!named)
+      sd.tangent = safe_normalize(sd.tangent);
+    if (v.geometry->normals) {
+      sd.normal = make_float3(0);
+      const int *indices = v.geometry->indices + 3 * v.primitive;
+      float weights[3] = {1 - v.barycentric.x - v.barycentric.y, v.barycentric.x, v.barycentric.y};
+      for (int i = 0; i < 3; ++i)
+        sd.normal += ::cycles_vector(::make_f3(v.geometry->normals + 3 * indices[i])) * weights[i];
+    }
+    else
+      sd.shader = 0;
+  }
+  return sd;
+}
 #if (VIBRT_SHADER_OPS & (7ull << 41))
 VN_INLINE float4 tracing_node(const ShaderInstruction &, const float4 *,
                               const float4 *, const SceneServices &);
@@ -444,10 +491,13 @@ VN_INLINE float4 scene_node(const ShaderInstruction &n, const float4 *slots,
   auto result = [](::float3 a) { return make_float4(a.x, a.y, a.z, 1); };
 #if (VIBRT_SHADER_OPS & (1ull << 51))
   if ((n.op & 255) == 51) {
-    ::float3 base = ::cross3(v.dPdu, v.dPdv);
+    auto dP = vibrt_differential::differential_from_compact(::cycles_vector(v.Ng), v.dP);
+    ::float3 dx = ::make_float3(dP.dx.x, dP.dx.y, dP.dx.z);
+    ::float3 dy = ::make_float3(dP.dy.x, dP.dy.y, dP.dy.z);
+    ::float3 base = ::cross3(dx, dy);
     float sign = ::dot3(base, v.Ns) < 0 ? -1 : 1;
-    ::float3 dpdu = v.dPdu + (cuda_vec(input(1)) - cuda_vec(input(0))) * 1000;
-    ::float3 dpdv = v.dPdv + (cuda_vec(input(2)) - cuda_vec(input(0))) * 1000;
+    ::float3 dpdu = dx + (cuda_vec(input(1)) - cuda_vec(input(0))) * 1000;
+    ::float3 dpdv = dy + (cuda_vec(input(2)) - cuda_vec(input(0))) * 1000;
     ::float3 changed = ::normalize3(::cross3(dpdu, dpdv)) * sign;
     if (::dot3(changed, changed) < 1e-12f)
       return input(3);
@@ -461,17 +511,19 @@ VN_INLINE float4 scene_node(const ShaderInstruction &n, const float4 *slots,
     float4 value = ctx[index];
     float du = n.params[0], dv = n.params[1];
     if (index == 0) {
-      value.x += du;
-      value.y += dv;
+      value.x += v.du.dx * du + v.du.dy * dv;
+      value.y += v.dv.dx * du + v.dv.dy * dv;
       return value;
     }
+    auto dP = vibrt_differential::differential_from_compact(::cycles_vector(v.Ng), v.dP);
     ::float3 delta = ::make_float3(0, 0, 0);
+    float su = v.du.dx * du + v.du.dy * dv, sv = v.dv.dx * du + v.dv.dy * dv;
     if (index == 1)
-      delta = v.dGdu * du + v.dGdv * dv;
+      delta = v.dGdu * su + v.dGdv * sv;
     if (index == 2)
-      delta = v.dOdu * du + v.dOdv * dv;
+      delta = v.dOdu * su + v.dOdv * sv;
     if (index == 3)
-      delta = v.dPdu * du + v.dPdv * dv;
+      delta = ::make_float3(dP.dx.x, dP.dx.y, dP.dx.z) * du + ::make_float3(dP.dy.x, dP.dy.y, dP.dy.z) * dv;
     value.x += delta.x;
     value.y += delta.y;
     value.z += delta.z;
@@ -480,18 +532,25 @@ VN_INLINE float4 scene_node(const ShaderInstruction &n, const float4 *slots,
 #endif
 #if (VIBRT_SHADER_OPS & (1ull << 47))
   if ((n.op & 255) == 47) {
-    ::float3 normal = ::normalize3(cuda_vec(input(5)));
-    ::float3 r1 = ::cross3(v.dPdv, normal), r2 = ::cross3(normal, v.dPdu);
-    float det = ::dot3(v.dPdu, r1);
-    if (fabsf(det) < 1e-12f)
-      return result(normal);
-    float du = (input(1).x - input(0).x) * 1000,
-          dv = (input(2).x - input(0).x) * 1000;
-    float distance = input(4).x * (n.modes[0] ? -1 : 1),
-          strength = __saturatef(input(3).x);
-    ::float3 bumped =
-        ::normalize3(normal - (r1 * du + r2 * dv) * (distance / det));
-    return result(::normalize3(normal * (1 - strength) + bumped * strength));
+    vibrt_scene_nodes::ShaderData sd{};
+    sd.N = ::cycles_vector(::normalize3(cuda_vec(input(5))));
+    sd.Ng = ::cycles_vector(v.Ng);
+    sd.world_basis = !n.modes[1];
+    float4 object_to_world[3], world_to_object[3];
+    if (v.geometry) {
+      for (int i = 0; i < 3; ++i) {
+        const float *a = v.geometry->object_to_world + 4 * i;
+        const float *b = v.geometry->world_to_object + 4 * i;
+        object_to_world[i] = make_float4(a[0], a[1], a[2], a[3]);
+        world_to_object[i] = make_float4(b[0], b[1], b[2], b[3]);
+      }
+      sd.object_to_world = object_to_world;
+      sd.world_to_object = world_to_object;
+    }
+    auto dP = vibrt_differential::differential_from_compact(sd.Ng, v.dP);
+    return color(vibrt_scene_nodes::bump(sd, dP, input(0).x, input(1).x, input(2).x,
+                                         input(3).x, input(4).x, n.params[0] > 0 ? n.params[0] : 0.001f,
+                                         n.modes[0] != 0, n.modes[1] != 0));
   }
 #endif
 #if (VIBRT_SHADER_OPS & (1ull << 45))
@@ -518,6 +577,9 @@ VN_INLINE float4 scene_node(const ShaderInstruction &n, const float4 *slots,
                         v.barycentric.y};
           float du = n.params[0] + (services.derivative == 1 ? 0.001f : 0);
           float dv = n.params[1] + (services.derivative == 2 ? 0.001f : 0);
+          float screen_u = du, screen_v = dv;
+          du = v.du.dx * screen_u + v.du.dy * screen_v;
+          dv = v.dv.dx * screen_u + v.dv.dy * screen_v;
           if ((du != 0 || dv != 0) && v.geometry->uvs) {
             const int *indices = v.geometry->indices + 3 * v.primitive;
             const float *uv = v.geometry->uvs;
@@ -545,7 +607,6 @@ VN_INLINE float4 scene_node(const ShaderInstruction &n, const float4 *slots,
     if (n.modes[0] == 4) {
       ::float3 t =
           ::transform_vector(v.geometry->object_to_world, cuda_vec(value));
-      t = ::normalize3(t - v.Ns * ::dot3(t, v.Ns));
       return make_float4(t.x, t.y, t.z, value.w);
     }
     if (n.modes[0] == 3)
@@ -561,30 +622,17 @@ VN_INLINE float4 scene_node(const ShaderInstruction &n, const float4 *slots,
   if (op == 40) {
     if (!v.geometry)
       return scalar(0);
-    float size = input(0).x, pixel_width = 1;
-    if (n.modes[0]) {
-      ::float3 camera_to_P = P - ::make_f3(params.cam_eye);
-      float depth = ::dot3(camera_to_P, ::normalize3(::make_f3(params.cam_w)));
-      ::float3 dx = ::make_f3(params.cam_u) * (2 * fabsf(depth) / params.width);
-      ::float3 dy =
-          ::make_f3(params.cam_v) * (2 * fabsf(depth) / params.height);
-      dx = dx - v.incoming * ::dot3(dx, v.incoming);
-      dy = dy - v.incoming * ::dot3(dy, v.incoming);
-      pixel_width = 0.5f * (sqrtf(::dot3(dx, dx)) + sqrtf(::dot3(dy, dy)));
-    }
-    float w = 0.5f * size * pixel_width;
-    ::float3 co[3];
-    for (int i = 0; i < 3; i++)
-      co[i] = ::transform_point(
+    vibrt_scene_nodes::ShaderData sd{};
+    sd.P = ::cycles_vector(P);
+    if (v.geometry->curve_radii) sd.type = vibrt_scene_nodes::PRIMITIVE_CURVE;
+    sd.wi = ::cycles_vector(v.incoming);
+    vibrt_scene_nodes::SceneData data{};
+    for (int i = 0; i < 3; ++i)
+      data.vertices[i] = ::cycles_vector(::transform_point(
           v.geometry->object_to_world,
-          ::make_f3(v.geometry->vertices +
-                    3 * v.geometry->indices[3 * v.primitive + i]));
-    for (int i = 0; i < 3; i++) {
-      ::float3 edge = co[i] - co[(i + 2) % 3], area = ::cross3(edge, P - co[i]);
-      if (::dot3(area, area) < ::dot3(edge, edge) * w * w)
-        return scalar(1);
-    }
-    return scalar(0);
+          ::make_f3(v.geometry->vertices + 3 * v.geometry->indices[3 * v.primitive + i])));
+    auto dP = vibrt_differential::differential_from_compact(::cycles_vector(v.Ng), v.dP);
+    return scalar(vibrt_scene_nodes::wireframe(&data, &sd, dP, input(0).x, n.modes[0], &sd.P));
   }
 #endif
 #if (VIBRT_SHADER_OPS & (7ull << 41))

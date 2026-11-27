@@ -14,6 +14,7 @@ pub(super) struct QueryTree {
 
 struct Entry {
     vertices: Box<[f32]>,
+    radii: Box<[f32]>,
     indices: Box<[u32]>,
     tree: Arc<QueryTree>,
 }
@@ -25,6 +26,8 @@ impl Entry {
         bytemuck::cast_slice::<f32, u8>(&self.vertices)
             == bytemuck::cast_slice::<f32, u8>(&mesh.vertices)
             && *self.indices == *mesh.indices
+            && bytemuck::cast_slice::<f32, u8>(&self.radii)
+                == bytemuck::cast_slice::<f32, u8>(&mesh.curve_radii)
     }
 }
 
@@ -46,7 +49,7 @@ impl Default for QueryCache {
 
 impl QueryCache {
     /// Retain only slots that fit this render's budget. Slot order is merely a
-    /// lookup hint: every hit still requires an exact match of both arrays.
+    /// lookup hint: every hit still requires an exact match of geometry arrays.
     pub(super) fn begin(&mut self, meshes: &[LoadedMesh]) {
         self.entries.resize_with(meshes.len(), || None);
         self.keep.clear();
@@ -55,6 +58,7 @@ impl QueryCache {
             let primitives = mesh.indices.len() / 3;
             let bytes = mem::size_of_val(&mesh.vertices[..])
                 + mem::size_of_val(&mesh.indices[..])
+                + mem::size_of_val(&mesh.curve_radii[..])
                 + query_bvh::node_count(primitives) * mem::size_of::<QueryNode>()
                 + primitives * mem::size_of::<u32>();
             let keep = bytes <= remaining;
@@ -65,7 +69,9 @@ impl QueryCache {
             // switch cannot retain two scenes' worth of cached payloads.
             if !keep
                 || entry.as_ref().is_some_and(|e| {
-                    e.vertices.len() != mesh.vertices.len() || e.indices.len() != mesh.indices.len()
+                    e.vertices.len() != mesh.vertices.len()
+                        || e.indices.len() != mesh.indices.len()
+                        || e.radii.len() != mesh.curve_radii.len()
                 })
             {
                 *entry = None;
@@ -86,7 +92,8 @@ impl QueryCache {
                 }
                 // Release changed geometry before allocating its replacement.
                 *entry = None;
-                let (nodes, indices) = query_bvh::build_triangles(&mesh.vertices, &mesh.indices);
+                let (nodes, indices) =
+                    query_bvh::build_geometry(&mesh.vertices, &mesh.indices, &mesh.curve_radii);
                 let tree = Arc::new(QueryTree {
                     nodes: nodes.into_boxed_slice(),
                     indices: indices.into_boxed_slice(),
@@ -94,6 +101,7 @@ impl QueryCache {
                 if keep {
                     *entry = Some(Entry {
                         vertices: mesh.vertices.to_vec().into_boxed_slice(),
+                        radii: mesh.curve_radii.to_vec().into_boxed_slice(),
                         indices: mesh.indices.to_vec().into_boxed_slice(),
                         tree: tree.clone(),
                     });
@@ -120,6 +128,7 @@ mod tests {
             vertex_colors: Cow::Borrowed(&[]),
             vertex_alphas: Cow::Borrowed(&[]),
             tangents: Cow::Borrowed(&[]),
+            curve_radii: Cow::Borrowed(&[]),
         }
     }
 
@@ -133,7 +142,8 @@ mod tests {
     }
 
     fn assert_current(tree: &QueryTree, mesh: &LoadedMesh) {
-        let (nodes, indices) = query_bvh::build_triangles(&mesh.vertices, &mesh.indices);
+        let (nodes, indices) =
+            query_bvh::build_geometry(&mesh.vertices, &mesh.indices, &mesh.curve_radii);
         assert_eq!(*tree.indices, indices);
         assert_eq!(tree.nodes.len(), nodes.len());
         for (actual, expected) in tree.nodes.iter().zip(nodes) {
@@ -174,6 +184,22 @@ mod tests {
             assert!(!Arc::ptr_eq(&edited[i], &reordered[i]));
             assert_current(&reordered[i], &meshes[i]);
         }
+    }
+
+    #[test]
+    fn curve_radius_edits_rebuild_bounds() {
+        let mut cache = QueryCache::default();
+        let mut curve = mesh(&[0.0, 0.0, 0.0, 0.0, 0.0, 1.0], &[0, 1, 0]);
+        curve.curve_radii = Cow::Owned(vec![0.1, 0.2]);
+        let mut meshes = [curve];
+        let first = prepare(&mut cache, &meshes);
+        let same = prepare(&mut cache, &meshes);
+        assert!(Arc::ptr_eq(&first[0], &same[0]));
+        meshes[0].curve_radii.to_mut()[1] = 0.5;
+        let edited = prepare(&mut cache, &meshes);
+        assert!(!Arc::ptr_eq(&first[0], &edited[0]));
+        assert_current(&edited[0], &meshes[0]);
+        assert_eq!(edited[0].nodes[0].hi[0], 0.5);
     }
 
     #[test]

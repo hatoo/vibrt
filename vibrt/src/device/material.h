@@ -29,20 +29,24 @@ static __device__ void shader_context(const PathVertex &v, vibrt_cycles::float4 
 #define NEED(I) (mask & (1u << (I)))
 #define CTX_VEC(I,V) if(NEED(I))ctx[I]=make_float4((V).x,(V).y,(V).z,1)
   constexpr float delta = 0.001f;
-  if(NEED(0))ctx[0]=make_float4(v.uv.x+(derivative==1?delta:0),v.uv.y+(derivative==2?delta:0),0,1);
+  float du = derivative == 1 ? v.du.dx * delta : derivative == 2 ? v.du.dy * delta : 0;
+  float dv = derivative == 1 ? v.dv.dx * delta : derivative == 2 ? v.dv.dy * delta : 0;
+  if(NEED(0))ctx[0]=make_float4(v.uv.x+du,v.uv.y+dv,0,1);
   if(NEED(1)) {
     float3 G=v.generated;
-    if(derivative==1)G=G+v.dGdu*delta;else if(derivative==2)G=G+v.dGdv*delta;
+    G=G+v.dGdu*du+v.dGdv*dv;
     CTX_VEC(1,G);
   }
   if(NEED(2)) {
     float3 O=v.P_object;
-    if(derivative==1)O=O+v.dOdu*delta;else if(derivative==2)O=O+v.dOdv*delta;
+    O=O+v.dOdu*du+v.dOdv*dv;
     CTX_VEC(2,O);
   }
   float3 P=v.P;
   if(mask&((1u<<3)|(1u<<12)|(1u<<14))) {
-    if(derivative==1)P=P+v.dPdu*delta;else if(derivative==2)P=P+v.dPdv*delta;
+    auto dP = vibrt_differential::differential_from_compact(cycles_vector(v.Ng), v.dP);
+    auto offset = derivative == 1 ? dP.dx * delta : derivative == 2 ? dP.dy * delta : vibrt_cycles::make_float3(0);
+    P = P + make_float3(offset.x, offset.y, offset.z);
     CTX_VEC(3,P);
   }
   CTX_VEC(4,v.Ns);CTX_VEC(5,v.Ng);CTX_VEC(6,v.incoming);
@@ -110,7 +114,8 @@ static __device__ __noinline__ void evaluate_shader_single(PrincipledGpu *m,floa
 static __device__ __forceinline__ void evaluate_shader(PrincipledGpu *m,const PathVertex &v,vibrt_cycles::float4 *out,unsigned int requested=vibrt_shader::EVAL_ALL,int derivative=0) {
   if (m->shader_len == 1) {
     float2 uv=v.uv;
-    if(derivative==1)uv.x+=0.001f;else if(derivative==2)uv.y+=0.001f;
+    if(derivative==1){uv.x+=v.du.dx*0.001f;uv.y+=v.dv.dx*0.001f;}
+    else if(derivative==2){uv.x+=v.du.dy*0.001f;uv.y+=v.dv.dy*0.001f;}
     evaluate_shader_single(m,uv,out,requested);
   } else evaluate_shader_vm(m,v,out,requested,derivative);
 }
@@ -178,6 +183,12 @@ struct MaterialEval {
 #endif
 #if (VIBRT_CLOSURE_TYPES & (1u << 5))
   vibrt_cycles::ChiangHairBSDF chiang;
+#endif
+#if (VIBRT_CLOSURE_TYPES & (1u << 6))
+  vibrt_cycles::HuangHairBSDF huang;
+  vibrt_cycles::HuangHairExtra huang_extra;
+#endif
+#if (VIBRT_CLOSURE_TYPES & ((1u << 5) | (1u << 6)))
   vibrt_cycles::ShaderData hair_context;
 #endif
   PrincipledGpu *mat; // raw material ptr for coat/sheen/sss params
@@ -369,8 +380,8 @@ static __device__ __noinline__ MaterialEval eval_material_one(const PathVertex &
     GRAPH_SCALAR(42, sss_ior);
     GRAPH_SCALAR(43, sss_anisotropy);
 #endif
-#if (VIBRT_CLOSURE_TYPES & (1u << 5))
-    if (m->closure_type == 5) {
+#if (VIBRT_CLOSURE_TYPES & ((1u << 5) | (1u << 6)))
+    if (m->closure_type == 5 || m->closure_type == 6) {
       e.hair_context = {};
       e.hair_context.wi =
           vibrt_cycles::make_float3(v.incoming.x, v.incoming.y, v.incoming.z);
@@ -381,9 +392,11 @@ static __device__ __noinline__ MaterialEval eval_material_one(const PathVertex &
       e.hair_context.N = vibrt_cycles::make_float3(v.Ns.x, v.Ns.y, v.Ns.z);
       e.hair_context.lcg_state =
           vibrt_cycles::hash_uint2(v.shader_seed, 0x68bc21ebu);
-      e.hair_context.type =
-          v.geometry->tangents ? vibrt_cycles::PRIMITIVE_CURVE_RIBBON : 0;
+      e.hair_context.type = v.geometry->curve_radii ? 1 :
+          (v.geometry->tangents ? vibrt_cycles::PRIMITIVE_CURVE_RIBBON : 0);
       e.hair_context.v = v.uv.x * 2 - 1;
+#if (VIBRT_CLOSURE_TYPES & (1u << 5))
+      if (m->closure_type == 5)
       e.chiang = vibrt_shader::chiang_setup(
           e.hair_context,
           vibrt_cycles::make_float3(e.base_color.x, e.base_color.y,
@@ -391,6 +404,34 @@ static __device__ __noinline__ MaterialEval eval_material_one(const PathVertex &
           vibrt_shader::xyz(out[44]), e.hair_roughness_u, e.hair_roughness_v,
           e.hair_offset, out[47].x, out[46].x, out[45].x, out[52].x, out[53].x,
           out[54].x, out[55].x, vibrt_shader::xyz(out[56]), (int)out[57].x);
+#endif
+#if (VIBRT_CLOSURE_TYPES & (1u << 6))
+      if (m->closure_type == 6) {
+        e.huang = {}; e.huang_extra = {};
+        e.huang.extra = &e.huang_extra;
+        e.huang.weight = vibrt_cycles::one_spectrum();
+        e.huang.roughness = e.hair_roughness_u * (1 + 2 * (out[45].x - 0.5f) * out[52].x);
+        e.huang.sigma = vibrt_shader::hair_sigma(cycles_vector(e.base_color),
+            vibrt_shader::xyz(out[44]), e.huang.roughness, out[45].x, out[53].x,
+            out[54].x, out[55].x, vibrt_shader::xyz(out[56]), (int)out[57].x);
+        e.huang.eta = fmaxf(out[47].x, 1.0001f);
+        e.huang.tilt = e.hair_offset;
+        e.huang.aspect_ratio = fmaxf(out[46].x, 1e-4f);
+        e.huang_extra.R = fmaxf(e.hair_roughness_v, 0);
+        e.huang_extra.TT = fmaxf(out[50].x, 0);
+        e.huang_extra.TRT = fmaxf(out[51].x, 0);
+        e.huang_extra.pixel_coverage = (v.path_flags & 1u) && v.path_depth == 0 && v.curve_radius > 0 ?
+            fmaxf(0.5f * v.dP / v.curve_radius, 1e-5f) : 1.0f;
+        if (v.geometry->curve_radii && v.geometry->normals) {
+          const int *ids = v.geometry->indices + 3 * v.primitive;
+          float3 normal = make_f3(v.geometry->normals + 3 * ids[0]) * (1 - v.barycentric.x) +
+                          make_f3(v.geometry->normals + 3 * ids[1]) * v.barycentric.x;
+          e.huang.N = cycles_vector(transform_normal(v.geometry->world_to_object, normal));
+        }
+        vibrt_cycles::bsdf_hair_huang_setup(&e.hair_context, &e.huang, 0);
+        if (e.hair_context.transparent) e.alpha_blend = 0;
+      }
+#endif
     }
 #endif
 #if VIBRT_CLOSURE_TYPES && VIBRT_SHADER_OUTPUT_COUNT > 32
@@ -417,9 +458,11 @@ static __device__ __noinline__ MaterialEval eval_material_one(const PathVertex &
       float dhdu=(shifted[26].x-out[26].x)/delta;
       evaluate_shader(m,v,shifted,vibrt_shader::EVAL_BUMP,2);
       float dhdv=(shifted[26].x-out[26].x)/delta;
-      float3 r1=cross3(v.dPdv,graph_normal),r2=cross3(graph_normal,v.dPdu);
-      float det=dot3(v.dPdu,r1);
-      if(fabsf(det)>1e-12f){float3 bumped=normalize3(graph_normal-(r1*dhdu+r2*dhdv)*(out[28].x/det));float f=fminf(fmaxf(out[27].x,0.0f),1.0f);graph_normal=normalize3(graph_normal*(1-f)+bumped*f);}
+      vibrt_scene_nodes::ShaderData sd{};
+      sd.N = cycles_vector(graph_normal);
+      auto dP = vibrt_differential::differential_from_compact(cycles_vector(v.Ng), v.dP);
+      auto bumped = vibrt_scene_nodes::bump(sd, dP, 0, dhdu, dhdv, out[27].x, out[28].x, 1, false, false);
+      graph_normal = make_float3(bumped.x, bumped.y, bumped.z);
     }
     cache.nodes=m->shader_nodes;cache.normal=graph_normal;cache.tangent=graph_tangent;
 #undef GRAPH_SCALAR
@@ -445,55 +488,33 @@ static __device__ __noinline__ MaterialEval eval_material_one(const PathVertex &
     e.alpha = min_alpha;
 
   float3 Ns = graph_normal;
-  // Composite tangent-space perturbation: start from (0,0,1), apply bump
-  // (central-difference over heightmap) first, then normal map (multiplied).
-  float3 nm_t = make_float3(0.0f, 0.0f, 1.0f);
-  bool any_perturb = false;
-  if (m->bump_tex != nullptr && m->bump_strength != 0.0f) {
-    int bw = m->bump_tex_w;
-    int bh = m->bump_tex_h;
-    if (bw > 0 && bh > 0) {
-      float du = 1.0f / (float)bw;
-      float dv = 1.0f / (float)bh;
-      float h_px = sample_rgba(m->bump_tex, bw, bh, m->bump_tex_channels,
-                               make_float2(uv.x + du, uv.y)).x;
-      float h_mx = sample_rgba(m->bump_tex, bw, bh, m->bump_tex_channels,
-                               make_float2(uv.x - du, uv.y)).x;
-      float h_py = sample_rgba(m->bump_tex, bw, bh, m->bump_tex_channels,
-                               make_float2(uv.x, uv.y + dv)).x;
-      float h_my = sample_rgba(m->bump_tex, bw, bh, m->bump_tex_channels,
-                               make_float2(uv.x, uv.y - dv)).x;
-      // Central-difference slope × user strength. Linear in bump_strength
-      // so Strength=1 reproduces Blender's default amplitude and the user
-      // doesn't need to pre-scale for an empirical "subtle" factor.
-      float sx = -(h_px - h_mx) * m->bump_strength;
-      float sy = -(h_py - h_my) * m->bump_strength;
-      nm_t = normalize3(make_float3(sx, sy, 1.0f));
-      any_perturb = true;
-    }
-  }
-  if (m->normal_tex != nullptr) {
-    float3 n = sample_rgba(m->normal_tex, m->normal_tex_w, m->normal_tex_h,
-                           m->normal_tex_channels, uv);
-    float s = m->normal_strength;
-    float3 nn = make_float3((n.x * 2.0f - 1.0f) * s,
-                            (n.y * 2.0f - 1.0f) * s,
-                             n.z * 2.0f - 1.0f);
-    nn = normalize3(nn);
-    // Compose: treat nm_t as frame, re-express nn in its tangent basis.
-    if (any_perturb) {
-      float3 nt, nb;
-      build_frame(nm_t, nt, nb);
-      nm_t = normalize3(nt * nn.x + nb * nn.y + nm_t * nn.z);
-    } else {
-      nm_t = nn;
-    }
-    any_perturb = true;
-  }
-  if (any_perturb) {
+  if (m->bump_tex || m->normal_tex) {
+    vibrt_scene_nodes::ShaderData sd{};
+    sd.N = sd.normal = cycles_vector(Ns);
+    sd.Ng = cycles_vector(v.Ng);
+    sd.sign = 1;
     float3 T, B;
     build_frame(Ns, T, B);
-    Ns = normalize3(T * nm_t.x + B * nm_t.y + Ns * nm_t.z);
+    sd.tangent = cycles_vector(T);
+    if (m->bump_tex && m->bump_strength != 0) {
+      constexpr float filter = 0.1f;
+      auto height = [&](float dx, float dy) {
+        float du = v.du.dx * dx + v.du.dy * dy;
+        float dv = v.dv.dx * dx + v.dv.dy * dy;
+        return sample_rgba(m->bump_tex, m->bump_tex_w, m->bump_tex_h, m->bump_tex_channels,
+                           make_float2(uv.x + M[0]*du + M[1]*dv, uv.y + M[3]*du + M[4]*dv)).x;
+      };
+      auto dP = vibrt_differential::differential_from_compact(sd.Ng, v.dP);
+      sd.N = sd.normal = vibrt_scene_nodes::bump(sd, dP, height(0,0), height(filter,0),
+          height(0,filter), 1, m->bump_strength, filter, false, false);
+    }
+    if (m->normal_tex) {
+      float3 value = sample_rgba(m->normal_tex, m->normal_tex_w, m->normal_tex_h,
+                                m->normal_tex_channels, uv);
+      sd.N = vibrt_scene_nodes::normal_map(sd, cycles_vector(value), m->normal_strength,
+                                          0, false, false);
+    }
+    Ns = make_float3(sd.N.x, sd.N.y, sd.N.z);
   }
   e.Ns = Ns;
   e.Ng = v.Ng;
@@ -793,6 +814,19 @@ static __device__ __noinline__ BsdfEval eval_bsdf_one(const MaterialEval &e, flo
   }
 #endif
 
+#if (VIBRT_CLOSURE_TYPES & (1u << 6))
+  if (e.mat->closure_type == 6) {
+    if (e.hair_context.transparent) return r;
+    auto sd = e.hair_context;
+    auto hair = e.huang;
+    auto extra = e.huang_extra;
+    hair.extra = &extra;
+    auto value = vibrt_cycles::bsdf_hair_huang_eval(0, &sd,
+        reinterpret_cast<const vibrt_cycles::ShaderClosure *>(&hair), cycles_vector(wi), &r.pdf);
+    r.f = make_float3(value.x, value.y, value.z);
+    return r;
+  }
+#endif
   float NoV = dot3(e.Ns, wo);
   if (NoV <= 0.0f)
     return r;
@@ -866,6 +900,12 @@ static __device__ __noinline__ BsdfDirectionSample sample_bsdf_direction(const M
   s.lobe = LOBE_DIFFUSE;
   s.transparent = false;
   s.weighted_sample = false;
+  if (e.mat->closure_type == 8) {
+    s.wi = -wo;
+    s.transparent = s.valid = s.specular = true;
+    s.lobe = LOBE_TRANSMISSION;
+    return s;
+  }
 #if (VIBRT_CLOSURE_TYPES & (1u << 7))
   if (e.sss_exit) {
     float r = sqrtf(rng.next()), phi = 2 * M_PIf * rng.next();
@@ -897,6 +937,32 @@ static __device__ __noinline__ BsdfDirectionSample sample_bsdf_direction(const M
   }
 #endif
 
+#if (VIBRT_CLOSURE_TYPES & (1u << 6))
+  if (e.mat->closure_type == 6) {
+    if (e.hair_context.transparent) {
+      s.wi = -wo; s.valid = s.transparent = s.specular = true;
+      s.lobe = LOBE_TRANSMISSION;
+      return s;
+    }
+    auto sd = e.hair_context;
+    auto hair = e.huang;
+    auto extra = e.huang_extra;
+    hair.extra = &extra;
+    vibrt_cycles::float3 value = {}, wi = {};
+    vibrt_cycles::float2 roughness;
+    float pdf = 0;
+    vibrt_cycles::bsdf_hair_huang_sample(0,
+        reinterpret_cast<const vibrt_cycles::ShaderClosure *>(&hair), &sd,
+        vibrt_cycles::make_float3(rng.next(), rng.next(), rng.next()), &value, &wi, &pdf, &roughness);
+    s.wi = make_float3(wi.x, wi.y, wi.z);
+    s.valid = pdf > 0;
+    s.lobe = LOBE_GLOSSY;
+    s.sampled_value = make_float3(value.x, value.y, value.z);
+    s.sampled_pdf = pdf;
+    s.weighted_sample = true;
+    return s;
+  }
+#endif
   float NoV = dot3(e.Ns, wo);
   if (NoV <= 0.0f)
     return s;
@@ -1076,13 +1142,16 @@ static __device__ BsdfSample sample_bsdf(const MaterialEvalGroup &g,
   }
   if (s.transparent) {
     if (g.n == 1) {
-      s.f = make_float3(1, 1, 1);
+      s.f = g.slots[0].mat->closure_type == 8 ? g.slots[0].base_color : make_float3(1, 1, 1);
       s.pdf = 1.0f;
       return s;
     }
     float opacity=0.0f;
-    for(int i=0;i<g.n;i++)opacity+=g.weights[i]*(1.0f-g.slots[i].alpha_blend);
-    s.f=make_float3(opacity,opacity,opacity);
+    for(int i=0;i<g.n;i++) {
+      float weight = g.weights[i] * (1.0f - g.slots[i].alpha_blend);
+      opacity += weight;
+      s.f = s.f + (g.slots[i].mat->closure_type == 8 ? g.slots[i].base_color : make_float3(1, 1, 1)) * weight;
+    }
     s.pdf=opacity/fmaxf(total_weight,1e-20f);
     return s;
   }
@@ -1096,7 +1165,54 @@ static __device__ BsdfSample sample_bsdf(const MaterialEvalGroup &g,
   return s;
 }
 
-static __device__ __noinline__ void fill_surface_vertex(PathVertex*,HitGroupData*,unsigned int,float2,float3,float,unsigned int);
+static __device__ __noinline__ void fill_surface_vertex(PathVertex*,HitGroupData*,unsigned int,float2,float3,float,unsigned int,const float3 * = nullptr);
+
+static __device__ __noinline__ float3 surface_shadow_transparency(const PathVertex &v) {
+  struct Entry { PrincipledGpu *material; float weight; bool leaf; };
+  Entry stack[32];
+  int count = 0;
+  stack[count++] = {v.mat, 1, false};
+  vibrt_shadow::ShaderData sd{vibrt_shadow::SD_TRANSPARENT, vibrt_cycles::make_float3(0)};
+  while (count) {
+    Entry entry = stack[--count];
+    auto *m = entry.material;
+    if (!m || entry.weight == 0)
+      continue;
+    if (!entry.leaf && (m->left_subtree || m->secondary)) {
+      float fac = compute_level_mix_fac(m, v, fabsf(dot3(v.Ns, v.incoming)));
+      stack[count++] = {m->secondary ? m->secondary : m, entry.weight * (m->add_shader ? 1 : fac), !m->secondary};
+      stack[count++] = {m->left_subtree ? m->left_subtree : m, entry.weight * (m->add_shader ? 1 : 1 - fac), !m->left_subtree};
+      continue;
+    }
+    if (m->closure_type == 4)
+      continue; // Cycles excludes ray portals from transparent shadow traversal.
+#if (VIBRT_CLOSURE_TYPES & (1u << 6))
+    if (m->closure_type == 6) {
+      ShaderEvalCache cache{};
+      auto hair = eval_material_one(v, m, cache);
+      if (hair.hair_context.transparent)
+        sd.closure_transparent_extinction += vibrt_cycles::make_float3(entry.weight);
+      continue;
+    }
+#endif
+    float alpha = m->alpha_blend;
+    float3 color = m->closure_type == 8 ? make_f3(m->base_color) : make_float3(1, 1, 1);
+    if (m->closure_type == 8 && m->base_color_tex) {
+      const float *M = m->uv_transform;
+      float2 uv = make_float2(M[0] * v.uv.x + M[1] * v.uv.y + M[2], M[3] * v.uv.x + M[4] * v.uv.y + M[5]);
+      color = color * sample_rgba(m->base_color_tex, m->base_color_tex_w, m->base_color_tex_h, m->base_color_tex_channels, uv);
+    }
+    if (m->shader_outputs & ((1u << 7) | (m->closure_type == 8 ? 1u : 0u))) {
+      vibrt_cycles::float4 out[VIBRT_SHADER_OUTPUT_COUNT];
+      evaluate_shader(m, v, out, m->closure_type == 8 ? vibrt_shader::EVAL_ALL : vibrt_shader::EVAL_ALPHA);
+      if (m->shader_outputs & (1u << 7)) alpha = __saturatef(out[7].x);
+      if (m->closure_type == 8 && (m->shader_outputs & 1u)) color = make_float3(out[0].x, out[0].y, out[0].z);
+    }
+    sd.closure_transparent_extinction += cycles_vector(color) * (entry.weight * (1 - alpha));
+  }
+  auto value = vibrt_shadow::surface_shader_transparency(&sd);
+  return make_float3(value.x, value.y, value.z);
+}
 
 static __device__ __noinline__ float4 emission_alpha(const PathVertex &v,bool include_emission=true) {
   struct Entry {PrincipledGpu *m;float w;bool leaf;};
@@ -1170,34 +1286,72 @@ static __device__ float sample_point_position(float3 center, float radius,
                                               unsigned int sphere, float3 P,
                                               RNG &rng, float3 &position,
                                               float3 &wi, float &distance) {
-  float3 delta = center - P;
-  float d2 = dot3(delta, delta), d = sqrtf(d2);
-  float3 axis = d > 1e-12f ? delta / d : make_float3(0, 0, 1);
+  float d2 = dot3(center - P, center - P);
   if (radius <= 1e-6f) {
-    position = center; wi = axis; distance = d;
-    return d > 1e-6f ? 1.0f / d2 : 0;
+    distance = sqrtf(d2);
+    position = center;
+    wi = normalize3(center - P);
+    return d2 > 1e-12f ? 1 / d2 : 0;
   }
-  float r2 = radius * radius;
-  float3 T, B;
-  build_frame(axis, T, B);
-  float u = rng.next(), phi = 2 * M_PIf * rng.next();
-  if (sphere) {
-    bool outside = d2 > r2;
-    float cos_max = sqrtf(fmaxf(1 - r2 / fmaxf(d2, r2), 0.0f));
-    float one_minus_cos = outside ? r2 / d2 / (1 + cos_max) : 2;
-    float ct = 1 - u * one_minus_cos;
-    float st = sqrtf(fmaxf(1 - ct * ct, 0.0f));
-    wi = normalize3(axis * ct + (T * cosf(phi) + B * sinf(phi)) * st);
-    float root = sqrtf(fmaxf(r2 - d2 * (1 - ct * ct), 0.0f));
-    distance = d * ct + (outside ? -root : root);
-    position = P + wi * distance;
-    return outside ? 2 / (d2 * (1 + cos_max)) : 4 / r2;
+  // A sphere center has no orientation; the upstream exterior formula divides
+  // by distance. Move only this singular evaluation point by a negligible offset.
+  auto point = cycles_vector(d2 > 0 ? P : P + make_float3(0, 0, radius * 1e-7f));
+  vibrt_lights::KernelLight light = {};
+  light.co = cycles_vector(center);
+  light.spot.radius = radius;
+  light.spot.is_sphere = sphere != 0;
+  light.spot.eval_fac = 1 / (M_PIf * radius * radius);
+  vibrt_lights::LightSample sample = {};
+  vibrt_lights::point_light_sample(&light, vibrt_cycles::make_float2(rng.next(), rng.next()),
+                                   point, vibrt_cycles::make_float3(0, 0, 1),
+                                   vibrt_cycles::SD_BSDF_HAS_TRANSMISSION, &sample);
+  position = make_float3(sample.P.x, sample.P.y, sample.P.z);
+  wi = make_float3(sample.D.x, sample.D.y, sample.D.z);
+  distance = sample.t;
+  return sample.pdf > 0 ? sample.eval_fac / sample.pdf : 0;
+}
+
+static __device__ float sample_spot_position(const SpotLight &sp, float3 P, RNG &rng,
+                                             float3 &position, float3 &wi, float &distance) {
+  vibrt_lights::KernelLight light = {};
+  light.co = cycles_vector(make_f3(sp.position));
+  light.spot.radius = sp.radius;
+  light.spot.is_sphere = sp.sphere != 0;
+  light.spot.dir = cycles_vector(make_f3(sp.direction));
+  light.spot.cos_half_spot_angle = sp.cos_outer;
+  light.spot.cos_half_larger_spread = sp.cos_larger_spread;
+  light.inverse = {cycles_vector(make_f3(sp.world_to_light)),
+                   cycles_vector(make_f3(sp.world_to_light + 3)),
+                   cycles_vector(make_f3(sp.world_to_light + 6))};
+  light.spot.spot_smooth = 1 / fmaxf(sp.cos_inner - sp.cos_outer, 1e-20f);
+  if (sp.radius <= 1e-6f) {
+    float weight = sample_point_position(make_f3(sp.position), 0, sp.sphere, P, rng,
+                                          position, wi, distance);
+    auto local = vibrt_lights::spot_light_to_local(0, &light, cycles_vector(-wi));
+    return weight * vibrt_lights::spot_light_attenuation(&light.spot, local);
   }
-  position = center + (T * cosf(phi) + B * sinf(phi)) * (radius * sqrtf(u));
-  delta = position - P;
-  distance = sqrtf(dot3(delta, delta));
-  wi = delta / fmaxf(distance, 1e-12f);
-  return fmaxf(dot3(axis, wi), 0.0f) / fmaxf(distance * distance, 1e-12f);
+  light.spot.eval_fac = 1 / (M_PIf * sp.radius * sp.radius);
+  vibrt_lights::LightSample sample = {};
+  auto p = cycles_vector(P);
+  if (vibrt_cycles::len_squared(p - light.co) == 0)
+    p.z += sp.radius * 1e-7f;
+  bool ok = vibrt_lights::spot_light_sample<false>(
+      0, &light, vibrt_cycles::make_float2(rng.next(), rng.next()), p,
+      vibrt_cycles::make_float3(0, 0, 1), vibrt_cycles::SD_BSDF_HAS_TRANSMISSION, &sample);
+  position = make_float3(sample.P.x, sample.P.y, sample.P.z);
+  wi = make_float3(sample.D.x, sample.D.y, sample.D.z);
+  distance = sample.t;
+  return ok && sample.pdf > 0 ? sample.eval_fac / sample.pdf : 0;
+}
+
+static __device__ float3 sample_sun_direction(const SunLight &sun, RNG &rng, float &pdf) {
+  vibrt_lights::KernelLight light = {};
+  light.co = cycles_vector(-make_f3(sun.direction));
+  light.distant.one_minus_cosangle = 1 - sun.cos_angle;
+  vibrt_lights::LightSample sample = {};
+  vibrt_lights::distant_light_sample(&light, vibrt_cycles::make_float2(rng.next(), rng.next()), &sample);
+  pdf = sample.pdf;
+  return make_float3(sample.D.x, sample.D.y, sample.D.z);
 }
 
 static __device__ float3 point_light_emission(PrincipledGpu *shader, float3 value,
@@ -1218,6 +1372,14 @@ static __device__ float3 area_light_emission(const AreaRectLight &light, float3 
                                              float3 incoming, float distance,
                                              unsigned int path_flags = 2u) {
   float3 value = make_f3(light.emission);
+  if (light.normalize_spread > 0) {
+    float3 normal = make_f3(light.normal);
+    if (light.two_sided && dot3(normal, incoming) < 0)
+      normal = -normal;
+    value = value * vibrt_lights::area_light_spread_attenuation(
+                        cycles_vector(-incoming), cycles_vector(normal),
+                        light.tan_half_spread, light.normalize_spread);
+  }
   if (light.shader) {
     PathVertex v = {};
     v.mat = light.shader;

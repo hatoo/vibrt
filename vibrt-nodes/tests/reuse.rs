@@ -78,6 +78,39 @@ fn light_tree_is_normalized_and_sample_matches_hit_probability() {
     }
 }
 
+#[test]
+fn light_tree_handles_coincident_and_zero_energy_emitters() {
+    for energy in [0.0, 1.0] {
+        let emitters: Vec<_> = (0..19)
+            .map(|i| {
+                Node::emitter(
+                    [-1.0; 3],
+                    [1.0; 3],
+                    energy,
+                    [0.0, 0.0, if i % 2 == 0 { 1.0 } else { -1.0 }],
+                    false,
+                )
+            })
+            .collect();
+        let tree = light_tree::build(&emitters);
+        assert_eq!(tree.nodes.len(), 37);
+        assert_eq!(tree.nodes[0].lower, [-1.0; 3]);
+        assert_eq!(tree.nodes[0].upper, [1.0; 3]);
+        assert!((tree.nodes[0].energy - energy * 19.0).abs() < 1e-5);
+        for (emitter, &leaf) in tree.leaves.iter().enumerate() {
+            assert_eq!(tree.nodes[leaf as usize].emitter, emitter as i32);
+        }
+        for node in &tree.nodes {
+            assert!(node.theta_o.is_finite() && node.theta_e.is_finite());
+            if node.left >= 0 {
+                let parent = tree.nodes[node.left as usize].parent;
+                assert_eq!(tree.nodes[parent as usize].left, node.left);
+                assert_eq!(tree.nodes[node.right as usize].parent, parent);
+            }
+        }
+    }
+}
+
 fn ies_text(kind: u32, vertical: &str, horizontal: &str, nv: usize, nh: usize) -> String {
     format!("IESNA:LM-63-2002\nTILT=NONE\n1 1000 2 {nv} {nh} {kind} 1 0 0 0\n0.5 1 10\n{vertical}\n{horizontal}\n{}\n",vec!["10";nv*nh].join(" "))
 }

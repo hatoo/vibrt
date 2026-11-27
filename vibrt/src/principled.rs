@@ -46,6 +46,7 @@ fn shader_has_alpha(mat: &PrincipledMaterial) -> bool {
 /// Be conservative for dynamic transmission and nested material trees.
 pub fn needs_any_hit(mat: &PrincipledMaterial) -> bool {
     shader_has_alpha(mat)
+        || mat.closure_type == 6
         || mat.transmission > 0.0
         || mat.transmission_tex.is_some()
         || mat
@@ -63,7 +64,11 @@ pub fn needs_any_hit(mat: &PrincipledMaterial) -> bool {
 /// Surface attributes used anywhere in a Mix/Add tree, including its factor.
 /// The legacy color evaluator also accepts vertex color and object randomness.
 pub fn surface_requirements(mat: &PrincipledMaterial) -> Result<(u32, bool)> {
-    let mut contexts = if mat.closure_type == 5 { 1 << 7 } else { 0 };
+    let mut contexts = if matches!(mat.closure_type, 5 | 6) {
+        1 << 7
+    } else {
+        0
+    };
     let mut bump = false;
     for graph in mat
         .shader_graph

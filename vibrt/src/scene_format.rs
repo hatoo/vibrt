@@ -51,9 +51,9 @@ pub struct SceneFile {
 /// - `color * density` is the per-channel scattering coefficient σ_s.
 /// - `absorption_color * density` is σ_a. (When σ_a = 0 the volume is purely
 ///   scattering — junk_shop's smoke is configured this way.)
-/// - σ_t = σ_s + σ_a. The renderer samples a single scalar majorant (the
-///   per-channel max of σ_t) for distance sampling and tracks per-channel
-///   beam transmittance separately.
+/// - σ_t = σ_s + σ_a. Exponential distance sampling uses the channel average,
+///   optionally mixed with an equiangular proposal; throughput retains RGB
+///   beam transmittance.
 /// - Emission = `emission_color * emission_strength + blackbody_rgb *
 ///   blackbody_intensity`, all scaled by `density`. The exporter folds the
 ///   blackbody term in before serialising; the renderer just sees one
@@ -92,6 +92,12 @@ fn default_volume_color() -> [f32; 3] {
 
 #[derive(Deserialize, Copy, Clone)]
 pub struct RenderSettings {
+    #[serde(default)]
+    pub use_adaptive_sampling: bool,
+    #[serde(default)]
+    pub adaptive_threshold: f32,
+    #[serde(default)]
+    pub adaptive_min_samples: u32,
     #[serde(default)]
     pub film_transparent: bool,
     pub width: u32,
@@ -147,6 +153,16 @@ pub struct CameraDesc {
     pub frame_aspect: f32,
     #[serde(default)]
     pub lens_radius: f32,
+    #[serde(default)]
+    pub aperture_blades: u32,
+    #[serde(default)]
+    pub aperture_rotation: f32,
+    #[serde(default = "one_f32")]
+    pub aperture_ratio: f32,
+    #[serde(default)]
+    pub filter_type: u32,
+    #[serde(default = "one_f32")]
+    pub filter_width: f32,
     #[serde(default = "one_f32")]
     pub focal_distance: f32,
     /// Cycles' "Clip Start". Primary rays skip geometry closer than this
@@ -222,13 +238,14 @@ pub struct MeshDesc {
     /// Alpha channel of the selected color attribute, f32 per vertex.
     #[serde(default)]
     pub vertex_alphas: Option<BlobIdx>,
-    /// f32 x 3 per vertex; optional. Object-space tangent direction authored
-    /// by the exporter — used by the hair Kajiya-Kay lobe to read the strand
-    /// axis at the hit point. When present, the device interpolates it
-    /// barycentrically and overrides the default build_frame() tangent. The
-    /// exporter only emits this for hair ribbon meshes today.
+    /// Optional object-space tangent, f32 x 3 per vertex/key. Hair closures
+    /// use the interpolated strand axis instead of a generated surface frame.
     #[serde(default)]
     pub tangents: Option<BlobIdx>,
+    /// Optional radius per key: selects round linear curves. Each index triplet
+    /// is [key, key + 1, key], preserving the shared attribute interpolation ABI.
+    #[serde(default)]
+    pub curve_radii: Option<BlobIdx>,
 }
 
 #[derive(Deserialize)]
@@ -690,6 +707,8 @@ pub enum LightDesc {
         size: [f32; 2],
         color: [f32; 3],
         power: f32,
+        #[serde(default = "default_area_spread")]
+        spread: f32,
         /// 0 = hidden from primary/specular camera rays (NEE still samples
         /// it), 1 = visible. Defaults to visible to preserve the behaviour
         /// of existing hand-authored scenes.
@@ -710,6 +729,10 @@ pub enum LightDesc {
 
 fn default_point_radius() -> f32 {
     0.05
+}
+
+fn default_area_spread() -> f32 {
+    std::f32::consts::PI
 }
 
 /// One layer of a (possibly mixed) world envmap. Mirrors a single

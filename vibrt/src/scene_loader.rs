@@ -23,10 +23,10 @@ pub struct LoadedMesh<'bin> {
     /// referenced by any material. See `MeshDesc::vertex_colors`.
     pub vertex_colors: Cow<'bin, [f32]>,
     pub vertex_alphas: Cow<'bin, [f32]>,
-    /// f32 x 3 per vertex; empty when the mesh has no authored tangent (the
-    /// common case — only hair ribbon meshes ship one today). See
-    /// `MeshDesc::tangents`.
+    /// f32 x 3 per vertex/key; empty without an authored tangent.
+    /// See `MeshDesc::tangents` for strand orientation.
     pub tangents: Cow<'bin, [f32]>,
+    pub curve_radii: Cow<'bin, [f32]>,
 }
 
 pub struct LoadedTexture<'bin> {
@@ -420,6 +420,21 @@ pub fn load_scene<'a>(
                     ies_n_h: 0,
                     light_rotation,
                     sphere: *sphere as u32,
+                    world_to_light: {
+                        let inv = transform::invert(&t);
+                        [
+                            inv[0], inv[1], inv[2], inv[4], inv[5], inv[6], inv[8], inv[9], inv[10],
+                        ]
+                    },
+                    cos_larger_spread: {
+                        let length_sq = |axis: usize| {
+                            t[axis].powi(2) + t[4 + axis].powi(2) + t[8 + axis].powi(2)
+                        };
+                        (1.0 + cone_rad.tan().powi(2) * length_sq(0).max(length_sq(1))
+                            / length_sq(2).max(1e-20))
+                        .sqrt()
+                        .recip()
+                    },
                 });
                 spot_ies.push(ies.clone());
             }
@@ -430,6 +445,7 @@ pub fn load_scene<'a>(
                 size,
                 color,
                 power,
+                spread,
                 camera_visible,
                 two_sided,
                 ies,
@@ -498,6 +514,23 @@ pub fn load_scene<'a>(
                     camera_visible: *camera_visible,
                     emission,
                     power: *power,
+                    tan_half_spread: if *spread >= std::f32::consts::PI {
+                        f32::MAX
+                    } else {
+                        (0.5 * spread.max(0.0)).tan()
+                    },
+                    normalize_spread: if *spread >= std::f32::consts::PI {
+                        0.0
+                    } else {
+                        let half = 0.5 * spread.max(0.0);
+                        if half > 0.05 {
+                            1.0 / (half.tan() - half)
+                        } else if half > 0.0 {
+                            3.0 / half.powi(3)
+                        } else {
+                            f32::MAX
+                        }
+                    },
                     ies_data: 0,
                     ies_n_v: 0,
                     ies_n_h: 0,
@@ -650,6 +683,11 @@ fn build_mesh_lights(
             .get(mi)
             .ok_or_else(|| anyhow!("mesh_lights: mesh {} out of range", mi))?;
         let obj_desc = &file.objects[oi];
+        // Curve emission is reached by BSDF sampling, as in Cycles. Surface
+        // triangle light tables cannot represent a swept sphere segment.
+        if !mesh.curve_radii.is_empty() {
+            continue;
+        }
 
         // Resolve per-triangle material: when the mesh carries
         // `material_indices` it indexes into ObjectDesc::materials; otherwise
@@ -1152,6 +1190,34 @@ fn load_mesh<'a>(desc: &MeshDesc, blobs: &[&'a [u8]]) -> Result<LoadedMesh<'a>> 
         None => Cow::Owned(Vec::new()),
     };
 
+    let curve_radii = match desc.curve_radii {
+        Some(idx) => cast_f32_slice(lookup_blob(blobs, idx)?),
+        None => Cow::Owned(Vec::new()),
+    };
+    anyhow::ensure!(
+        indices.iter().all(|&i| (i as usize) < vertices.len() / 3),
+        "mesh vertex index out of bounds"
+    );
+    if desc.curve_radii.is_some() {
+        anyhow::ensure!(
+            curve_radii.len() == vertices.len() / 3 && !curve_radii.is_empty(),
+            "curve radii must contain one value per key"
+        );
+        anyhow::ensure!(
+            curve_radii.iter().all(|r| r.is_finite() && *r >= 0.0),
+            "curve radii must be finite and nonnegative"
+        );
+        anyhow::ensure!(
+            vertices.iter().all(|v| v.is_finite()),
+            "curve keys must be finite"
+        );
+        anyhow::ensure!(
+            indices
+                .chunks_exact(3)
+                .all(|i| i[1] == i[0] + 1 && i[2] == i[0]),
+            "curve segments must use adjacent keys"
+        );
+    }
     if indices.len() % 3 != 0 {
         return Err(anyhow!("mesh index count is not a multiple of 3"));
     }
@@ -1208,6 +1274,7 @@ fn load_mesh<'a>(desc: &MeshDesc, blobs: &[&'a [u8]]) -> Result<LoadedMesh<'a>> 
         vertex_colors,
         vertex_alphas,
         tangents,
+        curve_radii,
     })
 }
 

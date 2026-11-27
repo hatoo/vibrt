@@ -45,11 +45,9 @@ except ValueError as error:
 
 hair = tree.nodes.new("ShaderNodeBsdfHairPrincipled")
 hair.model = "HUANG"
-try:
-    shader_graph.compile_leaf(hair, BinWriter(), [])
-    raise AssertionError("Unverified Huang mode was accepted")
-except shader_graph.UnsupportedNode as error:
-    assert "Huang" in str(error)
+result = shader_graph.compile_leaf(hair, BinWriter(), [])
+assert result['closure_type'] == 6
+assert {'hair_roughness_v', 'hair_coat', 'hair_transmission', 'hair_secondary'} <= set(result['shader_graph']['outputs'])
 for kind in ("ShaderNodePointInfo", "ShaderNodeVolumeInfo"):
     node = tree.nodes.new(kind)
     try:
@@ -98,7 +96,7 @@ for instance in depsgraph.object_instances:
         instances.append(attributes["particle:Index"][0])
 assert sorted(instances) == [0, 1, 2, 3], instances
 
-# Hair attributes follow the emitted ribbon's corners, including its full width.
+# Hair attributes follow native curve keys, including the authored full width.
 bpy.ops.mesh.primitive_plane_add(size=2)
 emitter = bpy.context.object
 emitter.data.materials.append(material)
@@ -111,6 +109,7 @@ settings.hair_step = 2
 settings.radius_scale = 0.01
 settings.root_radius = 1
 settings.tip_radius = 0.5
+settings.use_close_tip = False
 bpy.context.scene.frame_set(1)
 depsgraph = bpy.context.evaluated_depsgraph_get()
 keys = {
@@ -127,8 +126,9 @@ result = hair_export.export_hair(
     emitter.name,
     {material.name: keys},
 )
-assert result is not None
-mesh, _ = result
+assert len(result) == 1
+mesh, _ = result[0]
+assert 'curve_radii' in mesh
 attributes = {
     name: writer.mesh_blobs[index].reshape(-1, 4)
     for name, index in mesh["attributes"].items()
@@ -154,6 +154,49 @@ np.testing.assert_allclose(
 assert np.all(
     (attributes["hair:Random"][:, 0] >= 0) & (attributes["hair:Random"][:, 0] < 1)
 )
+# Child shape is Blender's evaluated cache, including curl, rather than an
+# approximation reconstructed from parent paths.
+settings.child_type = "SIMPLE"
+settings.child_percent = 3
+settings.kink = "CURL"
+settings.kink_amplitude = 0.05
+settings.kink_frequency = 2
+bpy.context.scene.frame_set(2)
+depsgraph = bpy.context.evaluated_depsgraph_get()
+evaluated = emitter.evaluated_get(depsgraph)
+system = evaluated.particle_systems[0]
+children = len(system.child_particles)
+assert children > 0
+writer = BinWriter()
+pairs = hair_export.export_hair(emitter, evaluated, bpy.context.scene, writer,
+                                lambda _: 0, emitter.name, depsgraph=depsgraph)
+mesh, _ = pairs[0]
+points = writer.mesh_blobs[mesh['vertices']].reshape(-1, 3)
+steps = (1 << settings.display_step) + 1
+assert len(points) == children * steps
+expected = np.asarray([system.co_hair(evaluated, particle_no=len(system.particles), step=i)
+                       for i in range(steps)], np.float32)
+inverse = np.asarray(evaluated.matrix_world.inverted(), np.float32)
+np.testing.assert_allclose(points[:steps], expected @ inverse[:3, :3].T + inverse[:3, 3], atol=1e-6)
+# Hiding the emitter surface must retain its evaluated hair and visibility.
+import vibrt_blender
+vibrt_blender.register()
+hair_scene = bpy.data.scenes.new("Hair without emitter")
+bpy.context.window.scene = hair_scene
+bpy.ops.mesh.primitive_plane_add(size=2)
+emitter = bpy.context.object
+emitter.show_instancer_for_render = False
+emitter.visible_camera = False
+bpy.ops.object.particle_system_add()
+settings = emitter.particle_systems[0].settings
+settings.type, settings.count, settings.hair_length = "HAIR", 2, 1
+settings.radius_scale = 0.01
+bpy.ops.object.camera_add(location=(0, 0, 4))
+hair_scene.camera = bpy.context.object
+hair_scene.frame_set(1)
+desc, _, _ = exporter.export_scene_to_memory(bpy.context.evaluated_depsgraph_get(), serialize=False)
+assert len(desc['meshes']) == 1 and 'curve_radii' in desc['meshes'][0]
+assert len(desc['objects']) == 1 and not desc['objects'][0]['camera_visible']
 print(
     "[node-exports] 5 volume phases, phase mixing, unsupported modes, particles and hair passed",
     flush=True,

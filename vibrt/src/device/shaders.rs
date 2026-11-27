@@ -14,7 +14,10 @@ pub struct CompiledShaders {
     pub miss_shadow: ProgramGroup,
     pub hit_radiance: ProgramGroup,
     pub hit_shadow: ProgramGroup,
+    pub curve_radiance: ProgramGroup,
+    pub curve_shadow: ProgramGroup,
     _module: Module,
+    _curve_module: Module,
     pub ptx_time: Duration,
     pub pipeline_time: Duration,
 }
@@ -37,7 +40,7 @@ pub fn compile(
         .traversable_graph_flags(TraversableGraphFlags::ALLOW_SINGLE_LEVEL_INSTANCING)
         .num_payload_values(2)
         .num_attribute_values(2)
-        .uses_primitive_type_flags(PrimitiveTypeFlags::TRIANGLE);
+        .uses_primitive_type_flags(PrimitiveTypeFlags::TRIANGLE | PrimitiveTypeFlags::ROUND_LINEAR);
 
     let module_opts = ModuleCompileOptions::default();
     let module = Module::new(ctx, &module_opts, &pipeline_options, ptx_src.as_bytes())
@@ -65,12 +68,32 @@ pub fn compile(
         .build()
         .context("hitgroup shadow")?
         .value;
+    let curve_module = Module::builtin_is(
+        ctx,
+        &module_opts,
+        &pipeline_options,
+        PrimitiveType::RoundLinear,
+    )?;
+    let curve_radiance = ProgramGroup::hitgroup(ctx)
+        .closest_hit(&module, "__closesthit__ch")
+        .any_hit(&module, "__anyhit__ah")
+        .intersection(&curve_module, "")
+        .build()?
+        .value;
+    let curve_shadow = ProgramGroup::hitgroup(ctx)
+        .closest_hit(&module, "__closesthit__shadow")
+        .any_hit(&module, "__anyhit__ah")
+        .intersection(&curve_module, "")
+        .build()?
+        .value;
     let all_pgs: Vec<&ProgramGroup> = vec![
         &raygen_pg,
         &miss_rg_pg,
         &miss_shadow_pg,
         &hit_rg_pg,
         &hit_shadow_pg,
+        &curve_radiance,
+        &curve_shadow,
     ];
     let pipeline = Pipeline::new(
         ctx,
@@ -91,7 +114,10 @@ pub fn compile(
         miss_shadow: miss_shadow_pg,
         hit_radiance: hit_rg_pg,
         hit_shadow: hit_shadow_pg,
+        curve_radiance,
+        curve_shadow,
         _module: module,
+        _curve_module: curve_module,
         ptx_time,
         pipeline_time: t_pipeline.elapsed(),
     })

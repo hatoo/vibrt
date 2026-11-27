@@ -59,6 +59,18 @@ static __forceinline__ __device__ float luminance(float3 c) {
   return 0.2126f * c.x + 0.7152f * c.y + 0.0722f * c.z;
 }
 
+static __device__ int cdf_search(const float *cdf, int n, float r) {
+  int lo = 0, hi = n - 1;
+  while (lo < hi) {
+    int mid = (lo + hi) >> 1;
+    if (cdf[mid + 1] < r)
+      lo = mid + 1;
+    else
+      hi = mid;
+  }
+  return lo;
+}
+
 static __forceinline__ __device__ void build_frame(float3 n, float3 &t,
                                                    float3 &b) {
   float s = n.z >= 0.0f ? 1.0f : -1.0f;
@@ -68,42 +80,22 @@ static __forceinline__ __device__ void build_frame(float3 n, float3 &t,
   b = make_float3(bb, s + n.y * n.y * a, -n.y);
 }
 
-// ---------- Texture sampling (bilinear) ----------
+// All packed texture reads share Cycles' interpolation and address modes.
+static __device__ vibrt_cycles::float4 sample_image(const float *data, int w, int h,
+                                                   int channels, float u, float v,
+                                                   bool equirectangular = false) {
+  vibrt_image::ImageView view{data, channels, false, equirectangular};
+  vibrt_image::KernelImageInfo info{w, h, equirectangular ? vibrt_image::EXTENSION_CLIP
+                                                       : vibrt_image::EXTENSION_REPEAT,
+                                   vibrt_image::INTERPOLATION_LINEAR, &view};
+  return vibrt_image::Interpolator::interp(info, u, v);
+}
 static __device__ float3 sample_rgba(const float *data, int w, int h,
                                      int channels, float2 uv) {
   if (data == nullptr || w <= 0 || h <= 0)
     return make_float3(1, 1, 1);
-  float u = uv.x - floorf(uv.x);
-  float v = uv.y - floorf(uv.y);
-  float fx = u * (float)w - 0.5f;
-  // Blender's image.pixels (and what the exporter writes to the bin) is
-  // bottom-up: buffer row 0 is the bottom of the image. Blender UV v=0 is
-  // also the bottom, so no flip on the y axis.
-  float fy = v * (float)h - 0.5f;
-  int x0 = (int)floorf(fx);
-  int y0 = (int)floorf(fy);
-  float dx = fx - (float)x0;
-  float dy = fy - (float)y0;
-  auto wrap = [](int v, int m) {
-    int r = v % m;
-    return r < 0 ? r + m : r;
-  };
-  int x1 = wrap(x0 + 1, w);
-  int y1 = wrap(y0 + 1, h);
-  x0 = wrap(x0, w);
-  y0 = wrap(y0, h);
-  auto fetch = [&](int x, int y) {
-    const float *p = &data[(y * w + x) * channels];
-    return channels <= 2 ? make_float3(p[0], p[0], p[0])
-                         : make_float3(p[0], p[1], p[2]);
-  };
-  float3 c00 = fetch(x0, y0);
-  float3 c10 = fetch(x1, y0);
-  float3 c01 = fetch(x0, y1);
-  float3 c11 = fetch(x1, y1);
-  float3 c0 = c00 * (1.0f - dx) + c10 * dx;
-  float3 c1 = c01 * (1.0f - dx) + c11 * dx;
-  return c0 * (1.0f - dy) + c1 * dy;
+  auto c = sample_image(data, w, h, channels, uv.x, uv.y);
+  return make_float3(c.x, c.y, c.z);
 }
 
 // Native-vector adapter for the shared Cycles GGX sampler used by SSS.
@@ -121,3 +113,4 @@ static __forceinline__ __device__ float3 offset_surface(float3 P, float3 N, floa
       vibrt_cycles::ray_offset(cycles_vector(P), cycles_vector(dot3(N, D) >= 0 ? N : -N));
   return make_float3(shifted.x, shifted.y, shifted.z);
 }
+static __device__ float3 transform_normal(const float *inverse, float3 v);

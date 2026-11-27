@@ -53,3 +53,15 @@ Adapted upstream from Open Shading Language.
 
 Voronoi portions (MIT):
 Copyright (c) 2013 Inigo Quilez.
+
+Cycles round linear curve intersections (Apache-2.0):
+Copyright 2009-2021 Intel Corporation.
+Adapted upstream from Embree; kernel/geom/curve_intersect.h supplies
+cone/sphere and linear-curve intersections for vibrt's software query BVH.
+
+Additional Cycles kernels (Apache-2.0, Blender Foundation/Blender Authors):
+Huang hair, light sampling/spread and light-tree SAOH construction, image
+interpolation, camera apertures, film filter CDFs, compact differentials,
+SVM bump/normal-map/wireframe, Bevel profiles, adaptive sampling, shadow
+transparency and equiangular volume sampling. The adapters replace Blender
+scene storage and kernel globals; the pinned submodule is not modified.

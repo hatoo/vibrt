@@ -32,14 +32,22 @@ VN_INLINE float3 xyz(float4 v) { return make_float3(v); }
 // Cycles' color/melanin parametrizations, followed by its unmodified Chiang
 // closure.
 VN_INLINE float3 hair_absorption(float3 reflectance, float roughness) {
-  float r = roughness;
-  float scale =
-      (((((0.245f * r) + 5.574f) * r - 10.73f) * r + 2.532f) * r - 0.215f) * r +
-      5.969f;
-  float3 result;
-  for (int i = 0; i < 3; i++)
-    result[i] = sqr(logf(fmaxf(reflectance[i], 1e-20f)) / scale);
-  return result;
+  return bsdf_principled_hair_sigma_from_reflectance(max(reflectance, make_float3(1e-20f)),
+                                                    roughness);
+}
+VN_INLINE float3 hair_sigma(float3 color_value, float3 absorption, float radial,
+                            float random, float random_color, float melanin,
+                            float redness, float3 tint, int parametrization) {
+  if (parametrization == 0)
+    return hair_absorption(color_value, radial);
+  if (parametrization == 1) {
+    melanin *= (1 + 2 * (random - 0.5f) * clamp(random_color, 0, 1));
+    melanin = -logf(fmaxf(1 - melanin, 0.0001f));
+    return bsdf_principled_hair_sigma_from_concentration(melanin * (1 - redness),
+                                                        melanin * redness) +
+           hair_absorption(tint, radial);
+  }
+  return absorption;
 }
 VN_INLINE ChiangHairBSDF
 chiang_setup(ShaderData &sd, float3 color_value, float3 absorption,
@@ -53,35 +61,17 @@ chiang_setup(ShaderData &sd, float3 color_value, float3 absorption,
   b.alpha = offset;
   b.eta = fmaxf(ior, 1.0001f);
   b.m0_roughness = 1 - clamp(coat, 0, 1);
-  b.sigma = absorption;
-  if (parametrization == 0)
-    b.sigma = hair_absorption(color_value, b.s);
-  if (parametrization == 1) {
-    melanin *= (1 + 2 * (random - 0.5f) * clamp(random_color, 0, 1));
-    melanin = -logf(fmaxf(1 - melanin, 0.0001f));
-    b.sigma = melanin * ((1 - redness) * make_float3(0.506f, 0.841f, 1.653f) +
-                         redness * make_float3(0.343f, 0.733f, 1.924f)) +
-              hair_absorption(tint, b.s);
-  }
+  b.sigma = hair_sigma(color_value, absorption, b.s, random, random_color,
+                       melanin, redness, tint, parametrization);
   bsdf_hair_chiang_setup(&sd, &b);
   return b;
 }
 // Cycles svm/bevel.h cubic radial profile (Apache-2.0), v5.1.1.
 VN_INLINE float bevel_cubic_radius(float u) {
-  float x = 0.25f;
-  for (int i = 0; i < 10; ++i) {
-    float x2 = x * x, x3 = x2 * x;
-    float f = 10 * x2 - 20 * x3 + 15 * x3 * x - 4 * x3 * x2 - u;
-    if (fabsf(f) < 1e-6f)
-      break;
-    float t = 1 - x;
-    x = clamp(x - f / fmaxf(20 * x * t * t * t, 1e-8f), 0.0f, 1.0f);
-  }
-  return x;
+  return svm_bevel_cubic_quintic_root_find(u);
 }
 VN_INLINE float bevel_cubic_pdf(float radius, float distance) {
-  float x = fmaxf(1 - distance / radius, 0.0f);
-  return 10 * x * x * x / (M_PI_F * radius * radius);
+  return radius > 0 ? svm_bevel_cubic_pdf(radius, distance) : 0;
 }
 VN_INLINE float volume_phase_pdf(unsigned int type, const float *p, float g,
                                  float cosine) {
@@ -139,6 +129,8 @@ struct SceneServices {
 #ifdef __CUDACC__
 VN_INLINE float4 scene_node(const ShaderInstruction &node, const float4 *slots,
                             const float4 *ctx, const SceneServices &services);
+VN_INLINE vibrt_scene_nodes::ShaderData normal_map_data(const float4 *ctx, float4 tangent,
+                                                        bool named, const SceneServices &services);
 #endif
 VN_INLINE float luminance(float3 v) { return 0.2126f * v.x + 0.7152f * v.y + 0.0722f * v.z; }
 VN_INLINE float fresnel(float cosi, float eta) {
@@ -182,60 +174,10 @@ VN_INLINE float3 vector_transform(float3 v, const float4 *ctx, int type, int fro
     v = transform(v, ctx + 28, point);
   return normal ? safe_normalize(v) : v;
 }
-VN_INLINE int tex_index(int i, int n, int extension) {
-  if ((unsigned int)i < (unsigned int)n)
-    return i;
-  if (extension == 0) {
-    // Texture dimensions are commonly powers of two. Masking also gives the
-    // correct positive remainder for negative coordinates without integer division.
-    if ((n & (n - 1)) == 0)
-      return i & (n - 1);
-    i %= n;
-    return i < 0 ? i + n : i;
-  }
-  if (extension == 3) {
-    if ((n & (n - 1)) == 0)
-      i &= n * 2 - 1;
-    else
-      i %= n * 2;
-    if (i < 0)
-      i += n * 2;
-    return i < n ? i : 2 * n - 1 - i;
-  }
-  return min(max(i, 0), n - 1);
-}
-VN_INLINE float4 texel(const ShaderInstruction &n, int x, int y) {
-  if (n.modes[1] == 2 && (x < 0 || y < 0 || x >= n.width || y >= n.height))
-    return make_float4(0);
-  x = tex_index(x, n.width, n.modes[1]);
-  y = tex_index(y, n.height, n.modes[1]);
-  // Image instructions store the channel count in the unused LUT length.
-  int channels = (int)n.table_len;
-  const float *p = (const float *)n.data + channels * (y * n.width + x);
-  float alpha = channels == 4 ? p[3] : (channels == 2 ? p[1] : 1);
-  float a = n.params[2] != 0 ? alpha : 1;
-  return make_float4(p[0] * a, (channels <= 2 ? p[0] : p[1]) * a,
-                     (channels <= 2 ? p[0] : p[2]) * a, alpha);
-}
 VN_INLINE float4 image_sample_raw(const ShaderInstruction &n, float3 v) {
-  if (n.modes[0] == 1)
-    return texel(n, (int)floorf(v.x * n.width), (int)floorf(v.y * n.height));
-  float x = v.x * n.width - 0.5f, y = v.y * n.height - 0.5f;
-  int ix = (int)floorf(x), iy = (int)floorf(y);
-  float tx = x - ix, ty = y - iy;
-  if (n.modes[0] >= 2) {
-    float wx[4] = {powf(1 - tx, 3) / 6, (3 * tx * tx * tx - 6 * tx * tx + 4) / 6,
-                   (-3 * tx * tx * tx + 3 * tx * tx + 3 * tx + 1) / 6, tx * tx * tx / 6};
-    float wy[4] = {powf(1 - ty, 3) / 6, (3 * ty * ty * ty - 6 * ty * ty + 4) / 6,
-                   (-3 * ty * ty * ty + 3 * ty * ty + 3 * ty + 1) / 6, ty * ty * ty / 6};
-    float4 r = make_float4(0);
-    for (int j = 0; j < 4; j++)
-      for (int i = 0; i < 4; i++)
-        r += texel(n, ix + i - 1, iy + j - 1) * (wx[i] * wy[j]);
-    return r;
-  }
-  return mix(mix(texel(n, ix, iy), texel(n, ix + 1, iy), tx),
-             mix(texel(n, ix, iy + 1), texel(n, ix + 1, iy + 1), tx), ty);
+  vibrt_image::ImageView data{(const float *)n.data, (int)n.table_len, n.params[2] != 0, false};
+  vibrt_image::KernelImageInfo info{n.width, n.height, (int)n.modes[1], (int)n.modes[0], &data};
+  return vibrt_image::Interpolator::interp(info, v.x, v.y);
 }
 VN_INLINE float4 image_sample(const ShaderInstruction &n, float3 v) {
   float4 r = image_sample_raw(n, v);
@@ -716,43 +658,41 @@ VN_INLINE void evaluate_vm(const ShaderInstruction *nodes, int count,
 #endif
 #if (VIBRT_SHADER_OPS & (1ull << 32))
     case 32: {
-      float3 nrm = V(0) * 2 - 1;
-      if (m[1])
-        nrm.y = -nrm.y;
-      if (m[0] >= 3) {
-        nrm.y = -nrm.y;
-        nrm.z = -nrm.z;
-      }
-      if (m[0] == 0) {
-        float3 N = xyz(ctx[4]), T = xyz(ctx[7]), B = cross(N, T) * ctx[17].x;
-        nrm.x *= S(1);
-        nrm.y *= S(1);
-        nrm.z = mix(1.0f, nrm.z, clamp(S(1), 0, 1));
-        nrm = T * nrm.x + B * nrm.y + N * nrm.z;
-      } else if (m[0] == 1 || m[0] == 3)
-        nrm = vector_transform(nrm, ctx, 2, 1, 0);
-      if (ctx[16].x != 0 && m[0] != 0)
-        nrm = -nrm;
-      nrm = safe_normalize(nrm);
+      vibrt_scene_nodes::ShaderData sd = {};
+      sd.N = sd.Ng = sd.normal = xyz(ctx[4]);
+      sd.flag = ctx[16].x != 0 ? vibrt_scene_nodes::SD_BACKFACING : 0;
+      float4 tangent = make_float4(xyz(ctx[7]), ctx[17].x);
+      sd.tangent = xyz(tangent);
+      sd.sign = tangent.w;
+      sd.world_basis = m[0] == 0;
+      sd.object_to_world = ctx + 22; sd.world_to_object = ctx + 25;
+#ifdef __CUDACC__
+      if (services)
+        sd = normal_map_data(ctx, tangent, false, *services);
       if (m[0] != 0)
-        nrm = safe_normalize(mix(xyz(ctx[4]), nrm, fmaxf(S(1), 0)));
-      if (dot(nrm, nrm) == 0)
-        nrm = xyz(ctx[4]);
-      r = color(nrm);
+        sd.world_basis = false;
+#endif
+      r = color(vibrt_scene_nodes::normal_map(sd, V(0), S(1), m[0],
+                                             m[1] != 0, m[2] != 0));
       break;
     }
 #endif
 #if (VIBRT_SHADER_OPS & (1ull << 48))
     case 48: {
-      float3 nrm = V(0) * 2 - 1, N = xyz(ctx[4]), T = V(2);
-      if (m[0])
-        nrm.y = -nrm.y;
-      float3 B = cross(N, T) * A(2).w;
-      nrm.x *= S(1);
-      nrm.y *= S(1);
-      nrm.z = mix(1.0f, nrm.z, clamp(S(1), 0, 1));
-      nrm = safe_normalize(T * nrm.x + B * nrm.y + N * nrm.z);
-      r = color(dot(nrm, nrm) > 0 ? nrm : N);
+      vibrt_scene_nodes::ShaderData sd = {};
+      sd.N = sd.Ng = sd.normal = xyz(ctx[4]);
+      sd.flag = ctx[16].x != 0 ? vibrt_scene_nodes::SD_BACKFACING : 0;
+      float4 tangent = A(2);
+      sd.tangent = xyz(tangent);
+      sd.sign = tangent.w;
+      sd.world_basis = true;
+
+#ifdef __CUDACC__
+      if (services)
+        sd = normal_map_data(ctx, tangent, true, *services);
+#endif
+      r = color(vibrt_scene_nodes::normal_map(sd, V(0), S(1), 0,
+                                             m[0] != 0, m[1] != 0));
       break;
     }
 #endif

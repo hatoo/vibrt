@@ -24,6 +24,7 @@ s.render.resolution_x = s.render.resolution_y = 16
 s.render.resolution_percentage = 100
 s.vibrt_clamp_indirect = 0
 s.cycles.max_bounces = 2
+s.cycles.use_adaptive_sampling = False
 s.cycles.sample_clamp_direct = s.cycles.sample_clamp_indirect = 0
 s.cycles.blur_glossy = 0
 world = bpy.data.worlds.new("Black")

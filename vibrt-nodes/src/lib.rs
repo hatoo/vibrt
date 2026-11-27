@@ -4,6 +4,7 @@
 //! the same color implementation; atmosphere models are compiled for the CPU.
 //! This crate has no Blender, Python, CUDA-driver or OptiX dependency.
 
+pub mod camera;
 pub mod color;
 pub mod fold;
 pub mod graph;

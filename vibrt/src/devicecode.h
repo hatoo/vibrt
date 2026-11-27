@@ -180,6 +180,7 @@ struct HitGroupData {
   float *vertex_colors; // f32x3 per vertex, nullptr if absent
   float *vertex_alphas; // f32 per vertex, nullptr means one
   float *tangents;      // f32x3 per vertex (object space), nullptr if absent
+  float *curve_radii;
   float bounds_min[3];
   float bounds_max[3];
   float object_to_world[12];
@@ -229,6 +230,8 @@ struct SpotLight {
   unsigned int ies_n_h;
   float light_rotation[9];
   unsigned int sphere;
+  float world_to_light[9];
+  float cos_larger_spread;
 };
 
 struct AreaRectLight {
@@ -244,6 +247,8 @@ struct AreaRectLight {
   unsigned int camera_visible;
   float emission[3];
   float power;
+  float tan_half_spread;
+  float normalize_spread;
   // IES profile, same layout as PointLight::ies_data. Sampled in the
   // rect's local frame (theta from local +Z = emission axis).
   float *ies_data;
@@ -316,12 +321,17 @@ struct LaunchParams {
   unsigned int num_aovs;
   float *image; // float4 per pixel
   float *accumulation; // unnormalized float4 RGB/transparency sums
+  float *adaptive_buffer; // Cycles combined, adaptive aux and bit-encoded count (stride 9)
+  unsigned int adaptive_phase;
+  unsigned int adaptive_min_samples;
+  float adaptive_threshold;
   unsigned int width;
   unsigned int height;
   unsigned int samples_per_pixel;
   unsigned int sample_start;
   unsigned int sample_count;
   unsigned int film_transparent;
+  unsigned int has_shadow_transparency;
   unsigned int max_depth;
   // Per-lobe bounce caps mirroring Cycles' diffuse/glossy/transmission
   // limits. Once a path has consumed its quota of one lobe type the
@@ -339,6 +349,10 @@ struct LaunchParams {
   float cam_v[3];
   float cam_w[3];
   float cam_lens_radius;
+  float cam_aperture_blades;
+  float cam_aperture_rotation;
+  float cam_inv_aperture_ratio;
+  const float *cam_filter_table;
   float cam_focal_distance;
   // Near/far clip distances along the primary ray. Matches Cycles'
   // Camera Clip Start / Clip End — lone_monk's 1.12 m clip_start is
