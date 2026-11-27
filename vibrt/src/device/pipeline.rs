@@ -1,5 +1,6 @@
 //! Assemble and cache device-code compilation.
 
+use crate::material::ShaderRequirements;
 use anyhow::Result;
 
 pub fn find_optix_include() -> String {
@@ -23,15 +24,20 @@ pub fn find_optix_include() -> String {
     panic!("OptiX SDK not found. Set OPTIX_ROOT.");
 }
 
-pub fn compile_ptx(
-    shader_ops: u64,
-    max_closures: usize,
-    shader_stack_size: usize,
-    closure_types: u32,
-    shader_output_count: usize,
-    has_aovs: bool,
-    has_extended_phases: bool,
-) -> Result<String> {
+pub fn compile_ptx(requirements: ShaderRequirements) -> Result<String> {
+    let ShaderRequirements {
+        shader_ops,
+        max_closures,
+        shader_stack_size,
+        shader_contexts,
+        closure_types,
+        shader_output_count,
+        has_aovs,
+        has_extended_phases,
+    } = requirements;
+    // Context indices keep their shared ABI; omit unused trailing storage and
+    // let NVRTC remove preparation branches outside this scene's union mask.
+    let shader_context_size = (u32::BITS - shader_contexts.leading_zeros()).max(1);
     // Include expansion also works in Windows checkouts using CRLF endings.
     let mut cu_src = include_str!("../devicecode.cu").replace("\r\n", "\n");
     cu_src = cu_src.replace("#include \"device/math.h\"\n", include_str!("math.h"));
@@ -77,7 +83,7 @@ pub fn compile_ptx(
         ..Default::default()
     };
     let full_src = format!(
-        "#define VIBRT_SHADER_OPS {shader_ops}ull\n#define VIBRT_MAX_CLOSURES {max_closures}\n#define VIBRT_SHADER_STACK_SIZE {shader_stack_size}\n#define VIBRT_CLOSURE_TYPES {closure_types}u\n#define VIBRT_SHADER_OUTPUT_COUNT {shader_output_count}\n#define VIBRT_AOVS {}\n#define VIBRT_EXTENDED_PHASES {}\n// -- inlined devicecode.h --\n{}\n// -- devicecode.cu --\n{}",
+        "#define VIBRT_SHADER_OPS {shader_ops}ull\n#define VIBRT_MAX_CLOSURES {max_closures}\n#define VIBRT_SHADER_STACK_SIZE {shader_stack_size}\n#define VIBRT_SHADER_CONTEXTS {shader_contexts}u\n#define VIBRT_SHADER_CONTEXT_SIZE {shader_context_size}\n#define VIBRT_CLOSURE_TYPES {closure_types}u\n#define VIBRT_SHADER_OUTPUT_COUNT {shader_output_count}\n#define VIBRT_AOVS {}\n#define VIBRT_EXTENDED_PHASES {}\n// -- inlined devicecode.h --\n{}\n// -- devicecode.cu --\n{}",
         u8::from(has_aovs),
         u8::from(has_extended_phases),
         header_src.replace(

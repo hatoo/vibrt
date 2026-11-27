@@ -25,6 +25,7 @@ static __device__ float3 volume_phase_sample(const Volume *vol, float u,
 static __device__ void shader_context(const PathVertex &v, vibrt_cycles::float4 *ctx,
                                       unsigned int mask, int derivative = 0) {
   using vibrt_cycles::make_float4;
+  mask &= VIBRT_SHADER_CONTEXTS;
 #define NEED(I) (mask & (1u << (I)))
 #define CTX_VEC(I,V) if(NEED(I))ctx[I]=make_float4((V).x,(V).y,(V).z,1)
   constexpr float delta = 0.001f;
@@ -96,7 +97,7 @@ static __device__ void shader_context(const PathVertex &v, vibrt_cycles::float4 
 #undef NEED
 }
 static __device__ __noinline__ void evaluate_shader_vm(PrincipledGpu *m,const PathVertex &v,vibrt_cycles::float4 *out,unsigned int requested,int derivative) {
-  vibrt_cycles::float4 ctx[32];shader_context(v,ctx,m->shader_contexts,derivative);
+  vibrt_cycles::float4 ctx[VIBRT_SHADER_CONTEXT_SIZE];shader_context(v,ctx,m->shader_contexts,derivative);
   vibrt_shader::SceneServices services{&v, derivative};
   vibrt_shader::evaluate_vm((const ShaderInstruction *)m->shader_nodes,
                             m->shader_len, ctx, out, requested, &services);

@@ -27,15 +27,7 @@ pub fn compile(
     anyhow::ensure!(!progress.cancelled(), "shader compilation cancelled");
     progress.log("Preparing shader code...");
     let t_ptx = Instant::now();
-    let ptx_src = pipeline::compile_ptx(
-        requirements.shader_ops,
-        requirements.max_closures,
-        requirements.shader_stack_size,
-        requirements.closure_types,
-        requirements.shader_output_count,
-        requirements.has_aovs,
-        requirements.has_extended_phases,
-    )?;
+    let ptx_src = pipeline::compile_ptx(requirements)?;
     let ptx_time = t_ptx.elapsed();
     anyhow::ensure!(!progress.cancelled(), "shader compilation cancelled");
     progress.log("Compiling OptiX pipeline...");

@@ -39,6 +39,7 @@ pub struct ShaderRequirements {
     pub shader_ops: u64,
     pub max_closures: usize,
     pub shader_stack_size: usize,
+    pub shader_contexts: u32,
     pub closure_types: u32,
     pub shader_output_count: usize,
     pub has_aovs: bool,
@@ -51,14 +52,16 @@ impl ShaderRequirements {
         aov_count: usize,
         world_volume: Option<&VolumeParams>,
     ) -> Result<Self> {
-        fn validate_volume(v: &VolumeParams, stack: &mut usize) -> Result<()> {
+        fn validate_volume(v: &VolumeParams, stack: &mut usize, contexts: &mut u32) -> Result<()> {
             anyhow::ensure!(
                 v.phase <= 4 && v.phase_params.iter().all(|x| x.is_finite()),
                 "Invalid volume phase parameters"
             );
             if let Some(graph) = &v.emission_graph {
                 *stack = (*stack).max(graph.required_stack_size()?);
-                anyhow::ensure!(graph.required_contexts()? & !((1 << 20) | (1 << 21)) == 0,
+                let mask = graph.required_contexts()?;
+                *contexts |= mask;
+                anyhow::ensure!(mask & !((1 << 20) | (1 << 21)) == 0,
                     "Homogeneous volume emission supports ray flags; spatial/depth-dependent emission requires heterogeneous volume transport");
                 anyhow::ensure!(
                     graph.outputs.len() == 1 && graph.outputs.contains_key("emission"),
@@ -71,11 +74,13 @@ impl ShaderRequirements {
             material: &PrincipledMaterial,
             depth: usize,
             shader_stack_size: &mut usize,
+            shader_contexts: &mut u32,
             aov_count: usize,
         ) -> Result<usize> {
             anyhow::ensure!(depth <= 8, "Material shader tree exceeds 8 levels");
             if let Some(graph) = &material.shader_graph {
                 *shader_stack_size = (*shader_stack_size).max(graph.required_stack_size()?);
+                *shader_contexts |= graph.required_contexts()?;
             }
             for aov in &material.aov_graphs {
                 anyhow::ensure!(
@@ -87,20 +92,33 @@ impl ShaderRequirements {
                     "AOV graph requires a base_color output"
                 );
                 *shader_stack_size = (*shader_stack_size).max(aov.graph.required_stack_size()?);
+                *shader_contexts |= aov.graph.required_contexts()?;
             }
             if let Some(volume) = &material.volume {
-                validate_volume(volume, shader_stack_size)?;
+                validate_volume(volume, shader_stack_size, shader_contexts)?;
             }
             let leaves = match (&material.left_subtree, &material.secondary) {
                 (None, None) => 1,
                 (left, right) => {
                     let l = if let Some(c) = left {
-                        validate_shader_tree(c, depth + 1, shader_stack_size, aov_count)?
+                        validate_shader_tree(
+                            c,
+                            depth + 1,
+                            shader_stack_size,
+                            shader_contexts,
+                            aov_count,
+                        )?
                     } else {
                         1
                     };
                     let r = if let Some(c) = right {
-                        validate_shader_tree(c, depth + 1, shader_stack_size, aov_count)?
+                        validate_shader_tree(
+                            c,
+                            depth + 1,
+                            shader_stack_size,
+                            shader_contexts,
+                            aov_count,
+                        )?
                     } else {
                         1
                     };
@@ -112,16 +130,18 @@ impl ShaderRequirements {
         }
         let mut max_closures = 1;
         let mut shader_stack_size = 1;
+        let mut shader_contexts = 0;
         for material in materials {
             max_closures = max_closures.max(validate_shader_tree(
                 material,
                 0,
                 &mut shader_stack_size,
+                &mut shader_contexts,
                 aov_count,
             )?);
         }
         if let Some(volume) = &world_volume {
-            validate_volume(volume, &mut shader_stack_size)?;
+            validate_volume(volume, &mut shader_stack_size, &mut shader_contexts)?;
         }
         fn shader_operations(material: &PrincipledMaterial) -> u64 {
             let mut flags = 0;
@@ -228,6 +248,7 @@ impl ShaderRequirements {
             shader_ops,
             max_closures,
             shader_stack_size: shader_stack_size.max(4).next_power_of_two(),
+            shader_contexts,
             closure_types,
             shader_output_count,
             has_aovs: aov_count > 0,
@@ -261,6 +282,8 @@ mod tests {
         let bounded = ShaderRequirements::new(&[material], 0, None).unwrap();
         assert_ne!(world.shader_ops, 0);
         assert_eq!(world.shader_ops, bounded.shader_ops);
+        assert_eq!(world.shader_contexts, 1 << 20);
+        assert_eq!(bounded.shader_contexts, world.shader_contexts);
         volume.emission_graph.as_mut().unwrap().nodes[0].modes[0] = 3;
         assert!(ShaderRequirements::new(&[], 0, Some(&volume)).is_err());
     }
@@ -274,6 +297,63 @@ mod tests {
         let requirements = ShaderRequirements::new(&[material], 0, None).unwrap();
         assert!(requirements.scene_queries());
         assert_eq!(requirements.shader_output_count, 64);
+    }
+
+    #[test]
+    fn context_requirements_cover_nested_materials_aovs_and_implicit_reads() {
+        let context_graph = |slot| {
+            json!({"nodes":[{"op":"context","modes":[slot,0,0,0]}],
+                   "outputs":{"base_color":0}})
+        };
+        let material: PrincipledMaterial = serde_json::from_value(json!({
+            "base_color":[1,1,1], "shader_graph":context_graph(0),
+            "left_subtree":{
+                "base_color":[1,1,1], "shader_graph":context_graph(31)
+            },
+            "secondary":{
+                "base_color":[1,1,1],
+                "shader_graph":{"nodes":[
+                    {"op":"constant","params":[0,0,1,1]},
+                    {"op":"fresnel","inputs":[0,0]}
+                ],"outputs":{"base_color":1}},
+                "aov_graphs":[{"index":0,"graph":context_graph(12)}],
+                "volume":{"emission_graph":{
+                    "nodes":[{"op":"context","modes":[21,0,0,0]}],
+                    "outputs":{"emission":0}
+                }}
+            }
+        }))
+        .unwrap();
+        let requirements = ShaderRequirements::new(&[material], 1, None).unwrap();
+        assert_eq!(
+            requirements.shader_contexts,
+            (1 << 0) | (1 << 6) | (1 << 12) | (1 << 16) | (1 << 21) | (1 << 31)
+        );
+    }
+
+    #[test]
+    fn context_only_edits_change_the_shader_cache_key() {
+        let mut material: PrincipledMaterial = serde_json::from_value(json!({
+            "base_color":[1,1,1], "shader_graph":{
+                "nodes":[{"op":"context","modes":[0,0,0,0]}],
+                "outputs":{"base_color":0}
+            }
+        }))
+        .unwrap();
+        let before = ShaderRequirements::new(std::slice::from_ref(&material), 0, None).unwrap();
+        material.shader_graph.as_mut().unwrap().nodes[0].modes[0] = 31;
+        let after = ShaderRequirements::new(&[material], 0, None).unwrap();
+        assert_eq!(before.shader_ops, after.shader_ops);
+        assert_eq!(before.shader_stack_size, after.shader_stack_size);
+        assert_eq!(before.shader_contexts, 1);
+        assert_eq!(after.shader_contexts, 1 << 31);
+        assert_ne!(before, after);
+        assert_eq!(
+            ShaderRequirements::new(&[], 0, None)
+                .unwrap()
+                .shader_contexts,
+            0
+        );
     }
 
     #[test]
