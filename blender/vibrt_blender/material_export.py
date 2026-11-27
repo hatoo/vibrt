@@ -3425,6 +3425,8 @@ def _from_transparent(node, writer, textures, *, context=None) -> dict:
     if context is None:
         context = ExportContext()
     p = _default_params()
+    p["closure_type"] = 8
+    p["alpha_blend"] = 0.0
     p["transmission"] = 1.0
     p["ior"] = 1.0  # no refraction
     p["roughness"] = 0.0
@@ -3432,7 +3434,6 @@ def _from_transparent(node, writer, textures, *, context=None) -> dict:
     if img is not None:
         p["base_color_tex"] = export_image_texture(img, writer, textures, "srgb", chain=chain, context=context)
         p["base_color"] = [1.0, 1.0, 1.0]
-        p["alpha_threshold"] = 0.5
     else:
         p["base_color"] = _socket_rgb(node.inputs["Color"])
     return p

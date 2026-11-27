@@ -352,11 +352,12 @@ class Compiler:
             return self.context(contexts[name])
         if kind == "ShaderNodeBump":
             height = s("Height")
+            filter_width = max(float(n.inputs["Filter Width"].default_value), 1e-5)
             saved = self.offset
             try:
-                self.offset = (saved[0] + 0.001, saved[1])
+                self.offset = (saved[0] + filter_width, saved[1])
                 dx = s("Height")
-                self.offset = (saved[0], saved[1] + 0.001)
+                self.offset = (saved[0], saved[1] + filter_width)
                 dy = s("Height")
             finally:
                 self.offset = saved
@@ -364,7 +365,8 @@ class Compiler:
             return self.add(
                 "bump",
                 [height, dx, dy, s("Strength"), s("Distance"), normal],
-                [int(n.invert)],
+                [int(n.invert), int(getattr(n, "use_object_space", False))],
+                [filter_width],
             )
         if kind == "ShaderNodeDisplacement":
             normal = s("Normal") if n.inputs["Normal"].is_linked else self.context(4)
@@ -447,11 +449,13 @@ class Compiler:
                 return self.add(
                     "normal_map_named",
                     ins("Color", "Strength") + [tangent],
-                    [int(getattr(n, "convention", "OPENGL") == "DIRECTX")],
+                    [int(getattr(n, "convention", "OPENGL") == "DIRECTX"),
+                     int(getattr(n, "use_original_base", False))],
                 )
             return self.add("normal_map", ins("Color", "Strength"),
                             [mode("space", "TANGENT OBJECT WORLD BLENDER_OBJECT BLENDER_WORLD"),
-                             int(getattr(n, "convention", "OPENGL") == "DIRECTX")])
+                             int(getattr(n, "convention", "OPENGL") == "DIRECTX"),
+                             int(getattr(n, "use_original_base", False))])
         if kind == "ShaderNodeNormal":
             return self.add("normal", [s(0) if n.inputs[0].is_linked else self.context(4)], [int(name == "Dot")], list(n.outputs["Normal"].default_value))
         if kind == "ShaderNodeTangent":
@@ -575,10 +579,6 @@ def compile_leaf(node, writer, textures, group_stack=(), *, context=None):
         compiler.attach_attributes(params)
         return params
     if kind == "ShaderNodeBsdfHairPrincipled":
-        if node.model != "CHIANG":
-            raise UnsupportedNode(
-                "Huang hair has unresolved Cycles comparison differences; only Chiang is supported"
-            )
         compiler = Compiler(writer, textures, group_stack, context=context)
         fields = {
             "Color": "base_color",
@@ -594,6 +594,15 @@ def compile_leaf(node, writer, textures, group_stack=(), *, context=None):
             "Melanin Redness": "hair_redness",
             "Tint": "hair_tint",
         }
+        if node.model == "HUANG":
+            del fields["Radial Roughness"]
+            del fields["Coat"]
+            # These sockets share the fixed shader-output ABI with Chiang's
+            # radial roughness/coat, just as in the Cycles SVM closure.
+            fields.update({"Reflection": "hair_roughness_v",
+                           "Aspect Ratio": "hair_coat",
+                           "Transmission": "hair_transmission",
+                           "Secondary Reflection": "hair_secondary"})
         sockets = {s.name: s for s in node.inputs}
         outputs = {
             field: compiler.input(sockets[socket]) for socket, field in fields.items()
@@ -617,7 +626,7 @@ def compile_leaf(node, writer, textures, group_stack=(), *, context=None):
             _enum(node.parametrization, ["COLOR", "MELANIN", "ABSORPTION"])
         )
         params = {
-            "closure_type": 5,
+            "closure_type": 5 if node.model == "CHIANG" else 6,
             "base_color": [1.0] * 3,
             "shader_graph": compiler.graph(outputs),
         }
@@ -703,6 +712,7 @@ def compile_leaf(node, writer, textures, group_stack=(), *, context=None):
         params["transmission"] = 1.0
     elif kind == "ShaderNodeBsdfTransparent":
         params["alpha_blend"] = 0.0
+        params["closure_type"] = 8
     elif kind == "ShaderNodeEmission":
         params.update(base_color=[0.0]*3, pure_diffuse=True, specular_ior_level=0.0)
     strength = node.inputs.get("Emission Strength" if kind == "ShaderNodeBsdfPrincipled" else "Strength")

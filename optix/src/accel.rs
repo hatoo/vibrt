@@ -38,9 +38,22 @@ pub enum AccelEmitProperty {
 /// This enum replaces the raw `OptixBuildInput` union with a type-safe interface.
 pub enum BuildInput<'a> {
     Triangles(TriangleArrayInput<'a>),
+    Curves(CurveArrayInput<'a>),
     Spheres(SphereArrayInput<'a>),
     CustomPrimitives(CustomPrimitiveInput<'a>),
     Instances(InstanceArrayInput),
+}
+
+/// Round linear curves, with one position and radius per key and one start
+/// index per segment. Adjacent keys define each segment.
+pub struct CurveArrayInput<'a> {
+    pub vertex_buffers: &'a [optix_sys::CUdeviceptr],
+    pub radius_buffers: &'a [optix_sys::CUdeviceptr],
+    pub num_vertices: u32,
+    pub index_buffer: optix_sys::CUdeviceptr,
+    pub num_primitives: u32,
+    pub index_stride: u32,
+    pub flags: GeometryFlags,
 }
 
 /// Triangle geometry build input.
@@ -133,6 +146,23 @@ fn build_input_to_raw(input: &BuildInput, raw_flags: &mut Vec<u32>) -> optix_sys
     let mut raw: optix_sys::OptixBuildInput = unsafe { MaybeUninit::zeroed().assume_init() };
 
     match input {
+        BuildInput::Curves(curve) => {
+            raw.type_ = optix_sys::OptixBuildInputType::OPTIX_BUILD_INPUT_TYPE_CURVES;
+            let curves = optix_sys::OptixBuildInputCurveArray {
+                curveType: optix_sys::OptixPrimitiveType::OPTIX_PRIMITIVE_TYPE_ROUND_LINEAR,
+                numPrimitives: curve.num_primitives,
+                vertexBuffers: curve.vertex_buffers.as_ptr(),
+                numVertices: curve.num_vertices,
+                vertexStrideInBytes: 12,
+                widthBuffers: curve.radius_buffers.as_ptr(),
+                widthStrideInBytes: 4,
+                indexBuffer: curve.index_buffer,
+                indexStrideInBytes: curve.index_stride,
+                flag: curve.flags.bits(),
+                ..Default::default()
+            };
+            raw.__bindgen_anon_1 = optix_sys::OptixBuildInput__bindgen_ty_1 { curveArray: curves };
+        }
         BuildInput::Triangles(tri) => {
             raw.type_ = optix_sys::OptixBuildInputType::OPTIX_BUILD_INPUT_TYPE_TRIANGLES;
             let flags_start = raw_flags.len();

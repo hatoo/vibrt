@@ -9,7 +9,15 @@ static __device__ float3 transform_point(const float *m, float3 v) {
 static __device__ float3 transform_normal(const float *inverse, float3 v) {
   return make_float3(inverse[0]*v.x+inverse[4]*v.y+inverse[8]*v.z,inverse[1]*v.x+inverse[5]*v.y+inverse[9]*v.z,inverse[2]*v.x+inverse[6]*v.y+inverse[10]*v.z);
 }
-static __device__ __noinline__ void fill_surface_vertex(PathVertex *v, HitGroupData *hg, unsigned int prim, float2 bary, float3 incoming, float distance, unsigned int flags) {
+static __device__ void surface_differentials(PathVertex *v, float radius) {
+  v->dP = fmaxf(radius, 1e-8f);
+  vibrt_differential::differential_dudv(&v->du, &v->dv, cycles_vector(v->dPdu),
+                                       cycles_vector(v->dPdv),
+                                       vibrt_differential::differential_from_compact(cycles_vector(v->Ng), v->dP),
+                                       cycles_vector(v->Ng));
+}
+static __device__ __noinline__ void fill_surface_vertex(PathVertex *v, HitGroupData *hg, unsigned int prim, float2 bary, float3 incoming, float distance, unsigned int flags, const float3 *hit_point) {
+  bool curve = hg->curve_radii != nullptr;
   v->mat = hg->mat;
   if (hg->material_indices != nullptr && hg->num_materials > 0) {
     unsigned int mi = hg->material_indices[prim];
@@ -19,7 +27,7 @@ static __device__ __noinline__ void fill_surface_vertex(PathVertex *v, HitGroupD
   unsigned int contexts = v->mat ? v->mat->surface_contexts : 0;
   bool bump = v->mat && v->mat->surface_bump != 0;
   bool derivatives =
-      bump || (v->mat && v->mat->hair_weight > 0.5f) || (contexts & ((1u << 7) | (1u << 17)));
+      curve || bump || (v->mat && v->mat->hair_weight > 0.5f) || (contexts & ((1u << 7) | (1u << 17)));
   v->light_pdf = hg->light_pdf ? hg->light_pdf[prim] : 0.0f;
   bool mesh_light = hg->area_light_group >= 0 && v->light_pdf > 0.0f;
   int i0 = hg->indices[prim * 3 + 0];
@@ -31,13 +39,16 @@ static __device__ __noinline__ void fill_surface_vertex(PathVertex *v, HitGroupD
 
   float b0 = 1.0f - bary.x - bary.y;
   float3 P_local = p0 * b0 + p1 * bary.x + p2 * bary.y;
+  float3 center = P_local;
+  if (curve && hit_point)
+    P_local = transform_point(hg->world_to_object, *hit_point);
 
   float3 P = transform_point(hg->object_to_world, P_local);
 
   // Geometric normal in object space
   float3 e1 = p1 - p0;
   float3 e2 = p2 - p0;
-  float3 Ng_local = normalize3(cross3(e1, e2));
+  float3 Ng_local = normalize3(curve ? P_local - center : cross3(e1, e2));
   float3 Ng = normalize3(transform_normal(hg->world_to_object, Ng_local));
 
   // Only mesh-light MIS and UV derivatives need world-space triangle edges.
@@ -55,7 +66,7 @@ static __device__ __noinline__ void fill_surface_vertex(PathVertex *v, HitGroupD
   }
 
   float3 Ns = Ng;
-  if (hg->normals != nullptr) {
+  if (!curve && hg->normals != nullptr) {
     float3 n0 = make_f3(&hg->normals[i0 * 3]);
     float3 n1 = make_f3(&hg->normals[i1 * 3]);
     float3 n2 = make_f3(&hg->normals[i2 * 3]);
@@ -98,6 +109,15 @@ static __device__ __noinline__ void fill_surface_vertex(PathVertex *v, HitGroupD
       }
     }
   }
+  v->curve_radius = 0.0f;
+  if (curve) {
+    T = normalize3(transform_vector(hg->object_to_world, e1));
+    dpdu = transform_vector(hg->object_to_world, e1);
+    float radius = hg->curve_radii[i0] * b0 + hg->curve_radii[i1] * bary.x;
+    float3 radial = transform_vector(hg->object_to_world, Ng_local * radius);
+    v->curve_radius = sqrtf(dot3(radial, radial));
+    dpdv = normalize3(cross3(Ng, T)) * (2.0f * M_PIf * v->curve_radius);
+  }
 
   float3 vc = make_float3(1.0f, 1.0f, 1.0f);
   if ((contexts & (1u << 8)) && hg->vertex_colors != nullptr) {
@@ -136,6 +156,9 @@ static __device__ __noinline__ void fill_surface_vertex(PathVertex *v, HitGroupD
   }
   v->Ng = Ng;
   v->Ns = Ns;
+  float footprint = 0.5f * (sqrtf(dot3(make_f3(params.cam_u), make_f3(params.cam_u))) * 2 / params.width +
+                            sqrtf(dot3(make_f3(params.cam_v), make_f3(params.cam_v))) * 2 / params.height);
+  surface_differentials(v, params.cam_orthographic ? footprint : footprint * distance);
   v->T = T;
   v->uv = uv;
   v->vc = vc;
@@ -154,7 +177,11 @@ static __device__ __noinline__ void fill_surface_vertex(PathVertex *v, HitGroupD
 }
 
 static __device__ void fill_path_vertex(PathVertex *v) {
-  fill_surface_vertex(v,(HitGroupData*)optixGetSbtDataPointer(),optixGetPrimitiveIndex(),optixGetTriangleBarycentrics(),-optixGetWorldRayDirection(),optixGetRayTmax(),(optixGetRayFlags()&OPTIX_RAY_FLAG_TERMINATE_ON_FIRST_HIT)?2u:1u);
+  auto *hg = (HitGroupData*)optixGetSbtDataPointer();
+  float2 bary = hg->curve_radii ? make_float2(optixGetCurveParameter(), 0) : optixGetTriangleBarycentrics();
+  float3 hit_point = optixGetWorldRayOrigin() + optixGetWorldRayDirection() * optixGetRayTmax();
+  fill_surface_vertex(v, hg, optixGetPrimitiveIndex(), bary, -optixGetWorldRayDirection(),
+                      optixGetRayTmax(), (optixGetRayFlags()&OPTIX_RAY_FLAG_TERMINATE_ON_FIRST_HIT)?2u:1u, &hit_point);
 }
 
 // Geometry-only node queries use compact software BVHs. No OptiX trace or

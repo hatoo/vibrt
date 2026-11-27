@@ -44,38 +44,37 @@ pub struct Tree {
     pub leaves: Vec<i32>,
 }
 
+unsafe extern "C" {
+    fn vibrt_tree_partition(
+        source: *const Node,
+        indices: *mut u32,
+        count: i32,
+        node: *mut Node,
+    ) -> i32;
+}
+
 pub fn build(emitters: &[Node]) -> Tree {
-    fn branch(tree: &mut Tree, source: &[Node], indices: &mut [usize], parent: i32) -> i32 {
+    fn branch(tree: &mut Tree, source: &[Node], indices: &mut [u32], parent: i32) -> i32 {
         let id = tree.nodes.len() as i32;
-        let mut node = source[indices[0]];
+        let mut node = source[indices[0] as usize];
         node.parent = parent;
         if indices.len() == 1 {
             node.emitter = indices[0] as i32;
-            tree.leaves[indices[0]] = id;
+            tree.leaves[indices[0] as usize] = id;
             tree.nodes.push(node);
             return id;
         }
-        node.energy = 0.0;
-        node.theta_o = std::f32::consts::PI;
-        node.axis = [0.0, 0.0, 1.0];
-        for &i in indices.iter() {
-            node.energy += source[i].energy;
-            for c in 0..3 {
-                node.lower[c] = node.lower[c].min(source[i].lower[c]);
-                node.upper[c] = node.upper[c].max(source[i].upper[c]);
-            }
-        }
-        let axis = (0..3)
-            .max_by(|&a, &b| {
-                (node.upper[a] - node.lower[a]).total_cmp(&(node.upper[b] - node.lower[b]))
-            })
-            .unwrap();
-        indices.sort_unstable_by(|&a, &b| {
-            (source[a].lower[axis] + source[a].upper[axis])
-                .total_cmp(&(source[b].lower[axis] + source[b].upper[axis]))
-        });
+        // Cycles computes merged orientation bounds and the bucketed SAOH split.
+        // The bridge only reorders these valid source indices; Rust owns the tree.
+        let mid = unsafe {
+            vibrt_tree_partition(
+                source.as_ptr(),
+                indices.as_mut_ptr(),
+                indices.len() as i32,
+                &mut node,
+            )
+        } as usize;
         tree.nodes.push(node);
-        let mid = indices.len() / 2;
         let (left, right) = indices.split_at_mut(mid);
         tree.nodes[id as usize].left = branch(tree, source, left, id);
         tree.nodes[id as usize].right = branch(tree, source, right, id);
@@ -89,7 +88,7 @@ pub fn build(emitters: &[Node]) -> Tree {
         branch(
             &mut tree,
             emitters,
-            &mut (0..emitters.len()).collect::<Vec<_>>(),
+            &mut (0..emitters.len() as u32).collect::<Vec<_>>(),
             -1,
         );
     }

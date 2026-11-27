@@ -25,12 +25,11 @@ static __device__ float sum_sun_nee_pdf(float3 dir) {
   float p = 0.0f;
   for (int i = 0; i < params.num_sun_lights; i++) {
     SunLight &sl = params.sun_lights[i];
-    float3 sd = make_f3(sl.direction);
-    float cos_to_sun = dot3(dir, sd);
-    if (cos_to_sun > sl.cos_angle) {
-      float sun_omega = 2.0f * M_PIf * fmaxf(1.0f - sl.cos_angle, 1e-30f);
-      p += 1.0f / sun_omega;
-    }
+    vibrt_lights::KernelLight light{};
+    light.co = cycles_vector(-make_f3(sl.direction));
+    light.distant.angle = acosf(sl.cos_angle);
+    light.distant.pdf = 1.0f / (2.0f * M_PIf * fmaxf(1 - sl.cos_angle, 1e-30f));
+    p += vibrt_lights::distant_light_eval_from_intersection(&light, cycles_vector(dir)).pdf;
   }
   return p;
 }
@@ -50,11 +49,7 @@ static __device__ float sum_env_nee_pdf(float3 dir) {
 static __device__ float power_heuristic_3(float pdf_self,
                                            float pdf_o1,
                                            float pdf_o2) {
-  float a = pdf_self * pdf_self;
-  float b = pdf_o1 * pdf_o1;
-  float c = pdf_o2 * pdf_o2;
-  float denom = a + b + c;
-  return (denom > 0.0f) ? a / denom : 0.0f;
+  return pdf_self > 0 ? vibrt_cycles::power_heuristic_3(pdf_self, pdf_o1, pdf_o2) : 0;
 }
 
 // Spatial selection shares Cycles' bounded importance and branch probabilities.
@@ -83,12 +78,48 @@ static __device__ vibrt_rect::Distribution rect_distribution(const AreaRectLight
                              dot3(corner, make_f3(ar.normal)), ar.size_u, ar.size_v);
 }
 
-static __device__ float3 sample_rect_position(const AreaRectLight &ar, float3 P,
+static __device__ bool area_sample_region(const AreaRectLight &light, float3 P, AreaRectLight &region) {
+  region = light;
+  if (light.normalize_spread == 0)
+    return true;
+  auto u = cycles_vector(make_f3(light.u_axis)), v = cycles_vector(make_f3(light.v_axis));
+  auto center = cycles_vector(make_f3(light.corner)) + u * (0.5f * light.size_u) + v * (0.5f * light.size_v);
+  auto normal = cycles_vector(make_f3(light.normal));
+  if (light.two_sided && vibrt_cycles::dot(normal, cycles_vector(P) - center) < 0)
+    normal = -normal;
+  bool rectangle = !light.disk;
+  if (!vibrt_lights::area_light_spread_clamp_light(cycles_vector(P), normal, &center, &u,
+                                                  &region.size_u, &v, &region.size_v,
+                                                  light.tan_half_spread, &rectangle))
+    return false;
+  auto corner = center - u * (0.5f * region.size_u) - v * (0.5f * region.size_v);
+  for (int c = 0; c < 3; ++c) {
+    region.corner[c] = corner[c];
+    region.u_axis[c] = u[c];
+    region.v_axis[c] = v[c];
+    region.normal[c] = normal[c];
+  }
+  region.disk = !rectangle;
+  return true;
+}
+
+static __device__ bool area_contains(const AreaRectLight &light, float3 P) {
+  float3 d = P - make_f3(light.corner);
+  float u = dot3(d, make_f3(light.u_axis)) / light.size_u - 0.5f;
+  float v = dot3(d, make_f3(light.v_axis)) / light.size_v - 0.5f;
+  return light.disk ? u * u + v * v <= 0.250001f : fabsf(u) <= 0.500001f && fabsf(v) <= 0.500001f;
+}
+
+static __device__ float3 sample_rect_region(const AreaRectLight &ar, float3 P,
                                                float u, float v, float &pdf) {
+  if (ar.tan_half_spread == 0) {
+    pdf = 1;
+    return make_f3(ar.corner);
+  }
   if (ar.disk) {
-    float r = sqrtf(u), phi = 2 * M_PIf * v;
-    float3 point = make_f3(ar.corner) + make_f3(ar.u_axis) * (ar.size_u * (0.5f + 0.5f * r * cosf(phi))) +
-                   make_f3(ar.v_axis) * (ar.size_v * (0.5f + 0.5f * r * sinf(phi)));
+    auto disk = vibrt_cycles::sample_uniform_disk(vibrt_cycles::make_float2(u, v));
+    float3 point = make_f3(ar.corner) + make_f3(ar.u_axis) * (ar.size_u * (0.5f + 0.5f * disk.x)) +
+                   make_f3(ar.v_axis) * (ar.size_v * (0.5f + 0.5f * disk.y));
     float3 delta = point - P;
     float d2 = dot3(delta, delta);
     float cosine = fabsf(dot3(normalize3(delta), make_f3(ar.normal)));
@@ -96,6 +127,15 @@ static __device__ float3 sample_rect_position(const AreaRectLight &ar, float3 P,
     return point;
   }
   auto distribution = rect_distribution(ar, P);
+  if (distribution.spherical && u > 0 && u < 1) {
+    auto point = cycles_vector(make_f3(ar.corner) + make_f3(ar.u_axis) * (0.5f * ar.size_u) +
+                               make_f3(ar.v_axis) * (0.5f * ar.size_v));
+    pdf = vibrt_lights::area_light_rect_sample(cycles_vector(P), &point, cycles_vector(make_f3(ar.u_axis)),
+                                               ar.size_u, cycles_vector(make_f3(ar.v_axis)), ar.size_v,
+                                               vibrt_cycles::make_float2(u, v), true);
+    if (isfinite(point.x) && isfinite(point.y) && isfinite(point.z))
+      return make_float3(point.x, point.y, point.z);
+  }
   float x, y;
   vibrt_rect::sample(distribution, u, v, x, y);
   pdf = vibrt_rect::pdf(distribution, x, y);
@@ -103,14 +143,37 @@ static __device__ float3 sample_rect_position(const AreaRectLight &ar, float3 P,
          make_f3(ar.v_axis) * (y - distribution.y0);
 }
 
-static __device__ float rect_direction_pdf(const AreaRectLight &ar, float3 P,
+static __device__ float3 sample_rect_position(const AreaRectLight &ar, float3 P,
+                                               float u, float v, float &pdf) {
+  AreaRectLight region;
+  if (!area_sample_region(ar, P, region)) {
+    pdf = 0;
+    return P;
+  }
+  float3 sampled = sample_rect_region(region, P, u, v, pdf);
+  if (ar.normalize_spread > 0 && !area_contains(ar, sampled))
+    pdf = 0;
+  return sampled;
+}
+
+static __device__ float rect_direction_pdf(const AreaRectLight &light, float3 P,
                                             float3 light_position) {
+  AreaRectLight ar;
+  if (light.tan_half_spread == 0 || !area_sample_region(light, P, ar))
+    return 0;
   if (ar.disk) {
     float3 delta = light_position - P;
     float cosine = fabsf(dot3(normalize3(delta), make_f3(ar.normal)));
     return dot3(delta, delta) / fmaxf(ar.size_u * ar.size_v * M_PIf * 0.25f * cosine, 1e-30f);
   }
   auto distribution = rect_distribution(ar, P);
+  if (distribution.spherical) {
+    auto center = cycles_vector(make_f3(ar.corner) + make_f3(ar.u_axis) * (0.5f * ar.size_u) +
+                                make_f3(ar.v_axis) * (0.5f * ar.size_v));
+    return vibrt_lights::area_light_rect_sample(cycles_vector(P), &center, cycles_vector(make_f3(ar.u_axis)),
+                                               ar.size_u, cycles_vector(make_f3(ar.v_axis)), ar.size_v,
+                                               vibrt_cycles::make_float2(0), false);
+  }
   float3 delta = light_position - P;
   return vibrt_rect::pdf(distribution, dot3(delta, make_f3(ar.u_axis)),
                          dot3(delta, make_f3(ar.v_axis)));
@@ -164,31 +227,19 @@ static __device__ __noinline__ float3 direct_light(const MaterialEvalGroup &e, f
   // when a scatter ray happens to land inside the sun cone.
   for (int i = 0; i < params.num_sun_lights; i++) {
     SunLight &sl = params.sun_lights[i];
-    float3 dir = make_f3(sl.direction);
-    // Small cone sample around the sun direction.
-    float cos_a = sl.cos_angle;
-    float u1 = rng.next();
-    float u2 = rng.next();
-    float ct = 1.0f - u1 * (1.0f - cos_a);
-    float st = sqrtf(fmaxf(0.0f, 1.0f - ct * ct));
-    float phi = 2.0f * M_PIf * u2;
-    float3 T, B;
-    build_frame(dir, T, B);
-    float3 wi =
-        normalize3(T * (st * cosf(phi)) + B * (st * sinf(phi)) + dir * ct);
+    float pdf_sun;
+    float3 wi = sample_sun_direction(sl, rng, pdf_sun);
     float3 vis = shadow_transmittance(P, wi, 1e20f, vstack, e.slots[0].Ng);
     if (luminance(vis) <= 0.0f)
       continue;
     BsdfEval b = eval_bsdf(e, wo, wi, cache);
-    float sun_omega = 2.0f * M_PIf * fmaxf(1.0f - cos_a, 1e-30f);
-    float pdf_sun = 1.0f / sun_omega;
     // 3-strategy MIS: balance sun NEE against the (residual) envmap NEE
     // and the BSDF sample. Without the env NEE term the denominator
     // missed the case where the envmap CDF picks a direction inside the
     // sun cone — rare but not zero, since the bake's clipped sun pixels
     // have nonzero luminance after `_extract_sun_from_bake_inplace`.
     float pdf_env_at_dir = sum_env_nee_pdf(wi);
-    float w_sun = power_heuristic_3(pdf_sun, pdf_env_at_dir, b.pdf);
+    float w_sun = sl.cos_angle == 1 ? 1 : power_heuristic_3(pdf_sun, pdf_env_at_dir, b.pdf);
     L = L + b.f * vis * make_f3(sl.emission) * w_sun;
   }
 
@@ -197,29 +248,16 @@ static __device__ __noinline__ float3 direct_light(const MaterialEvalGroup &e, f
     SpotLight &sp = params.spot_lights[i];
     float3 Pl, wi;
     float d;
-    float light_weight = sample_point_position(make_f3(sp.position), sp.radius,
-                                               sp.sphere, P, rng, Pl, wi, d);
+    float light_weight = sample_spot_position(sp, P, rng, Pl, wi, d);
     if (d < 1e-4f || light_weight <= 0)
       continue;
-    // Direction from light to point = -wi, cos against spot axis
-    float3 center_delta = make_f3(sp.position) - P;
-    float cos_a = sp.sphere && dot3(center_delta, center_delta) < sp.radius * sp.radius
-                      ? 1.0f : dot3(make_f3(sp.direction), -wi);
-    if (cos_a <= sp.cos_outer)
-      continue;
-    float falloff = 1.0f;
-    if (cos_a < sp.cos_inner) {
-      float t =
-          (cos_a - sp.cos_outer) / fmaxf(sp.cos_inner - sp.cos_outer, 1e-4f);
-      falloff = t * t * (3.0f - 2.0f * t);
-    }
     float3 vis = shadow_transmittance(P, wi, d, vstack, e.slots[0].Ng);
     if (luminance(vis) <= 0.0f)
       continue;
     BsdfEval b = eval_bsdf(e, wo, wi, cache);
     float ies = ies_lookup(sp.ies_data, sp.ies_n_v, sp.ies_n_h,
                            sp.light_rotation, -wi);
-    L = L + b.f * vis * point_light_emission(sp.shader, make_f3(sp.emission), Pl, -wi, d) * falloff * ies * light_weight;
+    L = L + b.f * vis * point_light_emission(sp.shader, make_f3(sp.emission), Pl, -wi, d) * ies * light_weight;
   }
 
   // Area rect lights: point-dependent selection and solid-angle sampling.
@@ -265,7 +303,7 @@ static __device__ __noinline__ float3 direct_light(const MaterialEvalGroup &e, f
               // the BSDF-side branch, which NEE can't importance-sample.
               // At the path-length limit no BSDF ray will be traced, so
               // NEE is the only strategy and must retain its full weight.
-              float w_light = (ar.camera_visible != 0u && rect_mis)
+              float w_light = (ar.camera_visible != 0u && ar.tan_half_spread > 0 && rect_mis)
                                   ? power_heuristic(pdf, b.pdf)
                                   : 1.0f;
               L = L + b.f * vis * area_light_emission(ar, Pl, -wi, d) * ies * (w_light / pdf);
@@ -430,17 +468,8 @@ static __device__ __noinline__ float3 direct_light_volume(float3 P, float3 wi_wo
   }
   for (int i = 0; i < params.num_sun_lights; i++) {
     SunLight &sl = params.sun_lights[i];
-    float3 dir = make_f3(sl.direction);
-    float cos_a = sl.cos_angle;
-    float u1 = rng.next();
-    float u2 = rng.next();
-    float ct = 1.0f - u1 * (1.0f - cos_a);
-    float st = sqrtf(fmaxf(0.0f, 1.0f - ct * ct));
-    float phi = 2.0f * M_PIf * u2;
-    float3 T, B;
-    build_frame(dir, T, B);
-    float3 wi =
-        normalize3(T * (st * cosf(phi)) + B * (st * sinf(phi)) + dir * ct);
+    float pdf_sun;
+    float3 wi = sample_sun_direction(sl, rng, pdf_sun);
     float3 vis = shadow_transmittance(P, wi, 1e20f, vstack);
     if (luminance(vis) <= 0.0f)
       continue;
@@ -450,25 +479,13 @@ static __device__ __noinline__ float3 direct_light_volume(float3 P, float3 wi_wo
     SpotLight &sp = params.spot_lights[i];
     float3 Pl, wi;
     float d;
-    float light_weight = sample_point_position(make_f3(sp.position), sp.radius,
-                                               sp.sphere, P, rng, Pl, wi, d);
+    float light_weight = sample_spot_position(sp, P, rng, Pl, wi, d);
     if (d < 1e-4f || light_weight <= 0)
       continue;
-    float3 center_delta = make_f3(sp.position) - P;
-    float cos_a = sp.sphere && dot3(center_delta, center_delta) < sp.radius * sp.radius
-                      ? 1.0f : dot3(make_f3(sp.direction), -wi);
-    if (cos_a <= sp.cos_outer)
-      continue;
-    float falloff = 1.0f;
-    if (cos_a < sp.cos_inner) {
-      float t =
-          (cos_a - sp.cos_outer) / fmaxf(sp.cos_inner - sp.cos_outer, 1e-4f);
-      falloff = t * t * (3.0f - 2.0f * t);
-    }
     float3 vis = shadow_transmittance(P, wi, d, vstack);
     if (luminance(vis) <= 0.0f)
       continue;
-    add(wi, point_light_emission(sp.shader, make_f3(sp.emission), Pl, -wi, d) * falloff * light_weight, vis);
+    add(wi, point_light_emission(sp.shader, make_f3(sp.emission), Pl, -wi, d) * light_weight, vis);
   }
   if (params.num_rect_lights > 0) {
     float pmf_light;

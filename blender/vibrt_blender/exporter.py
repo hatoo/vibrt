@@ -739,9 +739,9 @@ def _export_camera(scene, cam_obj, aspect: float) -> dict:
     shift_y_ndc = cy / (2.0 * half_h) if half_h > 0.0 else 0.0
     matrix = _matrix_to_row_major(cam_obj.matrix_world)
     if cam.dof.use_dof:
-        # Cycles convention: aperture radius [m] = (focal_length_mm / 1000) / (2 * fstop)
+        # Orthographic cameras use unit focal length for the aperture radius.
         fstop = cam.dof.aperture_fstop
-        lens_radius = (cam.lens * 1e-3) / (2.0 * fstop) if fstop > 0.0 else 0.0
+        lens_radius = (1.0 if orthographic else cam.lens * 1e-3) / (2.0 * fstop) if fstop > 0.0 else 0.0
         # If focus_object is set, Cycles uses the distance from the camera to the
         # object along the camera's view axis (-Z in camera space); otherwise the
         # numeric focus_distance field. focus_distance defaults to 0 when an
@@ -764,6 +764,11 @@ def _export_camera(scene, cam_obj, aspect: float) -> dict:
         "ortho_height": 2.0 * half_h if orthographic else 0.0,
         "frame_aspect": half_w / half_h,
         "lens_radius": lens_radius,
+        "aperture_blades": int(cam.dof.aperture_blades),
+        "aperture_rotation": float(cam.dof.aperture_rotation),
+        "aperture_ratio": float(cam.dof.aperture_ratio),
+        "filter_type": {"BOX": 0, "GAUSSIAN": 1, "BLACKMAN_HARRIS": 2}.get(scene.cycles.pixel_filter_type, 0),
+        "filter_width": 1.0 if scene.cycles.pixel_filter_type == "BOX" else float(scene.cycles.filter_width),
         "focal_distance": focal_distance,
         # Cycles' "Clip Start" — primary rays don't intersect anything
         # closer than this. Lone_monk has 1.12m clip_start to skip a
@@ -1316,6 +1321,7 @@ def _export_light(obj, writer, textures: list, materials=None, *, context=None) 
             return {"type": "portal", "transform": mw_flipz, "size": size}
         out = {
             "type": "area_rect",
+            "spread": float(light.spread),
             "transform": mw_flipz,
             "size": size,
             "color": col,
@@ -3294,7 +3300,7 @@ def _export_into(
                 else:
                     obj_eval = obj.evaluated_get(depsgraph)
 
-                if shaders_only and obj_eval.type != "MESH":
+                if shaders_only and obj_eval.type not in {"MESH", "CURVES"}:
                     continue
                 if obj_eval.type == "MESH":
                     slot_mat_ids: list[int] = []
@@ -3318,6 +3324,33 @@ def _export_into(
                         slot_mat_ids = [resolve_material(None)]
                     if shaders_only:
                         continue
+
+                    # Hair particle systems on this object: export native
+                    # curve keys and radii as a sibling object. Skipped for
+                    # instance copies — each particle system is owned by the
+                    # source object and we'd otherwise duplicate the hair
+                    # for every linked instance.
+                    if not inst.is_instance and any(
+                        ps.settings.type == "HAIR"
+                        for ps in obj_eval.particle_systems
+                    ):
+                        t_hair = time.perf_counter()
+                        hair_pairs = hair_export.export_hair(
+                            obj,
+                            obj_eval,
+                            scene,
+                            writer,
+                            resolve_material,
+                            obj_eval.name,
+                            material_attributes,
+                            depsgraph=depsgraph,
+                        )
+                        hair_s += time.perf_counter() - t_hair
+                        for hair_mesh, hair_obj in hair_pairs:
+                            hair_mesh_id = len(meshes)
+                            meshes.append(hair_mesh)
+                            hair_obj["mesh"] = hair_mesh_id
+                            objects.append(hair_obj)
 
                     # Lamp-Output emissive mesh carrying an IES profile
                     # (ies_light's red `Mesh`): promote the quad to an IES
@@ -3439,15 +3472,10 @@ def _export_into(
                         # the same delivery via a more general code
                         # path.
 
-                    # Skip camera-hidden non-emissive meshes. This catches
-                    # both plain transparent geometry and Cycles daylight
-                    # portals (classroom's `windows`): the portal slot was
-                    # demoted to non-emissive in `resolve_material` so it
-                    # falls into this branch, sky NEE/miss naturally
-                    # delivers the lighting through the empty space, and
-                    # we avoid double-counting the world envmap via a fake
-                    # mesh emitter.
-                    if not visible_camera and not has_emissive_slot:
+                    # Portal hints were promoted to world lighting above.
+                    # Other camera-hidden surfaces still affect shadows and
+                    # indirect rays, including colored Transparent BSDFs.
+                    if not visible_camera and all(mid in portal_mat_ids for mid in slot_mat_ids):
                         continue
 
                     # Particle scatter emitters: when the source object has
@@ -3535,7 +3563,8 @@ def _export_into(
                         # portals look superficially similar but are
                         # detected upstream and demoted to non-emissive,
                         # so they never reach this branch.
-                        obj_desc["cast_shadow"] = False
+                        if has_emissive_slot:
+                            obj_desc["cast_shadow"] = False
                     new_obj_idx = len(objects)
                     objects.append(obj_desc)
 
@@ -3551,32 +3580,18 @@ def _export_into(
                     if has_emissive_slot:
                         mesh_lights_json.append({"object_idx": new_obj_idx})
 
-                    # Hair particle systems on this object: tessellate to
-                    # ribbons + emit a sibling mesh/object. Skipped for
-                    # instance copies — each particle system is owned by the
-                    # source object and we'd otherwise duplicate the hair
-                    # for every linked instance.
-                    if not inst.is_instance and any(
-                        ps.settings.type == "HAIR"
-                        for ps in obj_eval.particle_systems
-                    ):
-                        t_hair = time.perf_counter()
-                        hair_pair = hair_export.export_hair(
-                            obj,
-                            obj_eval,
-                            scene,
-                            writer,
-                            resolve_material,
-                            obj_eval.name,
-                            material_attributes,
-                        )
-                        hair_s += time.perf_counter() - t_hair
-                        if hair_pair is not None:
-                            hair_mesh, hair_obj = hair_pair
-                            hair_mesh_id = len(meshes)
-                            meshes.append(hair_mesh)
-                            hair_obj["mesh"] = hair_mesh_id
-                            objects.append(hair_obj)
+                elif obj_eval.type == "CURVES":
+                    if shaders_only:
+                        for slot in obj_eval.material_slots:
+                            resolve_material(slot.material)
+                        continue
+                    pair = hair_export.export_curves(obj, obj_eval, inst.matrix_world, writer,
+                                                    resolve_material, material_attributes)
+                    if pair is not None:
+                        mesh, record = pair
+                        record["mesh"] = len(meshes)
+                        meshes.append(mesh)
+                        objects.append(record)
                 elif obj_eval.type == "LIGHT":
                     light = _export_light(obj_eval, writer, textures, materials, context=context)
                     if light is not None:
@@ -3671,6 +3686,9 @@ def _export_into(
         "version": 1,
         "aov_names": [a.name for a in bpy.context.view_layer.aovs if a.is_valid],
         "render": {
+            "use_adaptive_sampling": bool(getattr(cy, "use_adaptive_sampling", False)),
+            "adaptive_threshold": float(getattr(cy, "adaptive_threshold", 0.01)),
+            "adaptive_min_samples": int(getattr(cy, "adaptive_min_samples", 0)),
             "width": width,
             "height": height,
             "spp": spp,

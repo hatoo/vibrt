@@ -18,14 +18,15 @@ Blender itself does not need to be built. Installed addons embed the generated
 code/tables and do not read this checkout at runtime.
 
 `vibrt-nodes/build.rs` extracts numerical helpers into an OUT_DIR header, removing
-Blender includes, namespace macros and SVM bytecode entry points. It reads:
+Blender includes and namespace macros. Selected SVM entry points run through
+small stack and scene adapters. It reads:
 
 - `kernel/svm/`: enums, Math/Mix, procedural textures, radial tiling, Mapping,
   scalar/vector Map Range and Vector Rotate. Fresnel uses the closure helper.
 - `util/hash.h`, `util/color.h`, `util/math_fast.h`: hashes, color conversion and
   inverse error function.
 - `kernel/closure/`: Diffuse/Oren-Nayar, Sheen/Velvet, microfacet/Fresnel, Chiang
-  hair, legacy Hair reflection/transmission, Toon, Burley/dipole profiles and
+  and Huang hair, legacy Hair reflection/transmission, Toon, Burley/dipole profiles and
   volume phase functions.
 - `kernel/sample/mapping.h`, `kernel/util/lookup_table.h`, `kernel/tables.h`
   and `scene/shader.tables`: sampling, interpolation and original numerical tables.
@@ -41,9 +42,24 @@ Blender includes, namespace macros and SVM bytecode entry points. It reads:
 - `kernel/light/triangle.h`, `util/math_intersect.h`: triangle solid-angle/area
   sampling and matching hit PDFs. The adapter supplies world-space vertices.
 - `kernel/light/tree.h`: subtended-angle bounds, importance and branch selection
-  probabilities. A renderer-owned median-split tree selects rectangular lights
-  and mesh-light groups. Triangles within a group retain the power CDF; explicit
+  probabilities. `scene/light_tree.{h,cpp}` supplies OrientationBounds,
+  LightTreeMeasure and the SAOH partition; Rust owns the compact tree selecting
+  rectangular lights and mesh-light groups. Triangles within a group retain the power CDF; explicit
   point/spot/sun and environment strategies retain their existing selection.
+- `kernel/light/{point,spot,distant,area,background}.h`: emitter sampling/PDFs,
+  area spread and continuous environment CDF sampling.
+- `kernel/device/cpu/image.h`: nearest, bilinear and cubic interpolation; the
+  adapter supplies packed pixels and per-axis extension for environment maps.
+- `kernel/camera/camera.h`, `scene/film.cpp`, `util/math_cdf.{h,cpp}`:
+  disk/polygon/anamorphic aperture sampling and film-filter inverse CDF tables.
+- `kernel/util/differential.h`, `kernel/svm/{displace,tex_coord,wireframe,bevel}.h`:
+  compact differentials, SVM bump/normal-map/wireframe and Bevel profiles.
+- `kernel/film/adaptive_sampling.h`, `kernel/sample/pattern.h`: convergence,
+  neighbor filters and sample classes; vibrt owns accumulation and launch order.
+- `kernel/integrator/{surface_shader,shade_volume}.h`: RGB shadow transparency and
+  equiangular volume distance proposals/PDFs.
+- `kernel/geom/curve_intersect.h`: round linear curve queries for the software
+  BVH; OptiX uses its native round linear intersection module for path rays.
 - `kernel/bvh/util.h`: scale-aware ray offsets for surface and shadow origins.
 
 `native/cycles_compat.h` and `native/closures_compat.h` provide platform types
@@ -65,6 +81,8 @@ sources. Toon, AO, Bevel, Wireframe, Raycast and subsurface traversal use vibrt'
 geometry; Blender scene management and OSL are not linked.
 
 Most selected code is Apache-2.0, copyright Blender Foundation/Blender Authors.
+Curve intersections include code adapted from Embree, copyright 2009-2021 Intel
+Corporation (Apache-2.0).
 Noise, legacy Hair and Toon include BSD-3-Clause code from Sony Pictures Imageworks and
 Blender Foundation. Parts of Voronoi are MIT, copyright Inigo Quilez.
 Individual SPDX headers are authoritative. License texts and attribution are

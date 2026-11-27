@@ -102,6 +102,24 @@ impl<'scene, 'session> RenderJob<'scene, 'session> {
         let primary_back_face_skip_exhausted = dptr_u32(&d_back_face_warn, &stream);
 
         let mut lp = scene.launch_params(render_settings);
+        let d_adaptive: Option<CudaSlice<f32>> = if render_settings.use_adaptive_sampling {
+            Some(stream.alloc_zeros(pixel_count * 9).cuda()?)
+        } else {
+            None
+        };
+        lp.adaptive_buffer = d_adaptive.as_ref().map_or(0, |s| dptr_f32(s, &stream));
+        let threshold = if render_settings.adaptive_threshold > 0.0 {
+            render_settings.adaptive_threshold
+        } else {
+            (1.0 / render_settings.spp as f32).max(0.001)
+        };
+        lp.adaptive_threshold = threshold * 5.0;
+        lp.adaptive_min_samples = if render_settings.adaptive_min_samples == 0 {
+            (16.0 / threshold.powf(0.3)).ceil() as u32
+        } else {
+            render_settings.adaptive_min_samples
+        }
+        .max(4);
         lp.aov_data = d_aovs.as_ref().map_or(0, |s| dptr_f32(s, &stream));
         lp.image = dptr_f32(&d_image, &stream);
         lp.accumulation = d_accumulation.as_ref().map_or(0, |s| dptr_f32(s, &stream));
@@ -113,6 +131,14 @@ impl<'scene, 'session> RenderJob<'scene, 'session> {
         // upload/wait between samples. Reuse the slots only after the batch ends.
         let mut batch_params = vec![lp; MAX_BATCH_SAMPLES.min(render_settings.spp as usize)];
         let mut d_params = stream.clone_htod(&batch_params).cuda()?;
+        let adaptive_params: Vec<_> = (1..=3)
+            .map(|phase| {
+                let mut p = lp;
+                p.adaptive_phase = phase;
+                p
+            })
+            .collect();
+        let d_adaptive_params = stream.clone_htod(&adaptive_params).cuda()?;
         let batch_start = stream
             .context()
             .new_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))
@@ -154,6 +180,22 @@ impl<'scene, 'session> RenderJob<'scene, 'session> {
                         render_settings.width,
                         render_settings.height,
                     )?;
+                    let completed = start + i + 1;
+                    if d_adaptive.is_some()
+                        && completed >= lp.adaptive_min_samples
+                        && completed.is_multiple_of(16)
+                    {
+                        let (adaptive_ptr, _record_adaptive) =
+                            d_adaptive_params.device_ptr(&stream);
+                        for phase in 0..3 {
+                            scene.launch(
+                                &stream,
+                                adaptive_ptr + phase * mem::size_of::<LaunchParams>() as u64,
+                                render_settings.width,
+                                render_settings.height,
+                            )?;
+                        }
+                    }
                 }
             }
             if !every_sample {
@@ -347,10 +389,32 @@ impl<'scene, 'session> RenderJob<'scene, 'session> {
         // --- Readback ---
         let pixels: Vec<f32> = stream.clone_dtoh(&d_final).cuda()?;
         let depth: Vec<f32> = stream.clone_dtoh(&d_depth).cuda()?;
+        let sample_counts = if let Some(buffer) = &d_adaptive {
+            let data = stream.clone_dtoh(buffer).cuda()?;
+            let counts: Vec<u32> = data
+                .as_chunks::<9>()
+                .0
+                .iter()
+                .map(|p| p[8].to_bits())
+                .collect();
+            let mean = counts.iter().map(|&n| n as f64).sum::<f64>() / pixel_count as f64;
+            progress.log(&format!(
+                "Adaptive sampling: mean {mean:.1} spp (limit {})",
+                render_settings.spp
+            ));
+            Some(counts)
+        } else {
+            None
+        };
         let mut aovs = std::collections::BTreeMap::new();
         if let Some(data) = &d_aovs {
             let values: Vec<f32> = stream.clone_dtoh(data).cuda()?;
-            aovs = scene.collect_aovs(&values, pixel_count, render_settings.spp);
+            aovs = scene.collect_aovs(
+                &values,
+                pixel_count,
+                render_settings.spp,
+                sample_counts.as_deref(),
+            );
         }
 
         Ok(RenderOutput {

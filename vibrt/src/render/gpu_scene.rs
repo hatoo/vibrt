@@ -234,6 +234,7 @@ impl GpuScene<'_> {
             d_vertex_colors: optix_sys::CUdeviceptr,
             d_vertex_alphas: optix_sys::CUdeviceptr,
             d_tangents: optix_sys::CUdeviceptr,
+            d_curve_radii: optix_sys::CUdeviceptr,
             num_verts: i32,
         }
         let mut _buffers: Vec<CudaSlice<u8>> = Vec::new();
@@ -281,7 +282,21 @@ impl GpuScene<'_> {
                 3 * mem::size_of::<u32>() as u32,
             );
 
-            let bi = [BuildInput::Triangles(tri_input)];
+            let d_curve_radii = mesh_uploads.copy_slice(&m.curve_radii[..])?;
+            let radius_ptrs = [d_curve_radii];
+            let bi = [if d_curve_radii == 0 {
+                BuildInput::Triangles(tri_input)
+            } else {
+                BuildInput::Curves(optix::accel::CurveArrayInput {
+                    vertex_buffers: &vert_ptrs,
+                    radius_buffers: &radius_ptrs,
+                    num_vertices: num_verts,
+                    index_buffer: idx_ptr,
+                    num_primitives: num_tris,
+                    index_stride: 12,
+                    flags: GeometryFlags::NONE,
+                })
+            }];
             // Wait only when GAS construction needs the position/index arrays.
             mesh_uploads.wait_on_consumer()?;
             let built = session
@@ -320,6 +335,7 @@ impl GpuScene<'_> {
                 d_vertex_colors,
                 d_vertex_alphas,
                 d_tangents,
+                d_curve_radii,
                 num_verts: num_verts as i32,
             });
 
@@ -356,10 +372,11 @@ impl GpuScene<'_> {
             .map(|mesh| {
                 let mut lo = [f32::MAX; 3];
                 let mut hi = [f32::MIN; 3];
-                for vertex in mesh.vertices.as_chunks::<3>().0 {
+                for (index, vertex) in mesh.vertices.as_chunks::<3>().0.iter().enumerate() {
+                    let radius = mesh.curve_radii.get(index).copied().unwrap_or(0.0);
                     for axis in 0..3 {
-                        lo[axis] = lo[axis].min(vertex[axis]);
-                        hi[axis] = hi[axis].max(vertex[axis]);
+                        lo[axis] = lo[axis].min(vertex[axis] - radius);
+                        hi[axis] = hi[axis].max(vertex[axis] + radius);
                     }
                 }
                 (lo, hi)
@@ -436,6 +453,7 @@ impl GpuScene<'_> {
                 vertex_colors: m.d_vertex_colors,
                 vertex_alphas: m.d_vertex_alphas,
                 tangents: m.d_tangents,
+                curve_radii: m.d_curve_radii,
                 bounds_min: mesh_bounds[obj.mesh as usize].0,
                 bounds_max: mesh_bounds[obj.mesh as usize].1,
                 object_to_world: obj.transform,
@@ -493,6 +511,11 @@ impl GpuScene<'_> {
                     _pad: 0,
                 });
             }
+            let (hit_rg_pg, hit_shadow_pg) = if m.d_curve_radii == 0 {
+                (hit_rg_pg, hit_shadow_pg)
+            } else {
+                (&shaders.curve_radiance, &shaders.curve_shadow)
+            };
             tri_hg_records.push(SbtRecord::new(hit_rg_pg, hg)?);
             tri_hg_records.push(SbtRecord::new(hit_shadow_pg, hg)?);
             gas_entries.push(GasEntry {
@@ -856,12 +879,19 @@ impl GpuScene<'_> {
             num_aovs: scene.file.aov_names.len() as u32,
             image: 0,
             accumulation: 0,
+            adaptive_buffer: 0,
+            adaptive_phase: 0,
+            adaptive_min_samples: 0,
+            adaptive_threshold: 0.0,
             width: render_settings.width,
             height: render_settings.height,
             samples_per_pixel: render_settings.spp,
             sample_start: 0,
             sample_count: 1,
             film_transparent: render_settings.film_transparent as u32,
+            has_shadow_transparency: u32::from(
+                scene.file.materials.iter().any(principled::needs_any_hit),
+            ),
             max_depth: render_settings.max_depth,
             max_diffuse_bounces: render_settings.max_diffuse_bounces,
             max_glossy_bounces: render_settings.max_glossy_bounces,
@@ -872,6 +902,17 @@ impl GpuScene<'_> {
             cam_v: [0.0; 3],
             cam_w: [0.0; 3],
             cam_lens_radius: scene.file.camera.lens_radius,
+            cam_aperture_blades: if scene.file.camera.aperture_blades >= 3 {
+                scene.file.camera.aperture_blades as f32
+            } else {
+                0.0
+            },
+            cam_aperture_rotation: scene.file.camera.aperture_rotation,
+            cam_inv_aperture_ratio: scene.file.camera.aperture_ratio.max(0.01).recip(),
+            cam_filter_table: uploads.copy_slice(&vibrt_nodes::camera::filter_table(
+                scene.file.camera.filter_type,
+                scene.file.camera.filter_width,
+            ))?,
             cam_focal_distance: scene.file.camera.focal_distance,
             cam_clip_start: scene.file.camera.clip_start,
             cam_clip_end: scene.file.camera.clip_end,
@@ -1097,6 +1138,7 @@ impl GpuScene<'_> {
         values: &[f32],
         pixel_count: usize,
         spp: u32,
+        sample_counts: Option<&[u32]>,
     ) -> std::collections::BTreeMap<String, Vec<f32>> {
         self.aov_names
             .iter()
@@ -1104,7 +1146,13 @@ impl GpuScene<'_> {
             .map(|(name, pixels)| {
                 (
                     name.clone(),
-                    pixels.iter().map(|v| v / spp as f32).collect(),
+                    pixels
+                        .iter()
+                        .enumerate()
+                        .map(|(i, v)| {
+                            v / sample_counts.map_or(spp, |counts| counts[i / 4]).max(1) as f32
+                        })
+                        .collect(),
                 )
             })
             .collect()

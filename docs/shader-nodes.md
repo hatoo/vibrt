@@ -69,8 +69,8 @@ and GGX/Beckmann closures. Principled assembles sheen, coat, metal, transmission
 specular and diffuse/SSS in Cycles order, including attenuation of emission.
 Metallic supports F82 Edge Tint and physical conductor IOR/Extinction.
 Thin-film tables use scene-linear Rec.709. Legacy Hair reflection/transmission
-and diffuse/glossy Toon use the upstream closures. Colored transparency remains
-a limitation. Standalone and
+and diffuse/glossy Toon use the upstream closures. Transparent closures preserve
+RGB throughput on camera and shadow paths, including weighted Mix/Add trees. Standalone and
 Principled SSS support Burley, Random Walk and Random Walk Skin. Random walks
 use Cycles coefficient/radius fits and entry sampling, with spectral free flights,
 forward/backward Dwivedi guiding and Russian roulette (1,024-event cap).
@@ -80,9 +80,12 @@ degenerate input ranges and zero rotation axes. IES parsing and interpolation
 use Cycles for Type A/B/C profiles. Path samples use Owen-scrambled Sobol, and
 surface/shadow origins use scale-aware ray offsets. Triangle lights use Cycles'
 solid-angle/area sampling with matching hit PDFs. A spatial light tree selects
-rectangular lights and mesh-light groups; each mesh retains its triangle CDF.
+rectangular lights and mesh-light groups using Cycles orientation bounds and
+SAOH partitioning; each mesh retains its triangle CDF. Point, Spot, Sun and Area
+samplers, area spread and environment-map sampling/PDFs also call upstream code.
 
-Image textures are sampled at hits and graph-driven emission also participates
+Closest, linear and cubic image interpolation share Cycles CPU kernels on both
+CPU and CUDA, with packed texture storage supplied by the adapter. Graph-driven emission also participates
 in mesh-light importance sampling. Named UV/color/scalar/vector attributes are exported only when requested, and
 several layers can coexist. Animated image users and UDIM tiles still require a
 texture manager. Default UV images reuse the existing coordinate buffer.
@@ -109,8 +112,11 @@ normal; Geometry Normal read elsewhere in the graph is still undisplaced.
 
 The remaining unsupported node types are **Point Info, Volume Info and Script
 (OSL)**. They need point-cloud geometry, a volume-grid backend and an OSL runtime,
-respectively. Huang Hair remains an unsupported mode; its
-prototype failed roughness-dependent Cycles comparisons and is not enabled.
+respectively. Chiang and Huang Hair use the upstream closures, including Huang
+aspect ratio and R/TT/TRT lobes. Particle hair reads Blender's evaluated parent/child
+cache, and modern Curves exports point/curve attributes. Both use OptiX round
+linear segments with per-key radius; Catmull-Rom smoothing and motion keys are
+not implemented, so sparse curved guides can differ from Cycles.
 Warnings/fallbacks do not count as implementation of these features.
 
 ## Complete inventory
@@ -130,7 +136,7 @@ Native: **52**, Partial: **33**, Legacy: **6**, Unsupported: **3**, Outside Cycl
 | `ShaderNodeBsdfDiffuse` | Partial | Cycles Lambert and Oren-Nayar, including linked roughness, color and normal. |
 | `ShaderNodeBsdfGlass` | Partial | Cycles GGX, Beckmann and Multi-GGX dielectric reflection/transmission with thin film. |
 | `ShaderNodeBsdfHair` | Native | Cycles reflection/transmission closures; dynamic Color, Offset, RoughnessU/V and Tangent. Unlinked tangents follow strands or mesh dPdv. |
-| `ShaderNodeBsdfHairPrincipled` | Partial | Unmodified Cycles Chiang closure with Color/Melanin/Absorption parametrizations and strand randomization. Huang is rejected pending agreement with Cycles. |
+| `ShaderNodeBsdfHairPrincipled` | Partial | Unmodified Cycles Chiang/Huang closures, Color/Melanin/Absorption parametrizations, Huang aspect ratio and R/TT/TRT weights. Native round linear curves; no curve motion blur. |
 | `ShaderNodeBsdfMetallic` | Partial | Cycles GGX/Multi-GGX with F82 Edge Tint or physical conductor IOR/Extinction, anisotropy and thin film; Rec.709 working space. |
 | `ShaderNodeBsdfPrincipled` | Partial | Cycles numerical closures and layer ordering; dynamic tint, coat normal and thin film in addition to base/specular/coat/sheen/SSS inputs. Includes linked Diffuse Roughness; path integration remains renderer-specific. |
 | `ShaderNodeBsdfRayPortal` | Native | Dynamic color, position and direction; ray relocation also works inside Mix/Add trees. |
@@ -138,8 +144,8 @@ Native: **52**, Partial: **33**, Legacy: **6**, Unsupported: **3**, Outside Cycl
 | `ShaderNodeBsdfSheen` | Partial | Cycles Microfiber LTC and Ashikhmin Velvet, including linked Color/Roughness/Normal. Integrator limitations still apply. |
 | `ShaderNodeBsdfToon` | Native | Diffuse and glossy components with dynamic Color, Size, Smooth and Normal. |
 | `ShaderNodeBsdfTranslucent` | Partial | Cycles back-hemisphere Lambert closure with linked color and normal. |
-| `ShaderNodeBsdfTransparent` | Partial | Existing vibrt closure with dynamic supported color/value/normal sockets. See closure limitations below. |
-| `ShaderNodeBump` | Partial | Nested Bump graphs and normal chains use finite spatial differences. Ray differentials and displacement-aware Geometry Normal are incomplete. |
+| `ShaderNodeBsdfTransparent` | Partial | Colored transmission and RGB shadow extinction via Cycles surface transparency, including weighted Mix/Add trees and the transparent bounce limit. |
+| `ShaderNodeBump` | Partial | Cycles SVM bump with compact ray/UV differentials, Filter Width and nested normal chains. Displacement-aware Geometry Normal remains incomplete. |
 | `ShaderNodeCameraData` | Native | Shared C++ CPU/CUDA evaluator; socket conversions are explicit. |
 | `ShaderNodeClamp` | Native | Shared C++ CPU/CUDA evaluator; socket conversions are explicit. |
 | `ShaderNodeCombineColor` | Native | Shared C++ CPU/CUDA evaluator; socket conversions are explicit. |
@@ -151,7 +157,7 @@ Native: **52**, Partial: **33**, Legacy: **6**, Unsupported: **3**, Outside Cycl
 | `ShaderNodeFresnel` | Native | Shared C++ CPU/CUDA evaluator; socket conversions are explicit. |
 | `ShaderNodeGamma` | Native | Shared C++ CPU/CUDA evaluator; socket conversions are explicit. |
 | `ShaderNodeGroup` | Native | Nested groups, shader sockets and instance defaults; reroutes and muted nodes are followed. |
-| `ShaderNodeHairInfo` | Partial | Is Strand, Intercept, Length, Thickness, Random and Tangent Normal on exported legacy particle-hair ribbons. Modern Curves geometry is not exported. |
+| `ShaderNodeHairInfo` | Partial | Is Strand, Intercept, Length, Thickness, Random and Tangent Normal on evaluated particle hair and modern Curves with native round linear geometry. |
 | `ShaderNodeHoldout` | Native | Black contribution and holdout alpha with transparent film; weighted Mix/Add support. |
 | `ShaderNodeHueSaturation` | Native | Shared C++ CPU/CUDA evaluator; socket conversions are explicit. |
 | `ShaderNodeInvert` | Native | Shared C++ CPU/CUDA evaluator; socket conversions are explicit. |
@@ -166,7 +172,7 @@ Native: **52**, Partial: **33**, Legacy: **6**, Unsupported: **3**, Outside Cycl
 | `ShaderNodeMixShader` | Native | Separate weighted closures, including dynamic factors; 16 leaves / 8 levels maximum. |
 | `ShaderNodeNewGeometry` | Partial | Position, shading/geometric normal, incoming, tangent, backfacing and welded-mesh Pointiness. Random-per-island is unsupported. |
 | `ShaderNodeNormal` | Native | Shared C++ CPU/CUDA evaluator; socket conversions are explicit. |
-| `ShaderNodeNormalMap` | Partial | Multiple explicitly named UV maps use exported MikkTSpace tangents. The default unnamed UV retains triangle-derivative tangents; object/world and OpenGL/DirectX are supported. |
+| `ShaderNodeNormalMap` | Partial | Cycles SVM normal-map evaluation; explicitly named UV maps use exported MikkTSpace tangents. The default unnamed UV retains triangle-derivative tangents; object/world and OpenGL/DirectX are supported. |
 | `ShaderNodeObjectInfo` | Partial | Location, color, alpha, object/material pass indices; Random uses vibrt instance hashing, not Cycles hash identity. |
 | `ShaderNodeOutputAOV` | Native | Color/Value roots, including nested groups, written to registered Blender view-layer passes on render completion. |
 | `ShaderNodeOutputLight` | Partial | Point/Spot/Area Emission/Mix/Add trees run at NEE samples (and area-light hits), including Ray Length. Sun and IES use the existing exporter. Full light-object attributes and shadow-sample path depths are incomplete. |
@@ -186,7 +192,7 @@ Native: **52**, Partial: **33**, Legacy: **6**, Unsupported: **3**, Outside Cycl
 | `ShaderNodeShaderToRGB` | Outside Cycles surface scope | EEVEE, Freestyle or legacy node; not claimed as Cycles-compatible. |
 | `ShaderNodeSqueeze` | Outside Cycles surface scope | EEVEE, Freestyle or legacy node; not claimed as Cycles-compatible. |
 | `ShaderNodeSubsurfaceScattering` | Partial | Burley disk scattering (64-intersection cap), Random Walk and Random Walk Skin interior transport; see sampling and closure limitations above. |
-| `ShaderNodeTangent` | Partial | Named/active UV MikkTSpace tangents and radial tangents on meshes. Curve tangent semantics retain the ribbon approximation. |
+| `ShaderNodeTangent` | Partial | Named/active UV MikkTSpace tangents and radial tangents on meshes. Curve tangents follow the native segment. |
 | `ShaderNodeTexBrick` | Native | Spatial evaluation with linked inputs; Cycles 5.1.1 numerical helpers. |
 | `ShaderNodeTexChecker` | Native | Spatial evaluation with linked inputs; Cycles 5.1.1 numerical helpers. |
 | `ShaderNodeTexCoord` | Partial | Generated, UV, object, normal, camera, window, reflection. Explicit reference objects use their inverse world transform; instancer coordinates remain unsupported. Generated coordinates use evaluated mesh bounds. |
@@ -217,7 +223,7 @@ Native: **52**, Partial: **33**, Legacy: **6**, Unsupported: **3**, Outside Cycl
 | `ShaderNodeVolumePrincipled` | Legacy | Existing homogeneous volume export. No general spatial volume graph. |
 | `ShaderNodeVolumeScatter` | Legacy | Existing homogeneous volume export. No general spatial volume graph. |
 | `ShaderNodeWavelength` | Native | Shared C++ CPU/CUDA evaluator; socket conversions are explicit. |
-| `ShaderNodeWireframe` | Partial | Triangle edges with world or pixel size. Pixel size uses the primary camera footprint rather than propagated ray differentials. |
+| `ShaderNodeWireframe` | Partial | Cycles triangle-edge evaluation with world or pixel size, using propagated compact ray differentials. Curves return zero as in Cycles. |
 
 ## Validation
 
@@ -318,3 +324,20 @@ Surface closure regression: `scripts/test_surface_closures.py` renders 50 materi
 under environment and Sun illumination with 8,192 samples and unclamped
 contributions. It checks per-tile linear RGB against Cycles (8% relative,
 0.04 dark-value floor), including linked tint/normal/film/conductor sockets.
+
+Additional reuse regressions:
+
+- `scripts/test_native_curves.py`: Chiang/Huang, circular/elliptical cross sections.
+- `scripts/test_reuse_sampling.py`: finite/delta Point/Spot, scaled Spot, Sun,
+  rectangular/disk/elliptical Area and spread, colored transparent/glass shadows,
+  adaptive convergence and AOV normalization.
+- `scripts/test_reuse_transport.py`: Box/Gaussian/Blackman-Harris film filters,
+  circular/polygon/anamorphic apertures, orthographic DOF, and finite emitters
+  inside a colored absorbing/scattering medium.
+
+Film filters use Cycles inverse-CDF tables. Adaptive sampling uses the upstream
+class-A estimator, convergence check and two neighbor filter passes, with actual
+per-pixel counts for image/AOV normalization. Converged pixels skip work in later
+launches; the render still iterates to the configured sample limit. Homogeneous
+volume transport mixes Cycles equiangular and exponential distance proposals
+when a finite emitter is available; heterogeneous grids remain unsupported.

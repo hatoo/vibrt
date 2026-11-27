@@ -192,7 +192,7 @@ impl ShaderRequirements {
                 "Invalid Cycles surface model/distribution"
             );
             anyhow::ensure!(
-                m.closure_type <= 7 && m.closure_type != 6,
+                m.closure_type <= 8,
                 "Unsupported closure type {}",
                 m.closure_type
             );

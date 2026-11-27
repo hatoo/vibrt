@@ -23,14 +23,16 @@ static __device__ bool shadow_visible(float3 P, float3 dir, float tmax) {
 // crossings); past that we conservatively assume the light is unreachable
 // — pathological scenes only.
 static __device__ __noinline__ float4 emission_alpha(const PathVertex &v, bool include_emission);
+static __device__ __noinline__ float3 surface_shadow_transparency(const PathVertex &v);
 static __device__ __noinline__ float3 shadow_volume_transmittance(
     float3 P, float3 dir, float tmax, VolumeStack stack) {
   float3 tr = make_float3(1, 1, 1);
   float3 cur_origin = P;
   float remaining = tmax;
-  const int max_iters = VOL_STACK_MAX * 4 + 4;
+  const unsigned int max_iters = VOL_STACK_MAX * 4 + params.max_transparent_bounces + 1;
+  unsigned int transparent_bounces = 0;
 
-  for (int iter = 0; iter < max_iters; iter++) {
+  for (unsigned int iter = 0; iter < max_iters; iter++) {
     if (remaining <= 0.0f)
       return tr;
 
@@ -61,15 +63,7 @@ static __device__ __noinline__ float3 shadow_volume_transmittance(
     if (v.hit == 0)
       return tr; // reached light
 
-    // Surface in the way. Three cases:
-    //   1. Pure volume container — walk past, push/pop the volume stack.
-    //   2. Transmissive surface (Glass / Refraction / `transmission > 0`) —
-    //      attenuate by (1−F)·base_color and continue past, so the sun
-    //      reaches the pool floor through the water plane. Without this
-    //      the water acts as an opaque occluder for NEE and the only
-    //      light hitting underwater surfaces is the path-traced indirect
-    //      bounce, which is dim and noisy.
-    //   3. Anything else — opaque, return zero.
+    // Volume boundaries update the medium without changing surface throughput.
     if (v.mat != nullptr && v.mat->volume != nullptr &&
         v.mat->volume_only != 0) {
       bool entering = dot3(v.Ng, dir) < 0.0f;
@@ -83,46 +77,19 @@ static __device__ __noinline__ float3 shadow_volume_transmittance(
       cur_origin = next;
       continue;
     }
-    if (v.mat != nullptr && v.mat->shader_has_alpha) {
-      v.path_flags = 2u;
-      float transparent = 1.0f - emission_alpha(v, false).w;
-      if (transparent > 0.0f) {
-        tr = tr * transparent;
-        if (luminance(tr) < 1e-6f) return make_float3(0,0,0);
-        float3 next = offset_surface(v.P, v.Ng, dir);
-        remaining -= t_seg + dot3(next - v.P, dir);
-        cur_origin = next;
-        continue;
-      }
+    if (transparent_bounces++ >= params.max_transparent_bounces)
+      return make_float3(0, 0, 0);
+    v.path_flags = 2u;
+    tr = tr * surface_shadow_transparency(v);
+    if (luminance(tr) < 1e-6f)
+      return make_float3(0, 0, 0);
+    if (v.mat && v.mat->volume) {
+      if (dot3(v.Ng, dir) < 0) volume_stack_push(stack, v.mat->volume);
+      else volume_stack_pop(stack, v.mat->volume);
     }
-    if (v.mat != nullptr && v.mat->transmission > 0.0f) {
-      // Transparent shadow: keep the ray going through the surface,
-      // attenuated by `(1 − F) · base_color · transmission`. We can't
-      // call `eval_material` here because it's defined later in the
-      // translation unit and forward-declaring it just to share the
-      // (textured) base colour would pull in a lot of unrelated state;
-      // the constant `base_color` is correct for water / clear-glass
-      // (the common case) and only loses tint texture variation, which
-      // is rarely present on transmissive shaders.
-      float3 base = make_f3(v.mat->base_color);
-      float cos_i = fabsf(dot3(v.Ns, dir));
-      float F0_d = ((v.mat->ior - 1.0f) / (v.mat->ior + 1.0f)) *
-                   ((v.mat->ior - 1.0f) / (v.mat->ior + 1.0f))
-                   * (2.0f * v.mat->specular_ior_level);
-      float F = (F0_d + (1 - F0_d) * vibrt_cycles::schlick_fresnel(cos_i));
-      float3 t_factor = base * (1.0f - F) * v.mat->transmission;
-      // Surfaces with `transmission < 1` (e.g. Principled at 0.5) still
-      // partially absorb — fold the missing fraction into 0 so the ray
-      // does NOT pretend to also transmit the diffuse / specular share.
-      tr = tr * t_factor;
-      if (luminance(tr) < 1e-6f)
-        return make_float3(0, 0, 0);
-      float3 next = offset_surface(v.P, v.Ng, dir);
-      remaining -= t_seg + dot3(next - v.P, dir);
-      cur_origin = next;
-      continue;
-    }
-    return make_float3(0, 0, 0); // opaque occlusion
+    float3 next = offset_surface(v.P, v.Ng, dir);
+    remaining -= t_seg + dot3(next - v.P, dir);
+    cur_origin = next;
   }
   // Exceeded the iteration cap — conservatively block.
   return make_float3(0, 0, 0);
@@ -145,8 +112,8 @@ static __device__ __forceinline__ float3 shadow_transmittance(float3 P, float3 d
   P = start;
   // Keep binary visibility outside the volume walk's call frame. Most shadow
   // rays need neither its private stack copy nor its boundary-hit storage.
-  // The any-hit handler still applies the same transparent/cutout filtering.
-  if (params.world_volume == nullptr && stack.depth == 0) {
+  // Only scenes without transparent closures can use the binary query.
+  if (!params.has_shadow_transparency && params.world_volume == nullptr && stack.depth == 0) {
     return shadow_visible(P, dir, tmax) ? make_float3(1, 1, 1)
                                       : make_float3(0, 0, 0);
   }

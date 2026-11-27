@@ -205,6 +205,7 @@ pub struct HitGroupData {
     /// tangent — the device falls back to its default build_frame() tangent
     /// in that case. Currently only hair ribbon meshes ship a tangent blob.
     pub tangents: optix_sys::CUdeviceptr,
+    pub curve_radii: optix_sys::CUdeviceptr,
     pub bounds_min: [f32; 3],
     pub bounds_max: [f32; 3],
     pub object_to_world: [f32; 12],
@@ -299,6 +300,8 @@ pub struct SpotLight {
     pub ies_n_h: u32,
     pub light_rotation: [f32; 9],
     pub sphere: u32,
+    pub world_to_light: [f32; 9],
+    pub cos_larger_spread: f32,
 }
 
 #[repr(C)]
@@ -323,6 +326,8 @@ pub struct AreaRectLight {
     pub camera_visible: u32,
     pub emission: [f32; 3],
     pub power: f32,
+    pub tan_half_spread: f32,
+    pub normalize_spread: f32,
     /// IES profile for the rect. Sampled in the rect's local frame
     /// (theta from local +Z = emission axis). Same layout as
     /// `PointLight::ies_data`.
@@ -403,12 +408,17 @@ pub struct LaunchParams {
     /// Unnormalized float4 RGB/transparency sums retained between samples.
     /// Null for a one-sample render; independent of preview readback settings.
     pub accumulation: optix_sys::CUdeviceptr,
+    pub adaptive_buffer: optix_sys::CUdeviceptr,
+    pub adaptive_phase: u32,
+    pub adaptive_min_samples: u32,
+    pub adaptive_threshold: f32,
     pub width: u32,
     pub height: u32,
     pub samples_per_pixel: u32,
     pub sample_start: u32,
     pub sample_count: u32,
     pub film_transparent: u32,
+    pub has_shadow_transparency: u32,
     pub max_depth: u32,
     /// Per-lobe bounce caps (Cycles `diffuse_bounces` / `glossy_bounces` /
     /// `transmission_bounces`). Tracked separately by the path tracer so
@@ -424,6 +434,10 @@ pub struct LaunchParams {
     pub cam_v: [f32; 3],
     pub cam_w: [f32; 3],
     pub cam_lens_radius: f32,
+    pub cam_aperture_blades: f32,
+    pub cam_aperture_rotation: f32,
+    pub cam_inv_aperture_ratio: f32,
+    pub cam_filter_table: optix_sys::CUdeviceptr,
     pub cam_focal_distance: f32,
     /// World-space distance below which primary rays don't intersect
     /// geometry (= Blender camera's `clip_start`). Mirrors Cycles' near

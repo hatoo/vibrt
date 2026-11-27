@@ -67,7 +67,7 @@ static __device__ int intersect_rect_lights(float3 origin, float3 dir,
 
 static __device__ __noinline__ float3 trace_path(float3 origin, float3 dir,
                                                  RNG &rng, float first_ray_tmin,
-                                                 float &transparency) {
+                                                 float &transparency, float ray_dP, float ray_dD) {
   float3 throughput = make_float3(1, 1, 1);
   float3 L = make_float3(0, 0, 0);
   bool last_specular = true;
@@ -167,6 +167,7 @@ static __device__ __noinline__ float3 trace_path(float3 origin, float3 dir,
         // counting this as a bounce. Cap the retry depth so a pathological
         // all-back-faces direction can't loop forever.
         origin = offset_surface(v.P, v.Ng, dir);
+        ray_dP += v.ray_length * ray_dD;
         camera_skip++;
         bounce--;  // wraps to UINT_MAX, the for-loop's bounce++ brings it back to 0
         continue;
@@ -208,17 +209,30 @@ static __device__ __noinline__ float3 trace_path(float3 origin, float3 dir,
       float volume_start = (bounce == 0 && camera_skip == 0) ? first_ray_tmin : 0.0f;
       float volume_length = fmaxf(t_segment - volume_start, 0.0f);
       float sigma_t_avg = vol_sigma_t_avg(cur_vol);
+      // Emission is integrated over the full segment independently of the
+      // random scattering distance, including the endpoint survival branch.
+      L = L + throughput * vol_path_emission(cur_vol, volume_length, last_path_flags);
       if (sigma_t_avg > 1e-12f) {
+        vibrt_volume::Ray volume_ray{cycles_vector(origin + dir * volume_start), cycles_vector(dir)};
+        vibrt_volume::EquiangularCoefficients coeffs;
+        bool equiangular = luminance(make_f3(cur_vol->sigma_s)) > 0 &&
+            volume_equiangular_coefficients(origin + dir * volume_start, dir, volume_length, rng, coeffs);
         float u = rng.next();
-        float t_scatter =
-            -logf(fmaxf(1.0f - u, 1e-30f)) / sigma_t_avg;
+        float t_scatter, pdf_angular = 0;
+        if (equiangular && u < 0.5f)
+          t_scatter = vibrt_volume::volume_equiangular_sample(&volume_ray, coeffs, u * 2, &pdf_angular);
+        else {
+          t_scatter = -logf(fmaxf(1 - (equiangular ? (u - 0.5f) * 2 : u), 1e-30f)) / sigma_t_avg;
+          if (equiangular && t_scatter < volume_length)
+            pdf_angular = vibrt_volume::volume_equiangular_pdf(&volume_ray, coeffs, t_scatter);
+        }
         if (t_scatter < volume_length) {
           // --- Volume scatter event ---
-          // Path emission [0, t_scatter] (deterministic, noise-free).
-          L = L + throughput * vol_path_emission(cur_vol, t_scatter, last_path_flags);
           float3 P_scatter = origin + dir * (volume_start + t_scatter);
           float3 tr = vol_beam_transmittance(cur_vol, t_scatter);
           float pdf_t = sigma_t_avg * expf(-sigma_t_avg * t_scatter);
+          if (equiangular)
+            pdf_t = 0.5f * (pdf_t + pdf_angular);
           float3 sigma_s = make_float3(cur_vol->sigma_s[0],
                                        cur_vol->sigma_s[1],
                                        cur_vol->sigma_s[2]);
@@ -258,19 +272,17 @@ static __device__ __noinline__ float3 trace_path(float3 origin, float3 dir,
             throughput = throughput / q;
           }
           origin = P_scatter;
+          ray_dP += (volume_start + t_scatter) * ray_dD;
           dir = wi;
           continue;
         }
         // No scatter — path emission across the full segment, then apply
         // beam transmittance to the endpoint and divide by survival prob so
         // the no-scatter branch stays an unbiased estimator.
-        L = L + throughput * vol_path_emission(cur_vol, volume_length, last_path_flags);
         float3 tr = vol_beam_transmittance(cur_vol, volume_length);
         float pdf_surv = expf(-sigma_t_avg * volume_length);
+        if (equiangular) pdf_surv *= 0.5f;
         throughput = throughput * tr / fmaxf(pdf_surv, 1e-30f);
-      } else {
-        // Pure emitter (σ_t = 0): only path emission, no transmittance work.
-        L = L + throughput * vol_path_emission(cur_vol, volume_length, last_path_flags);
       }
     }
 
@@ -403,6 +415,7 @@ static __device__ __noinline__ float3 trace_path(float3 origin, float3 dir,
       else
         volume_stack_pop(vstack, v.mat->volume);
       origin = offset_surface(v.P, v.Ng, dir);
+      ray_dP += v.ray_length * ray_dD;
       if (++volume_boundaries > 128) break;
       if (bounce == 0) camera_skip++;
       bounce--; // the loop increment restores the same surface bounce
@@ -426,6 +439,8 @@ static __device__ __noinline__ float3 trace_path(float3 origin, float3 dir,
     v.glossy_depth = glossy_bounces;
     v.transmission_depth = transmission_bounces;
     v.path_flags = last_path_flags;
+    ray_dP = vibrt_differential::differential_transfer_compact(ray_dP, cycles_vector(dir), ray_dD, v.ray_length);
+    surface_differentials(&v, ray_dP);
     float e_weights[MAX_LEAVES];
     // View cosine for view-dependent (Fresnel) mix factors. `dir` is the
     // incoming ray (origin→hit); |dot(Ns, dir)| is the incidence cosine.
@@ -711,6 +726,20 @@ extern "C" __global__ void __raygen__rg() {
   uint3 dim = optixGetLaunchDimensions();
   unsigned int pixel = idx.y * dim.x + idx.x;
 
+  float *adaptive = params.adaptive_buffer ? params.adaptive_buffer + 9 * pixel : nullptr;
+  if (params.adaptive_phase) {
+    if (params.adaptive_phase == 1 && __float_as_uint(adaptive[8]) >= params.adaptive_min_samples)
+      vibrt_adaptive::film_adaptive_sampling_convergence_check(0, params.adaptive_buffer, idx.x, idx.y,
+                                                               params.adaptive_threshold, 0, 0, dim.x);
+    else if (params.adaptive_phase == 2 && idx.x == 0)
+      vibrt_adaptive::film_adaptive_sampling_filter_x(0, params.adaptive_buffer, idx.y, 0, dim.x, 0, dim.x);
+    else if (params.adaptive_phase == 3 && idx.y == 0)
+      vibrt_adaptive::film_adaptive_sampling_filter_y(0, params.adaptive_buffer, idx.x, 0, dim.y, 0, dim.x);
+    return;
+  }
+  if (adaptive && adaptive[7] != 0)
+    return;
+
   float3 eye = make_f3(params.cam_eye);
   float3 U = make_f3(params.cam_u);
   float3 V = make_f3(params.cam_v);
@@ -809,11 +838,12 @@ extern "C" __global__ void __raygen__rg() {
     accum = make_f3(&params.accumulation[pixel * 4]);
     transparency_sum = params.accumulation[pixel * 4 + 3];
   }
-  const unsigned int sample_end = params.sample_start + params.sample_count;
-  for (unsigned int s = params.sample_start; s < sample_end; s++) {
+  const unsigned int sample_start = adaptive ? __float_as_uint(adaptive[8]) : params.sample_start;
+  const unsigned int sample_end = sample_start + params.sample_count;
+  for (unsigned int s = sample_start; s < sample_end; s++) {
     RNG rng(pixel, s, 0u);
-    float jx = rng.next();
-    float jy = rng.next();
+    float jx = vibrt_camera::lookup_table_read(params.cam_filter_table, rng.next(), 0, 1024);
+    float jy = vibrt_camera::lookup_table_read(params.cam_filter_table, rng.next(), 0, 1024);
     float px = (2.0f * ((float)idx.x + jx) / (float)dim.x) - 1.0f
                + 2.0f * params.cam_shift_x;
     float py = (2.0f * ((float)idx.y + jy) / (float)dim.y) - 1.0f
@@ -831,10 +861,11 @@ extern "C" __global__ void __raygen__rg() {
     if (params.cam_lens_radius > 0.0f) {
       float u1 = rng.next();
       float u2 = rng.next();
-      float r = sqrtf(u1);
-      float phi = 2.0f * M_PIf * u2;
-      float lx = r * cosf(phi) * params.cam_lens_radius;
-      float ly = r * sinf(phi) * params.cam_lens_radius;
+      vibrt_cycles::KernelCamera camera{params.cam_aperture_blades, params.cam_aperture_rotation,
+                                        params.cam_inv_aperture_ratio};
+      auto bokeh = vibrt_cycles::camera_sample_aperture(&camera, vibrt_cycles::make_float2(u1, u2));
+      float lx = bokeh.x * params.cam_lens_radius;
+      float ly = bokeh.y * params.cam_lens_radius;
       float3 Uunit = normalize3(U);
       float3 Vunit = normalize3(V);
       // Cycles' focus_distance is measured from the camera (eye),
@@ -847,8 +878,20 @@ extern "C" __global__ void __raygen__rg() {
     }
 
     float transparency;
-    accum = accum +
-            trace_path(origin, dir, rng, params.cam_clip_start, transparency);
+    float pixel_radius = sqrtf(dot3(U, U)) / dim.x + sqrtf(dot3(V, V)) / dim.y;
+    float ray_dP = params.cam_orthographic ? pixel_radius : 0;
+    float ray_dD = params.cam_orthographic ? 0 :
+        0.5f * (vibrt_cycles::len(cycles_vector(normalize3(U * (px + 2.0f / dim.x) + V * py + W) -
+                                               normalize3(U * px + V * py + W))) +
+                vibrt_cycles::len(cycles_vector(normalize3(U * px + V * (py + 2.0f / dim.y) + W) -
+                                               normalize3(U * px + V * py + W))));
+    float3 contribution = trace_path(origin, dir, rng, params.cam_clip_start, transparency, ray_dP, ray_dD);
+    accum = accum + contribution;
+    if (adaptive && vibrt_adaptive::sample_is_class_A(0, s)) {
+      adaptive[4] += 2 * contribution.x;
+      adaptive[5] += 2 * contribution.y;
+      adaptive[6] += 2 * contribution.z;
+    }
     transparency_sum += transparency;
   }
   if (params.accumulation != nullptr) {
@@ -859,6 +902,11 @@ extern "C" __global__ void __raygen__rg() {
     sum[3] = transparency_sum;
   }
   float inv = 1.0f / (float)sample_end;
+  if (adaptive) {
+    adaptive[0] = accum.x; adaptive[1] = accum.y; adaptive[2] = accum.z;
+    adaptive[3] = transparency_sum;
+    adaptive[8] = __uint_as_float(sample_end);
+  }
   accum = accum * inv;
 
   // y is 0 at top of image; we'll flip on CPU side for EXR.

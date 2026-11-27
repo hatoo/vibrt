@@ -2,7 +2,16 @@
 use crate::gpu_types::QueryNode;
 pub type Bounds = ([f32; 3], [f32; 3]);
 
+#[cfg(test)]
 pub fn build_triangles(vertices: &[f32], indices: &[u32]) -> (Vec<QueryNode>, Vec<u32>) {
+    build_geometry(vertices, indices, &[])
+}
+
+pub fn build_geometry(
+    vertices: &[f32],
+    indices: &[u32],
+    radii: &[f32],
+) -> (Vec<QueryNode>, Vec<u32>) {
     let bounds: Vec<_> = indices
         .as_chunks::<3>()
         .0
@@ -12,8 +21,9 @@ pub fn build_triangles(vertices: &[f32], indices: &[u32]) -> (Vec<QueryNode>, Ve
             for &index in triangle {
                 for axis in 0..3 {
                     let v = vertices[index as usize * 3 + axis];
-                    lo[axis] = lo[axis].min(v);
-                    hi[axis] = hi[axis].max(v);
+                    let radius = radii.get(index as usize).copied().unwrap_or(0.0);
+                    lo[axis] = lo[axis].min(v - radius);
+                    hi[axis] = hi[axis].max(v + radius);
                 }
             }
             (lo, hi)

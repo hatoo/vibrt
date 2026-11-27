@@ -14,6 +14,9 @@ struct PathVertex {
   float object_random;
   float3 P_object, generated, N_object, object_location, incoming;
   float3 dPdu, dPdv;
+  float dP;
+  float curve_radius;
+  vibrt_differential::differential du, dv;
   float3 dOdu, dOdv, dGdu, dGdv;
   HitGroupData *geometry;
   unsigned int primitive, shader_seed;

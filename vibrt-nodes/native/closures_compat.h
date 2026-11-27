@@ -1,6 +1,7 @@
 // Scene-independent adapter for unmodified Cycles surface/hair closure functions.
 // Included inside vibrt_cycles after the numerical node helpers.
 #define __HAIR__
+#define ccl_restrict __restrict
 #define SHADER_CLOSURE_BASE                                                    \
   float3 N;                                                                    \
   int type;                                                                    \
