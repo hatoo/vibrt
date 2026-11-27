@@ -31,6 +31,7 @@ pub fn compile_ptx(requirements: ShaderRequirements) -> Result<String> {
         shader_stack_size,
         shader_contexts,
         closure_types,
+        shader_outputs,
         shader_output_count,
         has_aovs,
         has_extended_phases,
@@ -85,7 +86,7 @@ pub fn compile_ptx(requirements: ShaderRequirements) -> Result<String> {
         ..Default::default()
     };
     let full_src = format!(
-        "#define VIBRT_SHADER_OPS {shader_ops}ull\n#define VIBRT_MAX_CLOSURES {max_closures}\n#define VIBRT_SHADER_STACK_SIZE {shader_stack_size}\n#define VIBRT_SHADER_CONTEXTS {shader_contexts}u\n#define VIBRT_SHADER_CONTEXT_SIZE {shader_context_size}\n#define VIBRT_CLOSURE_TYPES {closure_types}u\n#define VIBRT_SHADER_OUTPUT_COUNT {shader_output_count}\n#define VIBRT_AOVS {}\n#define VIBRT_EXTENDED_PHASES {}\n// -- inlined devicecode.h --\n{}\n// -- devicecode.cu --\n{}",
+        "#define VIBRT_SHADER_OPS {shader_ops}ull\n#define VIBRT_MAX_CLOSURES {max_closures}\n#define VIBRT_SHADER_STACK_SIZE {shader_stack_size}\n#define VIBRT_SHADER_CONTEXTS {shader_contexts}u\n#define VIBRT_SHADER_CONTEXT_SIZE {shader_context_size}\n#define VIBRT_CLOSURE_TYPES {closure_types}u\n#define VIBRT_SHADER_OUTPUTS {shader_outputs}ull\n#define VIBRT_SHADER_OUTPUT_COUNT {shader_output_count}\n#define VIBRT_AOVS {}\n#define VIBRT_EXTENDED_PHASES {}\n// -- inlined devicecode.h --\n{}\n// -- devicecode.cu --\n{}",
         u8::from(has_aovs),
         u8::from(has_extended_phases),
         header_src.replace(

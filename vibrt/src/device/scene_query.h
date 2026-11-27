@@ -342,7 +342,7 @@ static __device__ __noinline__ bool scatter_subsurface(PathVertex &v,
 }
 #endif
 
-#if (VIBRT_SHADER_OPS & ((255ull << 40) | (1ull << 51)))
+#if (VIBRT_SHADER_OPS & ((255ull << 40) | (1ull << 51) | (1ull << 32) | (1ull << 48)))
 namespace vibrt_shader {
 VN_INLINE vibrt_scene_nodes::ShaderData normal_map_data(const float4 *ctx, float4 tangent,
                                                         bool named, const SceneServices &services) {

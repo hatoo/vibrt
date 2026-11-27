@@ -41,6 +41,7 @@ pub struct ShaderRequirements {
     pub shader_stack_size: usize,
     pub shader_contexts: u32,
     pub closure_types: u32,
+    pub shader_outputs: u64,
     pub shader_output_count: usize,
     pub has_aovs: bool,
     pub has_extended_phases: bool,
@@ -186,7 +187,14 @@ impl ShaderRequirements {
                 }
             }
         }
-        fn extended_requirements(m: &PrincipledMaterial) -> Result<(u32, usize)> {
+        fn graph_outputs(graph: &vibrt_nodes::shader::ShaderGraph) -> u64 {
+            vibrt_nodes::shader::OUTPUTS
+                .iter()
+                .enumerate()
+                .filter(|(_, name)| graph.outputs.contains_key(**name))
+                .fold(0, |mask, (slot, _)| mask | (1u64 << slot))
+        }
+        fn extended_requirements(m: &PrincipledMaterial) -> Result<(u32, u64)> {
             anyhow::ensure!(
                 m.surface_model <= 8 && m.distribution <= 2,
                 "Invalid Cycles surface model/distribution"
@@ -201,38 +209,44 @@ impl ShaderRequirements {
             } else {
                 1 << m.closure_type
             };
-            let mut outputs = 32;
+            let mut outputs = 0;
             anyhow::ensure!(m.sss_method <= 3, "Unsupported subsurface method");
             if m.sss_method != 0 {
                 kinds |= 1 << 7;
-                outputs = 64;
             }
             for graph in m
                 .shader_graph
                 .iter()
                 .chain(m.aov_graphs.iter().map(|a| &a.graph))
+                .chain(m.volume.iter().filter_map(|v| v.emission_graph.as_ref()))
             {
-                if graph
-                    .outputs
-                    .keys()
-                    .any(|name| vibrt_nodes::shader::OUTPUTS[32..].contains(&name.as_str()))
-                {
-                    outputs = 64;
-                }
+                outputs |= graph_outputs(graph);
             }
             for child in [&m.left_subtree, &m.secondary].into_iter().flatten() {
                 let (child_kinds, child_outputs) = extended_requirements(child)?;
                 kinds |= child_kinds;
-                outputs = outputs.max(child_outputs);
+                outputs |= child_outputs;
             }
             Ok((kinds, outputs))
         }
-        let (mut closure_types, mut shader_output_count) = (0, 32);
+        let (mut closure_types, mut shader_outputs) = (0, 0);
         for m in materials {
             let (kinds, outputs) = extended_requirements(m)?;
             closure_types |= kinds;
-            shader_output_count = shader_output_count.max(outputs);
+            shader_outputs |= outputs;
         }
+        if let Some(graph) = world_volume.and_then(|v| v.emission_graph.as_ref()) {
+            shader_outputs |= graph_outputs(graph);
+        }
+        // Keep the existing 32/64-slot buckets, including the implicit bump
+        // reads at 27/28 and Chiang/Huang hair reads through 57. Static SSS parameters
+        // live in PrincipledGpu and do not require upper graph output slots.
+        let shader_output_count =
+            if shader_outputs >> 32 != 0 || closure_types & ((1 << 5) | (1 << 6)) != 0 {
+                64
+            } else {
+                32
+            };
         // Bucket capacities to keep a small set of cached kernels across scene edits.
         fn extended_volume(m: &PrincipledMaterial) -> bool {
             m.volume.as_ref().is_some_and(|v| v.phase != 0)
@@ -250,6 +264,7 @@ impl ShaderRequirements {
             shader_stack_size: shader_stack_size.max(4).next_power_of_two(),
             shader_contexts,
             closure_types,
+            shader_outputs,
             shader_output_count,
             has_aovs: aov_count > 0,
             has_extended_phases: extended_phases,
@@ -292,7 +307,95 @@ mod tests {
         .unwrap();
         let requirements = ShaderRequirements::new(&[material], 0, None).unwrap();
         assert_ne!(requirements.closure_types & (1 << 7), 0);
+        assert_eq!(requirements.shader_output_count, 32);
+        assert_eq!(requirements.shader_outputs, 0);
+    }
+
+    #[test]
+    fn output_requirements_cover_nested_materials_aovs_and_volumes() {
+        let graph = |name: &str| {
+            json!({"nodes":[{"op":"constant","params":[1,1,1,1]}],
+                   "outputs":{name:0}})
+        };
+        let material: PrincipledMaterial = serde_json::from_value(json!({
+            "base_color":[1,1,1], "shader_graph":graph("normal"),
+            "left_subtree":{
+                "base_color":[1,1,1], "shader_graph":graph("sss_scale")
+            },
+            "secondary":{
+                "base_color":[1,1,1], "shader_graph":graph("coat_tint"),
+                "aov_graphs":[{"index":0,"graph":{
+                    "nodes":[{"op":"constant","params":[1,1,1,1]}],
+                    "outputs":{"base_color":0,"volume_emission":0}
+                }}],
+                "volume":{"emission_graph":graph("emission")}
+            }
+        }))
+        .unwrap();
+        let requirements = ShaderRequirements::new(&[material], 1, None).unwrap();
+        assert_eq!(
+            requirements.shader_outputs,
+            1 | (1 << 5) | (1 << 24) | (1 << 37) | (1 << 41) | (1 << 63)
+        );
         assert_eq!(requirements.shader_output_count, 64);
+        let volume = serde_json::from_value(json!({"emission_graph":graph("emission")})).unwrap();
+        let world = ShaderRequirements::new(&[], 0, Some(&volume)).unwrap();
+        assert_eq!(world.shader_outputs, 1 << 5);
+        assert_eq!(world.shader_output_count, 32);
+    }
+
+    #[test]
+    fn output_only_edits_change_the_shader_cache_key() {
+        let mut material: PrincipledMaterial = serde_json::from_value(json!({
+            "base_color":[1,1,1], "shader_graph":{
+                "nodes":[{"op":"constant","params":[1,1,1,1]}],
+                "outputs":{"base_color":0}
+            }
+        }))
+        .unwrap();
+        let before = ShaderRequirements::new(std::slice::from_ref(&material), 0, None).unwrap();
+        let outputs = &mut material.shader_graph.as_mut().unwrap().outputs;
+        outputs.remove("base_color");
+        outputs.insert("roughness".into(), 0);
+        let after = ShaderRequirements::new(&[material], 0, None).unwrap();
+        assert_eq!(before.shader_ops, after.shader_ops);
+        assert_eq!(before.shader_stack_size, after.shader_stack_size);
+        assert_eq!(before.shader_contexts, after.shader_contexts);
+        assert_eq!(before.shader_output_count, after.shader_output_count);
+        assert_eq!(before.shader_outputs, 1);
+        assert_eq!(after.shader_outputs, 1 << 1);
+        assert_ne!(before, after);
+    }
+
+    #[test]
+    fn output_capacity_covers_all_writes_and_implicit_hair_reads() {
+        for (slot, name) in vibrt_nodes::shader::OUTPUTS.iter().enumerate() {
+            let material: PrincipledMaterial = serde_json::from_value(json!({
+                "base_color":[1,1,1], "shader_graph":{
+                    "nodes":[{"op":"constant","params":[1,1,1,1]}],
+                    "outputs":{*name:0}
+                }
+            }))
+            .unwrap();
+            let requirements = ShaderRequirements::new(&[material], 0, None).unwrap();
+            assert_eq!(requirements.shader_outputs, 1 << slot);
+            assert_eq!(
+                requirements.shader_output_count,
+                if slot < 32 { 32 } else { 64 }
+            );
+        }
+        for kind in [5, 6] {
+            let hair = serde_json::from_value(json!({
+                "base_color":[1,1,1], "closure_type":kind
+            }))
+            .unwrap();
+            assert_eq!(
+                ShaderRequirements::new(&[hair], 0, None)
+                    .unwrap()
+                    .shader_output_count,
+                64
+            );
+        }
     }
 
     #[test]
