@@ -278,6 +278,12 @@ struct ShaderEvalCache {
   float3 normal, tangent;
 };
 
+static __forceinline__ __device__ unsigned long long shader_outputs(const PrincipledGpu *m) {
+  // The host includes surface, closure-child, AOV and volume graphs in this
+  // union. Constant bits let NVRTC omit unused material-output branches.
+  return m->shader_outputs & VIBRT_SHADER_OUTPUTS;
+}
+
 static __device__ __noinline__ MaterialEval eval_material_one(const PathVertex &v,
                                                   PrincipledGpu *m,
                                                   ShaderEvalCache &cache,
@@ -364,7 +370,7 @@ static __device__ __noinline__ MaterialEval eval_material_one(const PathVertex &
     vibrt_cycles::float4 *out=cache.outputs;
     bool cached=cache.nodes==m->shader_nodes;
     if(!cached)evaluate_shader(m,v,out);
-    unsigned long long mask = m->shader_outputs;
+    unsigned long long mask = shader_outputs(m);
 #define GRAPH_SCALAR(I, F)                                                     \
   if (mask & (1ull << I))                                                      \
   e.F = out[I].x
@@ -386,7 +392,7 @@ static __device__ __noinline__ MaterialEval eval_material_one(const PathVertex &
     GRAPH_COLOR(48, conductor_k);
     GRAPH_SCALAR(49, diffuse_roughness);
 #endif
-#if (VIBRT_CLOSURE_TYPES & (1u << 7))
+#if (VIBRT_CLOSURE_TYPES & (1u << 7)) && VIBRT_SHADER_OUTPUT_COUNT > 32
     GRAPH_SCALAR(41, sss_scale);
     GRAPH_SCALAR(42, sss_ior);
     GRAPH_SCALAR(43, sss_anisotropy);
@@ -605,7 +611,7 @@ static __device__ __noinline__ MaterialEval eval_material_one(const PathVertex &
 // things like edge-wear blends or multi-material decals.
 static __device__ float compute_level_mix_fac(PrincipledGpu *m, const PathVertex &v,
                                               float NoV) {
-  if (m->shader_outputs & (1u << 23)) {
+  if (shader_outputs(m) & (1u << 23)) {
     vibrt_cycles::float4 out[VIBRT_SHADER_OUTPUT_COUNT];
     evaluate_shader(m, v, out, vibrt_shader::EVAL_MIX);
     return fminf(fmaxf(out[23].x, 0.0f), 1.0f);
@@ -1282,7 +1288,7 @@ static __device__ __noinline__ float4 emission_alpha_impl(const PathVertex &v,bo
     // samples and visible hits; evaluating emission alone skips coat/sheen.
     if (include_emission && !m->surface_model && !m->pure_diffuse && !m->pure_glossy &&
         (m->coat_weight > 0 || m->sheen_weight > 0 ||
-         (m->shader_outputs & ((1ull << 11) | (1ull << 14))))) {
+         (shader_outputs(m) & ((1ull << 11) | (1ull << 14))))) {
       ShaderEvalCache cache{};
       MaterialEval material = eval_material_one(v, m, cache);
       emission = emission + material.emission * e.w;
@@ -1292,14 +1298,14 @@ static __device__ __noinline__ float4 emission_alpha_impl(const PathVertex &v,bo
     float3 em=make_f3(m->emission);float alpha=m->alpha_blend;
     if(include_emission&&m->emission_tex){const float *M=m->uv_transform;float2 uv=make_float2(M[0]*v.uv.x+M[1]*v.uv.y+M[2],M[3]*v.uv.x+M[4]*v.uv.y+M[5]);em=em*sample_rgba(m->emission_tex,m->emission_tex_w,m->emission_tex_h,m->emission_tex_channels,uv);}
     unsigned int outputs=(1u<<7)|(include_emission?((1u<<5)|(1u<<6)):0);
-    if (m->shader_outputs & outputs) {
+    if (shader_outputs(m) & outputs) {
       vibrt_cycles::float4 out[VIBRT_SHADER_OUTPUT_COUNT];
       evaluate_shader(m, v, out,
                       vibrt_shader::EVAL_ALPHA |
                           (include_emission ? vibrt_shader::EVAL_EMISSION : 0));
-      if(include_emission&&(m->shader_outputs&(1u<<5)))em=make_float3(out[5].x,out[5].y,out[5].z);
-      if(include_emission&&(m->shader_outputs&(1u<<6)))em=em*out[6].x;
-      if(m->shader_outputs&(1u<<7))alpha=fminf(fmaxf(out[7].x,0.0f),1.0f);
+      if(include_emission&&(shader_outputs(m)&(1u<<5)))em=make_float3(out[5].x,out[5].y,out[5].z);
+      if(include_emission&&(shader_outputs(m)&(1u<<6)))em=em*out[6].x;
+      if(shader_outputs(m)&(1u<<7))alpha=fminf(fmaxf(out[7].x,0.0f),1.0f);
     }
     emission=emission+em*(e.w*alpha);transparent+=e.w*(1-alpha);
   }

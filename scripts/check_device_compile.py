@@ -14,10 +14,15 @@ ROOT = Path(__file__).resolve().parents[1]
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--minimal", action="store_true", help="Compile a scene without special closures")
+    parser.add_argument("--normal-map-op", type=int, choices=(32, 48),
+                        help="Compile only one normal-map opcode to check its definition dependencies")
+    parser.add_argument("--generated-header", type=Path, help="Explicit generated cycles_nodes.h")
+    parser.add_argument("--output", type=Path, help="Directory for kernel, PTX and compile log")
     args = parser.parse_args()
     native = ROOT / "vibrt-nodes/native"
-    generated = sorted((ROOT / "target").glob("*/build/vibrt-nodes-*/out/cycles_nodes.h"),
-                       key=lambda p: p.stat().st_mtime)[-1]
+    generated = args.generated_header or sorted(
+        (ROOT / "target").glob("*/build/vibrt-nodes-*/out/cycles_nodes.h"),
+        key=lambda p: p.stat().st_mtime)[-1]
     replacements = {
         "devicecode.h": ROOT / "vibrt/src/devicecode.h",
         "vibrt_nodes_types.h": native / "types.h",
@@ -42,12 +47,16 @@ def main():
 #define VIBRT_SHADER_CONTEXT_SIZE 32
 #define VIBRT_CLOSURE_TYPES 0xffffffffu
 #define VIBRT_SHADER_OUTPUT_COUNT 64
+#define VIBRT_SHADER_OUTPUTS 0xffffffffffffffffull
 #define VIBRT_AOVS 1
 #define VIBRT_EXTENDED_PHASES 1
 """ + source
     if args.minimal:
         source = source.replace("#define VIBRT_CLOSURE_TYPES 0xffffffffu", "#define VIBRT_CLOSURE_TYPES 0u")
-    directory = ROOT / ("target/device-check-minimal" if args.minimal else "target/device-check")
+    if args.normal_map_op is not None:
+        source = source.replace("#define VIBRT_SHADER_OPS 0xffffffffffffffffull",
+                                f"#define VIBRT_SHADER_OPS {1 << args.normal_map_op}ull")
+    directory = args.output or ROOT / ("target/device-check-minimal" if args.minimal else "target/device-check")
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "kernel.cu").write_text(source, encoding="utf-8")
     cuda = Path(os.environ.get("CUDA_PATH", "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.0"))
@@ -74,9 +83,11 @@ def main():
         nvrtc.nvrtcGetPTX(program, ptx)
         (directory / "kernel.ptx").write_bytes(ptx.value)
         # OptiX looks up these unreferenced device functions by name at runtime.
-        for entry in (b"__continuation_callable__query", b"__continuation_callable__shader",
-                      b"__continuation_callable__material", b"__continuation_callable__emission",
-                      b"__continuation_callable__shadow"):
+        entries = [b"__continuation_callable__query"]
+        if args.normal_map_op is None:
+            entries.extend((b"__continuation_callable__shader", b"__continuation_callable__material",
+                            b"__continuation_callable__emission", b"__continuation_callable__shadow"))
+        for entry in entries:
             assert entry in ptx.value, f"NVRTC removed {entry.decode()}"
         variant = "minimal closures" if args.minimal else "all closure/node branches"
         print(f"NVRTC compiled {variant} ({size.value} PTX bytes); no GPU context created.")
