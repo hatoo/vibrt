@@ -223,7 +223,7 @@ Native: **52**, Partial: **33**, Legacy: **6**, Unsupported: **3**, Outside Cycl
 | `ShaderNodeVolumePrincipled` | Legacy | Existing homogeneous volume export. No general spatial volume graph. |
 | `ShaderNodeVolumeScatter` | Legacy | Existing homogeneous volume export. No general spatial volume graph. |
 | `ShaderNodeWavelength` | Native | Shared C++ CPU/CUDA evaluator; socket conversions are explicit. |
-| `ShaderNodeWireframe` | Partial | Triangle edges with world or pixel size. Pixel size uses the primary camera footprint rather than propagated ray differentials. |
+| `ShaderNodeWireframe` | Partial | Cycles triangle-edge evaluation with world or pixel size, using propagated compact ray differentials. Curves return zero as in Cycles. |
 
 ## Validation
 
