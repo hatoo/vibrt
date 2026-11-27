@@ -3,7 +3,6 @@ mod gpu_scene;
 mod job;
 mod lighting;
 mod mesh_uploads;
-mod query_cache;
 mod sample_batches;
 mod session;
 mod types;

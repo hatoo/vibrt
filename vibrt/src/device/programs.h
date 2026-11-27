@@ -50,3 +50,49 @@ extern "C" __global__ void __miss__ms() {
 }
 
 extern "C" __global__ void __miss__shadow() { optixSetPayload_0(1u); }
+
+// Query intersections ignore material alpha, preserving raw geometry semantics.
+extern "C" __global__ void __anyhit__query() {
+  QueryPayload *p = (QueryPayload *)unpack_ptr(optixGetPayload_0(), optixGetPayload_1());
+  unsigned int instance = optixGetInstanceId();
+  if ((p->only_local && instance != p->instance) ||
+      (p->skip_self && instance == p->instance && optixGetPrimitiveIndex() == p->primitive))
+    optixIgnoreIntersection();
+}
+extern "C" __global__ void __closesthit__query() {
+  QueryPayload *p = (QueryPayload *)unpack_ptr(optixGetPayload_0(), optixGetPayload_1());
+  SceneQuery &q = *p->result;
+  q.hit = true;
+  q.geometry = (HitGroupData *)optixGetSbtDataPointer();
+  q.hit_primitive = optixGetPrimitiveIndex();
+  q.distance = optixGetRayTmax();
+  q.bary = q.geometry->curve_radii ? make_float2(optixGetCurveParameter(), 0) : optixGetTriangleBarycentrics();
+}
+extern "C" __global__ void __miss__query() {}
+
+#if (VIBRT_SHADER_OPS & (7ull << 41))
+extern "C" __device__ void __continuation_callable__shader(
+    PrincipledGpu *m, const PathVertex *v, vibrt_cycles::float4 *out,
+    unsigned int requested, int derivative) {
+  evaluate_shader_vm_impl(m, *v, out, requested, derivative);
+}
+#endif
+
+extern "C" __device__ void __continuation_callable__query(QueryCall *call) {
+  call->result = query_scene_impl(*call->vertex, call->origin, call->direction,
+                                 call->distance, call->only_local, call->skip_self,
+                                 call->mask, call->tmin);
+}
+
+#if (VIBRT_SHADER_OPS & (7ull << 41))
+extern "C" __device__ void __continuation_callable__material(MaterialCall *call) {
+  call->count = eval_material_impl(*call->vertex, call->slots, call->weights,
+                                   call->max_leaves, call->min_alpha, call->NoV);
+}
+extern "C" __device__ void __continuation_callable__emission(EmissionCall *call) {
+  call->result = emission_alpha_impl(*call->vertex, call->include_emission);
+}
+extern "C" __device__ void __continuation_callable__shadow(ShadowCall *call) {
+  call->result = surface_shadow_transparency_impl(*call->vertex);
+}
+#endif

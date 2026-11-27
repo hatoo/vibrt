@@ -100,11 +100,22 @@ static __device__ void shader_context(const PathVertex &v, vibrt_cycles::float4 
 #undef CTX_VEC
 #undef NEED
 }
-static __device__ __noinline__ void evaluate_shader_vm(PrincipledGpu *m,const PathVertex &v,vibrt_cycles::float4 *out,unsigned int requested,int derivative) {
+static __device__ __noinline__ void evaluate_shader_vm_impl(PrincipledGpu *m,const PathVertex &v,vibrt_cycles::float4 *out,unsigned int requested,int derivative) {
   vibrt_cycles::float4 ctx[VIBRT_SHADER_CONTEXT_SIZE];shader_context(v,ctx,m->shader_contexts,derivative);
   vibrt_shader::SceneServices services{&v, derivative};
   vibrt_shader::evaluate_vm((const ShaderInstruction *)m->shader_nodes,
                             m->shader_len, ctx, out, requested, &services);
+}
+// Keep the tracing interpreter behind a continuation-callable boundary so
+// OptiX does not duplicate it into every material/light/shadow evaluation site.
+static __device__ void evaluate_shader_vm(PrincipledGpu *m, const PathVertex &v,
+                                        vibrt_cycles::float4 *out, unsigned int requested, int derivative) {
+#if (VIBRT_SHADER_OPS & (7ull << 41))
+  optixContinuationCall<void, PrincipledGpu *, const PathVertex *, vibrt_cycles::float4 *, unsigned int, int>(
+      1, m, &v, out, requested, derivative);
+#else
+  evaluate_shader_vm_impl(m, v, out, requested, derivative);
+#endif
 }
 static __device__ __noinline__ void evaluate_shader_single(PrincipledGpu *m,float2 uv,vibrt_cycles::float4 *out,unsigned int requested) {
   const ShaderInstruction &n=*(const ShaderInstruction*)m->shader_nodes;
@@ -643,7 +654,27 @@ static __device__ float compute_level_mix_fac(PrincipledGpu *m, const PathVertex
 // `max_leaves == 1` makes this behave like the AOV-pass single-closure
 // query (just emit the leftmost leaf). `slots == nullptr` is treated
 // the same way (return 0 leaves — caller signalled "I don't care").
-static __device__ __noinline__ int eval_material(const PathVertex &v,
+// Traced shader graphs otherwise force the entire material evaluator to inline.
+struct MaterialCall {
+  const PathVertex *vertex;
+  MaterialEval *slots;
+  float *weights;
+  int max_leaves;
+  float min_alpha, NoV;
+  int count;
+};
+static __device__ __noinline__ int eval_material_impl(const PathVertex &, MaterialEval *, float *, int, float, float);
+static __device__ int eval_material(const PathVertex &v, MaterialEval *slots, float *weights,
+                                    int max_leaves, float min_alpha = 0, float NoV = 1) {
+#if (VIBRT_SHADER_OPS & (7ull << 41))
+  MaterialCall call = {&v, slots, weights, max_leaves, min_alpha, NoV, 0};
+  optixContinuationCall<void, MaterialCall *>(2, &call);
+  return call.count;
+#else
+  return eval_material_impl(v, slots, weights, max_leaves, min_alpha, NoV);
+#endif
+}
+static __device__ __noinline__ int eval_material_impl(const PathVertex &v,
                                      MaterialEval *slots,
                                      float *weights,
                                      int max_leaves,
@@ -1167,7 +1198,18 @@ static __device__ BsdfSample sample_bsdf(const MaterialEvalGroup &g,
 
 static __device__ __noinline__ void fill_surface_vertex(PathVertex*,HitGroupData*,unsigned int,float2,float3,float,unsigned int,const float3 * = nullptr);
 
+struct ShadowCall { const PathVertex *vertex; float3 result; };
+static __device__ __noinline__ float3 surface_shadow_transparency_impl(const PathVertex &);
 static __device__ __noinline__ float3 surface_shadow_transparency(const PathVertex &v) {
+#if (VIBRT_SHADER_OPS & (7ull << 41))
+  ShadowCall call = {&v, {}};
+  optixContinuationCall<void, ShadowCall *>(4, &call);
+  return call.result;
+#else
+  return surface_shadow_transparency_impl(v);
+#endif
+}
+static __device__ __noinline__ float3 surface_shadow_transparency_impl(const PathVertex &v) {
   struct Entry { PrincipledGpu *material; float weight; bool leaf; };
   Entry stack[32];
   int count = 0;
@@ -1214,7 +1256,18 @@ static __device__ __noinline__ float3 surface_shadow_transparency(const PathVert
   return make_float3(value.x, value.y, value.z);
 }
 
-static __device__ __noinline__ float4 emission_alpha(const PathVertex &v,bool include_emission=true) {
+struct EmissionCall { const PathVertex *vertex; bool include_emission; float4 result; };
+static __device__ __noinline__ float4 emission_alpha_impl(const PathVertex &, bool);
+static __device__ __noinline__ float4 emission_alpha(const PathVertex &v, bool include_emission = true) {
+#if (VIBRT_SHADER_OPS & (7ull << 41))
+  EmissionCall call = {&v, include_emission, {}};
+  optixContinuationCall<void, EmissionCall *>(3, &call);
+  return call.result;
+#else
+  return emission_alpha_impl(v, include_emission);
+#endif
+}
+static __device__ __noinline__ float4 emission_alpha_impl(const PathVertex &v,bool include_emission=true) {
   struct Entry {PrincipledGpu *m;float w;bool leaf;};
   Entry stack[32];int sp=0;stack[sp++]={v.mat,1,false};
   float3 emission=make_float3(0,0,0);float transparent=0;

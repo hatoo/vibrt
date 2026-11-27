@@ -58,8 +58,6 @@ small stack and scene adapters. It reads:
   neighbor filters and sample classes; vibrt owns accumulation and launch order.
 - `kernel/integrator/{surface_shader,shade_volume}.h`: RGB shadow transparency and
   equiangular volume distance proposals/PDFs.
-- `kernel/geom/curve_intersect.h`: round linear curve queries for the software
-  BVH; OptiX uses its native round linear intersection module for path rays.
 - `kernel/bvh/util.h`: scale-aware ray offsets for surface and shadow origins.
 
 `native/cycles_compat.h` and `native/closures_compat.h` provide platform types

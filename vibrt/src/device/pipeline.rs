@@ -80,6 +80,8 @@ pub fn compile_ptx(requirements: ShaderRequirements) -> Result<String> {
     let opts = cudarc::nvrtc::CompileOptions {
         include_paths: vec![find_optix_include()],
         use_fast_math: Some(true),
+        // OptiX resolves externally callable device entry points by name.
+        options: vec!["--relocatable-device-code=true".into()],
         ..Default::default()
     };
     let full_src = format!(

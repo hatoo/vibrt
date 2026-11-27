@@ -18,7 +18,6 @@ pub mod material;
 mod pointiness;
 pub mod principled;
 mod progress;
-mod query_bvh;
 pub mod render;
 pub mod scene_format;
 pub mod scene_loader;

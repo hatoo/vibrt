@@ -6,145 +6,26 @@ struct SceneQuery {
   float2 bary;
   float3 P, N, Ng;
 };
-static __device__ float3 query_inverse_direction(float3 D) {
-  // A ray visits many BVH nodes with the same direction. Parallel slabs keep
-  // their explicit test below, so they do not need an infinite reciprocal.
-  return make_float3(fabsf(D.x) < 1e-30f ? 0.0f : 1.0f / D.x,
-                     fabsf(D.y) < 1e-30f ? 0.0f : 1.0f / D.y,
-                     fabsf(D.z) < 1e-30f ? 0.0f : 1.0f / D.z);
-}
-static __device__ bool query_box(const QueryNode &node, float3 P, float3 D,
-                                 float3 invD,
-                                 float tmin, float tmax) {
-  const float *p = &P.x, *d = &D.x, *inv = &invD.x;
-  for (int axis = 0; axis < 3; axis++) {
-    if (fabsf(d[axis]) < 1e-30f) {
-      if (p[axis] < node.lo[axis] || p[axis] > node.hi[axis])
-        return false;
-    } else {
-      float a = (node.lo[axis] - p[axis]) * inv[axis],
-            b = (node.hi[axis] - p[axis]) * inv[axis];
-      float near = fminf(a, b), far = fmaxf(a, b);
-      // Round the interval outwards to cover reciprocal/multiply error at
-      // grazing bounds. This only admits extra nodes; triangle tests retain
-      // their original arithmetic, distances, and traversal order.
-      constexpr float padding = 4.0f * 1.1920928955078125e-7f;
-      tmin = fmaxf(tmin, near - fmaxf(fabsf(near), 1e-30f) * padding);
-      tmax = fminf(tmax, far + fmaxf(fabsf(far), 1e-30f) * padding);
-      if (tmin > tmax)
-        return false;
-    }
-  }
-  return true;
-}
-static __device__ __noinline__ void query_mesh(const QueryObject &obj,
-                                               const PathVertex &v, float3 P,
-                                               float3 D, float tmin,
-                                               bool skip_self, SceneQuery &q) {
-  HitGroupData *hg = obj.geometry;
-  P = transform_point(hg->world_to_object, P);
-  D = transform_vector(hg->world_to_object, D);
-  float3 invD = query_inverse_direction(D);
-  unsigned int stack[64];
-  int sp = 0;
-  stack[sp++] = 0;
-  while (sp) {
-    const QueryNode &node = obj.nodes[stack[--sp]];
-    if (!query_box(node, P, D, invD, tmin, q.distance))
-      continue;
-    if (node.count == 0) {
-      stack[sp++] = node.first;
-      stack[sp++] = node.first + 1;
-      continue;
-    }
-    for (unsigned int i = 0; i < node.count; i++) {
-      unsigned int prim = obj.indices[node.first + i];
-      if (skip_self && hg->instance_id == v.geometry->instance_id &&
-          prim == v.primitive)
-        continue;
-      const int *ids = hg->indices + prim * 3;
-      if (hg->curve_radii) {
-        vibrt_cycles::float4 keys[4];
-        for (int j = 0; j < 2; ++j) {
-          int key = ids[j];
-          keys[j + 1] = vibrt_cycles::make_float4(cycles_vector(make_f3(hg->vertices + 3 * key)), hg->curve_radii[key]);
-        }
-        keys[0] = keys[1]; keys[3] = keys[2];
-        vibrt_cycles::Intersection isect;
-        if (vibrt_cycles::linear_curve_intersect(cycles_vector(P), cycles_vector(D), tmin, q.distance, keys, &isect)) {
-          q.hit = true; q.distance = isect.t; q.geometry = hg;
-          q.hit_primitive = prim; q.bary = make_float2(isect.u, 0);
-        }
-        continue;
-      }
-      float3 A = make_f3(hg->vertices + 3 * ids[0]);
-      float3 E1 = make_f3(hg->vertices + 3 * ids[1]) - A,
-             E2 = make_f3(hg->vertices + 3 * ids[2]) - A;
-      float3 H = cross3(D, E2);
-      float det = dot3(E1, H);
-      if (fabsf(det) < 1e-20f)
-        continue;
-      float inv = 1 / det;
-      float3 S = P - A;
-      float u = dot3(S, H) * inv;
-      if (u < 0 || u > 1)
-        continue;
-      float3 Q = cross3(S, E1);
-      float w = dot3(D, Q) * inv;
-      if (w < 0 || u + w > 1)
-        continue;
-      float distance = dot3(E2, Q) * inv;
-      if (distance < tmin || distance > q.distance)
-        continue;
-      q.hit = true;
-      q.distance = distance;
-      q.geometry = hg;
-      q.hit_primitive = prim;
-      q.bary = make_float2(u, w);
-    }
-  }
-}
+// Raw geometry queries share the radiance/shadow OptiX acceleration structures.
+struct QueryPayload {
+  SceneQuery *result;
+  unsigned int instance, primitive;
+  bool only_local, skip_self;
+};
 static __device__ __noinline__ SceneQuery
-query_scene(const PathVertex &v, float3 origin, float3 direction,
+query_scene_impl(const PathVertex &v, float3 origin, float3 direction,
             float distance, bool only_local, bool skip_self,
             unsigned int mask = 0xffu, float tmin = 0.0f) {
   SceneQuery q = {};
   q.distance = distance;
-  if (skip_self)
-    tmin = fmaxf(tmin, 1e-6f);
-  if (distance <= tmin || dot3(direction, direction) < 1e-30f || !v.geometry ||
-      !params.query_nodes)
+  if (skip_self) tmin = fmaxf(tmin, 1e-6f);
+  if (distance <= tmin || dot3(direction, direction) < 1e-30f || !v.geometry)
     return q;
-  if (only_local) {
-    // Query objects retain scene-object order, matching the SBT instance IDs.
-    // Local queries need only the entry instance's mesh BVH, even when other
-    // instances share that mesh. Keep its visibility mask and self-hit policy.
-    const QueryObject &obj = params.query_objects[v.geometry->instance_id];
-    if (obj.mask & mask)
-      query_mesh(obj, v, origin, direction, tmin, skip_self, q);
-  } else {
-    float3 invD = query_inverse_direction(direction);
-    unsigned int stack[64];
-    int sp = 0;
-    stack[sp++] = 0;
-    while (sp) {
-      const QueryNode &node = params.query_nodes[stack[--sp]];
-      if (!query_box(node, origin, direction, invD, tmin, q.distance))
-        continue;
-      if (node.count == 0) {
-        stack[sp++] = node.first;
-        stack[sp++] = node.first + 1;
-        continue;
-      }
-      for (unsigned int i = 0; i < node.count; i++) {
-        const QueryObject &obj =
-            params.query_objects[params.query_indices[node.first + i]];
-        if (!(obj.mask & mask))
-          continue;
-        query_mesh(obj, v, origin, direction, tmin, skip_self, q);
-      }
-    }
-  }
+  QueryPayload payload = {&q, v.geometry->instance_id, v.primitive, only_local, skip_self};
+  unsigned int hi, lo;
+  pack_ptr(&payload, hi, lo);
+  optixTrace(params.traversable, origin, direction, tmin, distance, 0.0f,
+             OptixVisibilityMask(mask), OPTIX_RAY_FLAG_ENFORCE_ANYHIT, 2, 3, 2, hi, lo);
   if (q.hit) {
     HitGroupData *hg = q.geometry;
     const int *ids = hg->indices + 3 * q.hit_primitive;
@@ -165,12 +46,29 @@ query_scene(const PathVertex &v, float3 origin, float3 direction,
   return q;
 }
 
+// Isolate trace payload analysis from the shader interpreter's stack arrays.
+struct QueryCall {
+  const PathVertex *vertex;
+  float3 origin, direction;
+  float distance;
+  bool only_local, skip_self;
+  unsigned int mask;
+  float tmin;
+  SceneQuery result;
+};
+static __device__ SceneQuery query_scene(const PathVertex &v, float3 origin, float3 direction,
+                                        float distance, bool only_local, bool skip_self,
+                                        unsigned int mask = 0xffu, float tmin = 0.0f) {
+  QueryCall call = {&v, origin, direction, distance, only_local, skip_self, mask, tmin, {}};
+  optixContinuationCall<void, QueryCall *>(0, &call);
+  return call.result;
+}
+
 static __device__ __noinline__ void initialize_volume_stack(float3 origin, VolumeStack &stack) {
   float distances[VOL_STACK_MAX];
   const float3 direction = normalize3(make_float3(0.371f, 0.529f, 0.763f));
   for (unsigned int i = 0; i < params.num_initial_volumes; i++) {
-    const QueryObject &object = params.initial_volumes[i];
-    HitGroupData *hg = object.geometry;
+    HitGroupData *hg = params.initial_volumes[i];
     float3 local = transform_point(hg->world_to_object, origin);
     bool in_bounds = true;
     for (int axis = 0; axis < 3; axis++)
@@ -178,9 +76,8 @@ static __device__ __noinline__ void initialize_volume_stack(float3 origin, Volum
                    (&local.x)[axis] <= hg->bounds_max[axis];
     if (!in_bounds) continue;
     PathVertex vertex = {};
-    SceneQuery hit = {};
-    hit.distance = 1e20f;
-    query_mesh(object, vertex, origin, direction, 1e-6f, false, hit);
+    vertex.geometry = hg;
+    SceneQuery hit = query_scene(vertex, origin, direction, 1e20f, true, false, 0xffu, 1e-6f);
     if (!hit.hit) continue;
     const int *ids = hg->indices + hit.hit_primitive * 3;
     float3 a = make_f3(hg->vertices + ids[0]*3);
@@ -365,8 +262,7 @@ static __device__ __noinline__ bool scatter_subsurface_walk(
   return false;
 }
 
-// Cycles' three-axis Burley disk estimator. Scene intersections use vibrt's
-// BVH.
+// Cycles' three-axis Burley disk estimator with OptiX geometry queries.
 static __device__ __noinline__ bool scatter_subsurface(PathVertex &v,
                                                        MaterialEval &e,
                                                        RNG &rng,

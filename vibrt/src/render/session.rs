@@ -1,10 +1,6 @@
-//! Thread-confined GPU contexts, compiled shader variants and CPU query cache.
+//! Thread-confined GPU contexts, compiled shader variants.
 
-use super::{
-    query_cache::{QueryCache, QueryTree},
-    upload::dptr_u8,
-};
-use crate::scene_loader::LoadedMesh;
+use super::upload::dptr_u8;
 use crate::CudaResultExt;
 use crate::{
     material::ShaderRequirements,
@@ -28,7 +24,6 @@ pub struct RenderSession {
     shaders: RefCell<Option<(ShaderRequirements, Rc<CompiledShaders>)>>,
     optix: DeviceContext,
     cuda: Arc<CudaContext>,
-    queries: RefCell<QueryCache>,
 }
 
 impl RenderSession {
@@ -45,7 +40,6 @@ impl RenderSession {
             shaders: RefCell::new(None),
             optix,
             cuda,
-            queries: RefCell::new(QueryCache::default()),
         })
     }
 
@@ -62,14 +56,6 @@ impl RenderSession {
     pub(super) fn cleanup(&self) {
         self.cuda.record_err(self.cuda.bind_to_thread());
         self.cuda.record_err(self.cuda.synchronize());
-    }
-
-    pub(super) fn begin_queries(&self, meshes: &[LoadedMesh]) {
-        self.queries.borrow_mut().begin(meshes);
-    }
-
-    pub(super) fn query_batch(&self, first: usize, meshes: &[LoadedMesh]) -> Vec<Arc<QueryTree>> {
-        self.queries.borrow_mut().batch(first, meshes)
     }
 
     pub(super) fn build_accel(

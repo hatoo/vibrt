@@ -2,6 +2,7 @@
 
 Uses analytic hit/miss fixtures as well as stochastic AO/Bevel. Artifacts:
 target/scene-nodes/{cycles.exr,cuda.npy,results.json}.
+Run with --factory-startup --python-exit-code 1 to avoid preloaded addons.
 """
 
 from pathlib import Path
@@ -101,13 +102,24 @@ black.node_tree.nodes["Principled BSDF"].inputs["Base Color"].default_value = (
     0,
     1,
 )
+shared_cube = None
 for i, (name, mat) in enumerate(cases):
     x, y = i % side - side / 2 + 0.5, i // side - side / 2 + 0.5
     # The closed box gives Bevel actual adjacent faces on the same object.
     bpy.ops.mesh.primitive_cube_add(size=1, location=(x, y, -0.25))
     obj = bpy.context.object
     obj.scale.z = 0.5
-    obj.data.materials.append(mat)
+    # Linked instances share primitive IDs; local and self-hit queries must
+    # identify the instance, not merely the mesh/primitive. Keep nonuniform scale.
+    if shared_cube is None:
+        shared_cube = obj.data
+        shared_cube.materials.append(mat)
+    else:
+        unused = obj.data
+        obj.data = shared_cube
+        bpy.data.meshes.remove(unused)
+    obj.material_slots[0].link = "OBJECT"
+    obj.material_slots[0].material = mat
     if "Bevel" not in name and "Wireframe" not in name:
         mesh = bpy.data.meshes.new("Wall")
         mesh.from_pydata(
