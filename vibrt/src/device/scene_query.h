@@ -240,29 +240,97 @@ static __device__ __noinline__ bool scatter_subsurface_walk(
   }
   float orientation = dot3(v.Ng, N) >= 0 ? 1.0f : -1.0f;
   if (dot3(v.Ng * orientation, D) >= 0) return false;
-  float3 P = v.P;
+  // Cycles' Dwivedi guiding uses a mixture with the original HG walk. Keep
+  // all direction/distance/channel probabilities in the same balance PDF.
+  const float3 entry = v.P;
+  float3 P = entry;
+  float diffusion =
+      vibrt_cycles::diffusion_length_dwivedi(fmaxf(alpha[0], fmaxf(alpha[1], alpha[2])));
+  float phase_log =
+      diffusion > 1 && isfinite(diffusion) ? logf((diffusion + 1) / (diffusion - 1)) : 0;
+  float guide_fraction = phase_log > 0 ? 1 - fmaxf(0.5f, powf(fabsf(g), 0.125f)) : 0;
+  bool have_opposite = false;
+  float opposite_distance = 0;
+  auto extinction = vibrt_cycles::make_float3(sigma[0], sigma[1], sigma[2]);
   for (int step = 0; step < 1024; step++) {
     float probabilities[3], total = 0;
     for (int c = 0; c < 3; c++) {
       probabilities[c] = fabsf((&weight.x)[c]) * alpha[c];
       total += probabilities[c];
     }
-    if (!(total > 1e-12f)) return false;
-    for (int c = 0; c < 3; c++) probabilities[c] /= total;
-    float pick = rng.next();
-    int channel = pick < probabilities[0] ? 0 : pick < probabilities[0]+probabilities[1] ? 1 : 2;
-    float distance = -logf(fmaxf(1-rng.next(), 1e-7f)) / sigma[channel];
-    SceneQuery q = query_scene(v, P, D, distance, true, step == 0, 0xffu, 1e-7f);
-    float t = q.hit ? q.distance : distance;
-    float tr[3], pdf = 0;
-    for (int c = 0; c < 3; c++) {
-      tr[c] = expf(-sigma[c]*t);
-      pdf += probabilities[c]*tr[c]*(q.hit ? 1 : sigma[c]);
-    }
-    if (!(pdf > 1e-30f)) return false;
+    if (!(total > 1e-12f))
+      return false;
     for (int c = 0; c < 3; c++)
-      (&weight.x)[c] *= tr[c]*(q.hit ? 1 : sigma[c]*alpha[c])/pdf;
-    if (q.hit) {
+      probabilities[c] /= total;
+    float pick = rng.next();
+    int channel = pick < probabilities[0] ? 0 : pick < probabilities[0] + probabilities[1] ? 1 : 2;
+    float sample_sigma = sigma[channel];
+    float backward_fraction = 0, forward_factor = 0, backward_factor = 0;
+    float forward_stretch = 1, backward_stretch = 1;
+    if (step > 0) {
+      bool guided = rng.next() < guide_fraction;
+      bool backward = false;
+      if (have_opposite && guide_fraction > 0) {
+        float x = fminf(fmaxf(dot3(P - entry, -N), 0), opposite_distance);
+        backward_fraction = 1 / (1 + expf((opposite_distance - 2 * x) / diffusion));
+        backward = rng.next() < backward_fraction;
+      }
+      float u1 = rng.next(), u2 = rng.next(), hg_pdf, cosine;
+      if (guided) {
+        cosine = vibrt_cycles::sample_phase_dwivedi(diffusion, phase_log, u1);
+        if (backward)
+          cosine = -cosine;
+        build_frame(N, T, B);
+        float r = sqrtf(fmaxf(0, 1 - cosine * cosine)), phi = 2 * M_PIf * u2;
+        float3 next = N * cosine + (T * cosf(phi) + B * sinf(phi)) * r;
+        hg_pdf = phase_hg_eval(g, dot3(D, next));
+        D = next;
+      } else {
+        build_frame(D, T, B);
+        float3 local = phase_hg_sample(g, u1, u2, hg_pdf);
+        D = normalize3(T * local.x + B * local.y + D * local.z);
+        cosine = dot3(D, N);
+      }
+      if (guide_fraction > 0) {
+        forward_factor = 0.5f * INV_PIf *
+                         vibrt_cycles::eval_phase_dwivedi(diffusion, phase_log, cosine) / hg_pdf;
+        backward_factor = 0.5f * INV_PIf *
+                          vibrt_cycles::eval_phase_dwivedi(diffusion, phase_log, -cosine) / hg_pdf;
+        forward_stretch = 1 - cosine / diffusion;
+        backward_stretch = 1 + cosine / diffusion;
+        if (guided)
+          sample_sigma *= backward ? backward_stretch : forward_stretch;
+      }
+    }
+    float distance = -logf(fmaxf(1 - rng.next(), 1e-7f)) / sample_sigma;
+    float query_distance =
+        step == 0 ? fmaxf(distance, 10 / fminf(sigma[0], fminf(sigma[1], sigma[2]))) : distance;
+    SceneQuery q = query_scene(v, P, D, query_distance, true, step == 0, 0xffu, 1e-7f);
+    if (step == 0 && q.hit) {
+      opposite_distance = dot3(q.P - entry, -N);
+      have_opposite = opposite_distance > 0;
+    }
+    bool hit = q.hit && q.distance < distance;
+    float t = hit ? q.distance : distance;
+    vibrt_cycles::Spectrum tr;
+    auto density = vibrt_cycles::subsurface_random_walk_pdf(extinction, t, hit, &tr);
+    if (step > 0 && guide_fraction > 0) {
+      auto forward =
+          vibrt_cycles::subsurface_random_walk_pdf(extinction * forward_stretch, t, hit, nullptr) *
+          forward_factor;
+      auto backward =
+          vibrt_cycles::subsurface_random_walk_pdf(extinction * backward_stretch, t, hit, nullptr) *
+          backward_factor;
+      auto guided = forward * (1 - backward_fraction) + backward * backward_fraction;
+      density = density * (1 - guide_fraction) + guided * guide_fraction;
+    }
+    float pdf =
+        probabilities[0] * density.x + probabilities[1] * density.y + probabilities[2] * density.z;
+    if (!(pdf > 1e-30f))
+      return false;
+    for (int c = 0; c < 3; c++)
+      (&weight.x)[c] *= tr[c] * (hit ? 1 : sigma[c] * alpha[c]) / pdf;
+    if (hit) {
       throughput = throughput * weight;
       v.P=q.P;v.Ng=q.Ng*orientation;v.Ns=q.N*orientation;
       v.primitive=q.hit_primitive;v.barycentric=q.bary;
@@ -270,16 +338,13 @@ static __device__ __noinline__ bool scatter_subsurface_walk(
       e.base_color=make_float3(1,1,1);
       return true;
     }
-    P = P + D*t;
+    P = P + D * t;
     if (step >= 3) {
       float survival = fminf(fmaxf(fmaxf(weight.x, weight.y), weight.z), 0.95f);
-      if (!(survival > 0) || rng.next() >= survival) return false;
+      if (!(survival > 0) || rng.next() >= survival)
+        return false;
       weight = weight / survival;
     }
-    build_frame(D, T, B);
-    float phase_pdf;
-    float3 local = phase_hg_sample(g, rng.next(), rng.next(), phase_pdf);
-    D = normalize3(T*local.x+B*local.y+D*local.z);
   }
   return false;
 }

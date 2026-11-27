@@ -3244,19 +3244,15 @@ def _from_diffuse(node, writer, textures, *, context=None) -> dict:
 def _from_hair(node, writer, textures, *, context=None) -> dict:
     """Map Cycles' classic Hair BSDF (Kajiya-Kay) to Principled params.
 
-    Sets `hair_weight = 1.0` so the kernel takes the Kajiya-Kay eval/sample
-    branch instead of the standard diffuse+specular path. Color feeds
-    `base_color` (with texture support). Offset / RoughnessU / RoughnessV are
-    read as scalar constants; linked inputs fall back through
-    `_warn_linked_scalar` (exact fold or warn). Tangent is intentionally
-    ignored — the kernel uses the per-hit tangent frame built from Ns, which
-    doesn't follow the strand direction but gives a qualitatively hair-like
-    look on triangle-mesh "hair caps". Proper UV-based tangent is follow-up.
+    Selects Cycles' legacy Hair reflection or transmission closure. Color and
+    scalar defaults are exported here; the shader graph carries linked inputs,
+    including Tangent. Unlinked tangents use the strand axis or mesh dPdv.
     """
     if context is None:
         context = ExportContext()
     p = _default_params()
     p["hair_weight"] = 1.0
+    p["hair_component"] = int(getattr(node, "component", "Reflection") == "Transmission")
     color_sock = node.inputs["Color"]
     img, chain = _socket_linked_image_with_chain(color_sock, context=context)
     if img is not None:

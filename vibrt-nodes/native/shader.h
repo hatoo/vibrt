@@ -83,21 +83,6 @@ VN_INLINE float bevel_cubic_pdf(float radius, float distance) {
   float x = fmaxf(1 - distance / radius, 0.0f);
   return 10 * x * x * x / (M_PI_F * radius * radius);
 }
-// Cycles closure/bsdf_toon.h (BSD-3-Clause), v5.1.1. Returns eval and PDF.
-VN_INLINE float2 toon_eval(float cosine, float size, float smooth) {
-  float max_angle = clamp(size, 1e-5f, 1.0f) * M_PI_2_F;
-  float width = clamp(smooth, 0.0f, 1.0f) * M_PI_2_F;
-  float sample_angle = fminf(max_angle + width, M_PI_2_F);
-  float angle = acosf(clamp(cosine, -1.0f, 1.0f));
-  if (angle >= sample_angle)
-    return make_float2(0, 0);
-  float intensity = angle < max_angle
-                        ? 1.0f
-                        : (width > 0 ? 1 - (angle - max_angle) / width : 0);
-  // 2*sin(a/2)^2 is stable even for the minimum size.
-  float s = sinf(0.5f * sample_angle), pdf = 1 / (4 * M_PI_F * s * s);
-  return make_float2(pdf * intensity, pdf);
-}
 VN_INLINE float volume_phase_pdf(unsigned int type, const float *p, float g,
                                  float cosine) {
   if (type == 1)
@@ -156,31 +141,8 @@ VN_INLINE float4 scene_node(const ShaderInstruction &node, const float4 *slots,
                             const float4 *ctx, const SceneServices &services);
 #endif
 VN_INLINE float luminance(float3 v) { return 0.2126f * v.x + 0.7152f * v.y + 0.0722f * v.z; }
-VN_INLINE float3 rotate(float3 p, float3 axis, float angle) {
-  axis = safe_normalize(axis);
-  float c = cosf(angle), s = sinf(angle);
-  return p * c + cross(axis, p) * s + axis * dot(axis, p) * (1 - c);
-}
-VN_INLINE float3 euler(float3 v, float3 r, bool inverse = false) {
-  if (inverse) {
-    v = rotate(v, make_float3(0, 0, 1), -r.z);
-    v = rotate(v, make_float3(0, 1, 0), -r.y);
-    return rotate(v, make_float3(1, 0, 0), -r.x);
-  }
-  v = rotate(v, make_float3(1, 0, 0), r.x);
-  v = rotate(v, make_float3(0, 1, 0), r.y);
-  return rotate(v, make_float3(0, 0, 1), r.z);
-}
 VN_INLINE float fresnel(float cosi, float eta) {
-  cosi = fabsf(cosi);
-  eta = fmaxf(eta, 1e-5f);
-  float g = eta * eta - 1 + cosi * cosi;
-  if (g <= 0)
-    return 1;
-  g = sqrtf(g);
-  float a = (g - cosi) / (g + cosi);
-  float b = (cosi * (g + cosi) - 1) / (cosi * (g - cosi) + 1);
-  return 0.5f * a * a * (1 + b * b);
+  return fresnel_dielectric_cos(cosi, fmaxf(eta, 1e-5f));
 }
 VN_INLINE float4 lut_sample(const float *p, int count, float x, bool linear = true,
                             bool extend = false) {
@@ -481,53 +443,43 @@ VN_INLINE void evaluate_vm(const ShaderInstruction *nodes, int count,
 #endif
 #if (VIBRT_SHADER_OPS & (1ull << 13))
     case 13: {
-      float3 c = zero_float3();
-      for (int ch = 0; ch < 3; ch++) {
-        float lo = A(1)[ch], hi = A(2)[ch], to_lo = A(3)[ch], to_hi = A(4)[ch];
-        float t = safe_divide(A(0)[ch] - lo, hi - lo);
-        if (m[0] == 1)
-          t = safe_divide(floorf(t * (A(5)[ch] + 1)), A(5)[ch]);
-        if (m[0] >= 2) {
-          t = saturatef(t);
-          t = m[0] == 2 ? t * t * (3 - 2 * t) : t * t * t * (t * (t * 6 - 15) + 10);
-        }
-        c[ch] = to_lo + t * (to_hi - to_lo);
-        if (m[1])
-          c[ch] = clamp(c[ch], fminf(to_lo, to_hi), fmaxf(to_lo, to_hi));
+      if (m[2]) {
+        float stack[21];
+        for (int i = 0; i < 6; ++i)
+          stack_store_float3(stack, 3 * i, xyz(A(i)));
+        svm_node_vector_map_range(stack, 0, 3 | (6 << 8) | (9 << 16) | (12 << 24),
+                                  15 | (m[1] << 8) | (m[0] << 16) | (18 << 24), 0);
+        r = color(stack_load_float3(stack, 18));
+      } else {
+        float stack[7];
+        for (int i = 0; i < 6; ++i)
+          stack[i] = S(i);
+        svm_node_map_range(0, stack, 0, 1 | (2 << 8) | (3 << 16) | (4 << 24),
+                           m[0] | (5 << 8) | (6 << 16), 0);
+        float value = stack[6];
+        if (m[1] && m[0] < 2)
+          value = clamp(value, fminf(S(3), S(4)), fmaxf(S(3), S(4)));
+        r = scalar(value);
       }
-      r = color(c);
       break;
     }
 #endif
 #if (VIBRT_SHADER_OPS & (1ull << 14))
     case 14: {
-      float3 v = V(0), loc = V(1), rot = V(2), scale = V(3);
-      if (m[0] == 0)
-        v = euler(v * scale, rot) + loc;
-      else if (m[0] == 1)
-        v = safe_divide(euler(v - loc, rot, true), scale);
-      else if (m[0] == 2)
-        v = euler(v * scale, rot);
-      else
-        v = safe_normalize(euler(safe_divide(v, scale), rot));
-      r = color(v);
+      r = color(svm_mapping((NodeMappingType)m[0], V(0), V(1), V(2), V(3)));
       break;
     }
 #endif
 #if (VIBRT_SHADER_OPS & (1ull << 15))
     case 15: {
-      float3 v = V(0) - V(1), axis = V(2);
-      float sign = m[1] ? -1.0f : 1.0f;
-      if (m[0] == 4)
-        v = euler(v, V(4), m[1] != 0);
-      else {
-        if (m[0] >= 1 && m[0] <= 3) {
-          axis = zero_float3();
-          axis[m[0] - 1] = 1;
-        }
-        v = rotate(v, axis, S(3) * sign);
-      }
-      r = color(v + V(1));
+      float stack[16];
+      stack_store_float3(stack, 0, V(0));
+      stack_store_float3(stack, 3, V(1));
+      stack_store_float3(stack, 6, V(2));
+      stack[9] = S(3);
+      stack_store_float3(stack, 10, V(4));
+      svm_node_vector_rotate(stack, m[0] | (10 << 16) | (m[1] << 24), 3 | (6 << 8) | (9 << 16), 13);
+      r = color(stack_load_float3(stack, 13));
       break;
     }
 #endif

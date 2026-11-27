@@ -81,6 +81,7 @@ pub struct PrincipledGpu {
     /// energy goes to the back lobe instead of the front).
     pub translucent_weight: f32,
     pub hair_weight: f32,
+    pub hair_component: u32,
     pub hair_offset: f32,
     pub hair_roughness_u: f32,
     pub hair_roughness_v: f32,
@@ -211,6 +212,7 @@ pub struct HitGroupData {
     pub object_color: [f32; 4],
     pub object_index: u32,
     pub instance_id: u32,
+    /// Conditional triangle probability per unit area within its mesh light.
     pub light_pdf: optix_sys::CUdeviceptr,
 }
 
@@ -257,16 +259,9 @@ pub struct PointLight {
     pub radius: f32,
     pub emission: [f32; 3],
     pub sphere: u32,
-    /// Optional IES profile attached to this light. `ies_data` points
-    /// to a CUDA buffer of `ies_n_v * max(1, ies_n_h) * 1` floats laid
-    /// out as `[h * n_v + v]` (matching `IesProfile.candelas`), already
-    /// normalised by `peak_candela` so each entry is in `[0, 1]`. Two
-    /// extra prefix floats hold the table's vertical-angle range
-    /// (theta_min_deg, theta_max_deg) and `ies_n_h` extra floats hold
-    /// the phi axis (when `n_h > 1`); the GPU lookup walks them with
-    /// `ies_lookup_normalised`. `ies_data == 0` (null) means "no IES,
-    /// emit isotropically" — the existing scenes' lights all start
-    /// here.
+    /// Cycles packed IES table: slot offset, bit-cast horizontal/vertical
+    /// counts, horizontal and vertical radians, then normalized intensities.
+    /// A null pointer means isotropic emission.
     pub ies_data: optix_sys::CUdeviceptr,
     pub ies_n_v: u32,
     pub ies_n_h: u32,
@@ -453,22 +448,15 @@ pub struct LaunchParams {
     pub spot_lights: optix_sys::CUdeviceptr,
     pub num_rect_lights: i32,
     pub rect_lights: optix_sys::CUdeviceptr,
+    pub rect_light_tree: optix_sys::CUdeviceptr,
+    pub rect_light_leaves: optix_sys::CUdeviceptr,
+    pub mesh_light_tree: optix_sys::CUdeviceptr,
+    pub mesh_light_leaves: optix_sys::CUdeviceptr,
 
-    /// Mesh-light NEE: `mesh_lights` is a `MeshLight[num_mesh_lights]`,
-    /// `mesh_light_cdf` is `f32[num_mesh_lights + 1]` normalised over
-    /// per-mesh-light total power (area × luminance(emission)). Each
-    /// `MeshLight` carries its own per-triangle table + inner CDF.
+    /// Mesh-light groups use the spatial tree; each mesh carries a triangle CDF.
     pub num_mesh_lights: i32,
     pub mesh_lights: optix_sys::CUdeviceptr,
-    pub mesh_light_cdf: optix_sys::CUdeviceptr,
-    /// Sum over all mesh-lights of `area_i × luminance(emission_i)`.
-    /// Equals the un-normalised total of the outer CDF — same scalar that
-    /// makes the joint pmf cancel out the per-mesh-light index:
-    ///   `pmf_outer × pmf_tri = (area_t × lum_t) / total_power`
-    /// regardless of which mesh-light owns triangle t. Used in trace_path's
-    /// MIS gate (the BSDF-sampler-side weight) so closest_hit can compute
-    /// the NEE-side pdf at a hit without needing per-instance mesh-light
-    /// indexing or per-triangle id lookups.
+    /// Sum of emitter powers, used to skip empty mesh-light MIS.
     pub mesh_light_total_power: f32,
 
     /// World background: 0 = constant, 1 = single envmap, 2 = mixed (two layers).

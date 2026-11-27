@@ -1,119 +1,20 @@
-// ---------- IES profile lookup ----------
-//
-// Returns the IES table's normalised intensity multiplier in [0, 1] for
-// the world-space sample direction `dir_world` (light → surface). When
-// `ies_data == nullptr` returns 1.0 (no IES, isotropic).
-//
-// Layout of `ies_data` matches `upload_ies_buffers` in render.rs:
-//   [0           .. n_v          ): vertical angles in degrees (theta)
-//   [n_v         .. n_v + n_h    ): horizontal angles in degrees (phi)
-//   [n_v + n_h   .. + n_v * n_h  ): normalised candelas, row-major over
-//                                    phi × theta — `[h * n_v + v]`
-//
-// Convention: `light_rotation` is the light's object→world 3×3 (row-
-// major). We invert (transpose for pure rotations) to convert
-// `dir_world` into the light's local frame, then derive theta from the
-// local -Z axis (the IES "down" convention) and phi from atan2 around
-// local +Z.
-static __device__ float ies_lookup(const float *ies_data,
-                                   unsigned int n_v, unsigned int n_h,
-                                   const float *light_rotation,
-                                   float3 dir_world) {
-  if (ies_data == nullptr || n_v == 0 || n_h == 0)
+// Cycles packed IES table; position/orientation remain renderer-owned.
+static __device__ float ies_lookup(const float *data, unsigned int nv, unsigned int nh,
+                                   const float *rotation, float3 direction) {
+  if (!data || nv < 2 || nh < 2)
     return 1.0f;
-  // light_rotation row-major: rows are world-space basis vectors of the
-  // light's local axes. world→local = transpose(rotation), so the local
-  // dir is (rotation[col 0] · world, rotation[col 1] · world, ...)
-  // expressed as: local.x = R[0]·d + R[3]·d.y + R[6]·d.z (column 0).
-  float3 local;
-  local.x = light_rotation[0] * dir_world.x + light_rotation[3] * dir_world.y +
-            light_rotation[6] * dir_world.z;
-  local.y = light_rotation[1] * dir_world.x + light_rotation[4] * dir_world.y +
-            light_rotation[7] * dir_world.z;
-  local.z = light_rotation[2] * dir_world.x + light_rotation[5] * dir_world.y +
-            light_rotation[8] * dir_world.z;
-  float len = sqrtf(dot3(local, local));
-  if (len < 1e-12f)
-    return 1.0f;
-  // theta from -Z (IES "down" convention). cos(theta) = dot(local, -Z) =
-  // -local.z / len.
-  float cos_t = fminf(1.0f, fmaxf(-1.0f, -local.z / len));
-  float theta_deg = acosf(cos_t) * (180.0f / M_PIf);
-  // phi: horizontal angle around the IES axis. Match Cycles'
-  // `kernel/svm/ies.h`: `h_angle = atan2f(vector.x, vector.y) + PI`
-  // (NOT atan2(y,x)) — the LM-63 Type-C horizontal convention. For
-  // radially-symmetric profiles (n_h==1) phi is ignored, but directional
-  // profiles (e.g. comet.ies, n_h=5) read the wrong lobe under the old
-  // atan2(y,x) form, under-delivering the point/spot IES lamps.
-  float phi_rad = atan2f(local.x, local.y) + M_PIf;
-  float phi_deg = phi_rad * (180.0f / M_PIf);
-
-  // Bilinear lookup in the table.
-  const float *thetas = ies_data;
-  const float *phis = ies_data + n_v;
-  const float *cands = ies_data + n_v + n_h;
-
-  // Vertical-angle bracket. Clamp to table range; IES profiles often
-  // have a sparse range like [0, 90] (downlights) so anything below
-  // theta[0] takes theta[0] and anything above theta[n_v-1] takes the
-  // last entry (typically 0 candela for properly authored downlights).
-  unsigned int v_lo = 0, v_hi = 0;
-  float tv = 0.0f;
-  if (theta_deg <= thetas[0]) {
-    v_lo = 0; v_hi = 0;
-  } else if (theta_deg >= thetas[n_v - 1]) {
-    v_lo = n_v - 1; v_hi = n_v - 1;
-  } else {
-    for (unsigned int i = 0; i + 1 < n_v; i++) {
-      if (thetas[i] <= theta_deg && theta_deg < thetas[i + 1]) {
-        v_lo = i;
-        v_hi = i + 1;
-        float span = thetas[v_hi] - thetas[v_lo];
-        tv = (span > 0.0f) ? (theta_deg - thetas[v_lo]) / span : 0.0f;
-        break;
-      }
-    }
-  }
-
-  // Horizontal-angle bracket. n_h == 1 means radially symmetric — phi
-  // is ignored. Otherwise fold phi according to the table's coverage:
-  // phi_max ≤ 90 → quadrant symmetric, ≤ 180 → bilateral, else full.
-  unsigned int h_lo = 0, h_hi = 0;
-  float th = 0.0f;
-  if (n_h > 1) {
-    float phi_max = phis[n_h - 1];
-    float p = phi_deg;
-    if (phi_max <= 90.0f) {
-      p = fmodf(p, 180.0f);
-      if (p > 90.0f) p = 180.0f - p;
-      if (p > 90.0f) p = 90.0f;
-    } else if (phi_max <= 180.0f) {
-      if (p > 180.0f) p = 360.0f - p;
-    }
-    if (p <= phis[0]) {
-      h_lo = 0; h_hi = 0;
-    } else if (p >= phis[n_h - 1]) {
-      h_lo = n_h - 1; h_hi = n_h - 1;
-    } else {
-      for (unsigned int i = 0; i + 1 < n_h; i++) {
-        if (phis[i] <= p && p < phis[i + 1]) {
-          h_lo = i;
-          h_hi = i + 1;
-          float span = phis[h_hi] - phis[h_lo];
-          th = (span > 0.0f) ? (p - phis[h_lo]) / span : 0.0f;
-          break;
-        }
-      }
-    }
-  }
-
-  float a = cands[h_lo * n_v + v_lo];
-  float b = cands[h_lo * n_v + v_hi];
-  float c = cands[h_hi * n_v + v_lo];
-  float d = cands[h_hi * n_v + v_hi];
-  float ab = a * (1.0f - tv) + b * tv;
-  float cd = c * (1.0f - tv) + d * tv;
-  return ab * (1.0f - th) + cd * th;
+  float3 local = make_float3(
+      rotation[0] * direction.x + rotation[3] * direction.y + rotation[6] * direction.z,
+      rotation[1] * direction.x + rotation[4] * direction.y + rotation[7] * direction.z,
+      rotation[2] * direction.x + rotation[5] * direction.y + rotation[8] * direction.z);
+  float length = sqrtf(dot3(local, local));
+  if (length == 0)
+    return 0;
+  float theta = acosf(fminf(1.0f, fmaxf(-1.0f, -local.z / length)));
+  float phi = atan2f(local.x, local.y) + M_PIf;
+  if (phi >= 2 * M_PIf)
+    phi = 0;
+  return vibrt_ies::kernel_ies_interp(data, 0, phi, theta);
 }
 
 // Sum of all sun-light NEE pdfs at a given world-space direction. Used
@@ -156,60 +57,22 @@ static __device__ float power_heuristic_3(float pdf_self,
   return (denom > 0.0f) ? a / denom : 0.0f;
 }
 
-// Rectangular lights are selected at each shading point, rather than by
-// global wattage: a distant, large panel must not starve nearby small lights.
-// This is a positive importance estimate, not a visibility/BSDF test. The
-// normal floor preserves support for transmission and mixed/bumped closures.
-static __device__ float rect_light_importance(const AreaRectLight &ar,
-                                              float3 P, float3 N) {
-  float area = ar.size_u * ar.size_v * (ar.disk ? M_PIf * 0.25f : 1.0f);
-  float brightness = fmaxf(luminance(make_f3(ar.emission)), 0.0f);
-  if (area <= 0 || brightness <= 0)
-    return 0;
-  float3 delta = make_f3(ar.corner) + make_f3(ar.u_axis) * (0.5f * ar.size_u) +
-                 make_f3(ar.v_axis) * (0.5f * ar.size_v) - P;
-  float plane = -dot3(make_f3(ar.normal), delta);
-  if (ar.two_sided == 0u && plane <= 0)
-    return 0;
-  float d2 = fmaxf(dot3(delta, delta), 1e-20f);
-  float inv_d = rsqrtf(d2);
-  float cosine = fabsf(plane) * inv_d;
-  // Finite-area regularization limits the near-field estimate to 2*pi.
-  float omega = area * cosine / (d2 + area * (0.5f * INV_PIf));
-  float normal_factor = dot3(N, N) > 0 ?
-      0.1f + 0.9f * fabsf(dot3(N, delta)) * inv_d : 1.0f;
-  return brightness * omega * normal_factor;
+// Spatial selection shares Cycles' bounded importance and branch probabilities.
+static __device__ int sample_mesh_light(float3 P, float3 N, float u, float &pmf) {
+  return vibrt_light_tree::sample((vibrt_light_tree::KernelGlobals)params.mesh_light_tree,
+                                  cycles_vector(P), cycles_vector(N), u, &pmf);
 }
-
+static __device__ float mesh_light_pmf(int index, float3 P, float3 N) {
+  return vibrt_light_tree::pdf((vibrt_light_tree::KernelGlobals)params.mesh_light_tree,
+                               params.mesh_light_leaves[index], cycles_vector(P), cycles_vector(N));
+}
 static __device__ int sample_rect_light(float3 P, float3 N, float u, float &pmf) {
-  pmf = 0;
-  float total = 0;
-  for (int i = 0; i < params.num_rect_lights; ++i)
-    total += rect_light_importance(params.rect_lights[i], P, N);
-  if (total <= 0)
-    return -1;
-  float target = u * total;
-  int selected = -1;
-  float weight = 0;
-  for (int i = 0; i < params.num_rect_lights; ++i) {
-    float w = rect_light_importance(params.rect_lights[i], P, N);
-    if (w <= 0)
-      continue;
-    selected = i;
-    weight = w;
-    target -= w;
-    if (target < 0)
-      break;
-  }
-  pmf = weight / total;
-  return selected;
+  return vibrt_light_tree::sample((vibrt_light_tree::KernelGlobals)params.rect_light_tree,
+                                  cycles_vector(P), cycles_vector(N), u, &pmf);
 }
-
 static __device__ float rect_light_pmf(int index, float3 P, float3 N) {
-  float total = 0;
-  for (int i = 0; i < params.num_rect_lights; ++i)
-    total += rect_light_importance(params.rect_lights[i], P, N);
-  return total > 0 ? rect_light_importance(params.rect_lights[index], P, N) / total : 0;
+  return vibrt_light_tree::pdf((vibrt_light_tree::KernelGlobals)params.rect_light_tree,
+                               params.rect_light_leaves[index], cycles_vector(P), cycles_vector(N));
 }
 
 static __device__ vibrt_rect::Distribution rect_distribution(const AreaRectLight &ar,
@@ -278,7 +141,7 @@ static __device__ __noinline__ float3 direct_light(const MaterialEvalGroup &e, f
                                                pl.sphere, P, rng, Pl, wi, d);
     if (d < 1e-4f || light_weight <= 0)
       continue;
-    float3 vis = shadow_transmittance(P, wi, d, vstack);
+    float3 vis = shadow_transmittance(P, wi, d, vstack, e.slots[0].Ng);
     if (luminance(vis) <= 0.0f)
       continue;
     BsdfEval b = eval_bsdf(e, wo, wi, cache);
@@ -313,7 +176,7 @@ static __device__ __noinline__ float3 direct_light(const MaterialEvalGroup &e, f
     build_frame(dir, T, B);
     float3 wi =
         normalize3(T * (st * cosf(phi)) + B * (st * sinf(phi)) + dir * ct);
-    float3 vis = shadow_transmittance(P, wi, 1e20f, vstack);
+    float3 vis = shadow_transmittance(P, wi, 1e20f, vstack, e.slots[0].Ng);
     if (luminance(vis) <= 0.0f)
       continue;
     BsdfEval b = eval_bsdf(e, wo, wi, cache);
@@ -350,7 +213,7 @@ static __device__ __noinline__ float3 direct_light(const MaterialEvalGroup &e, f
           (cos_a - sp.cos_outer) / fmaxf(sp.cos_inner - sp.cos_outer, 1e-4f);
       falloff = t * t * (3.0f - 2.0f * t);
     }
-    float3 vis = shadow_transmittance(P, wi, d, vstack);
+    float3 vis = shadow_transmittance(P, wi, d, vstack, e.slots[0].Ng);
     if (luminance(vis) <= 0.0f)
       continue;
     BsdfEval b = eval_bsdf(e, wo, wi, cache);
@@ -380,7 +243,7 @@ static __device__ __noinline__ float3 direct_light(const MaterialEvalGroup &e, f
         if (ar.two_sided != 0u)
           cos_light = fabsf(cos_light);
         if (cos_light > 0.0f) {
-          float3 vis = shadow_transmittance(P, wi, d, vstack);
+          float3 vis = shadow_transmittance(P, wi, d, vstack, e.slots[0].Ng);
           if (luminance(vis) > 0.0f) {
             BsdfEval b = eval_bsdf(e, wo, wi, cache);
             float pdf = pdf_solid * pmf_light;
@@ -413,82 +276,35 @@ static __device__ __noinline__ float3 direct_light(const MaterialEvalGroup &e, f
     }
   }
 
-  // Mesh lights: two-stage CDF — outer over per-mesh-light total power,
-  // inner over per-triangle area × luminance(emission). Same solid-angle
-  // pdf math as area_rect (uniform sample on triangle, then the standard
-  // d² / (area × cos_light) Jacobian). MIS-weighted against BSDF
-  // sampling via `power_heuristic` — the matching closest-hit branch
-  // in `trace_path`'s emission gate adds the BSDF-side weighted
-  // contribution when a sampled wi happens to land on a mesh-light
-  // triangle. Shadow ray uses standard `shadow_transmittance` which
-  // subtracts ~1mm from tmax internally, so it doesn't self-intersect
-  // the sampled light triangle.
+  // Select a mesh group with the spatial light tree, then a triangle with
+  // its power CDF. Cycles chooses solid-angle or area sampling and supplies
+  // the matching PDF used by the BSDF-hit MIS path.
   if (params.num_mesh_lights > 0) {
-    float u = rng.next();
-    int mli = cdf_search(params.mesh_light_cdf, params.num_mesh_lights, u);
-    MeshLight &ml = params.mesh_lights[mli];
-    float pmf_outer =
-        (params.mesh_light_cdf[mli + 1] - params.mesh_light_cdf[mli]);
-    if (pmf_outer > 0.0f && ml.num_triangles > 0) {
-      float ut = rng.next();
-      int ti = cdf_search(ml.cdf, (int)ml.num_triangles, ut);
-      MeshLightTri &tri = ml.triangles[ti];
-      float pmf_tri = ml.cdf[ti + 1] - ml.cdf[ti];
-      if (pmf_tri > 0.0f) {
-        // Uniform area sample on the triangle via the Turk √r mapping.
-        float r1 = rng.next();
-        float r2 = rng.next();
-        float sq = sqrtf(r1);
-        float b0 = 1.0f - sq;
-        float b1 = sq * (1.0f - r2);
-        float b2 = sq * r2;
-        float3 v0 = make_f3(tri.v0);
-        float3 v1 = make_f3(tri.v1);
-        float3 v2 = make_f3(tri.v2);
-        float3 Pl = v0 * b0 + v1 * b1 + v2 * b2;
-        float3 e1 = v1 - v0;
-        float3 e2 = v2 - v0;
-        float3 ng = cross3(e1, e2);
-        float ng_len2 = dot3(ng, ng);
-        if (ng_len2 > 1e-20f) {
-          float3 n = ng * (1.0f / sqrtf(ng_len2));
-          float3 ld = Pl - P;
-          float d2 = dot3(ld, ld);
-          float d = sqrtf(d2);
-          if (d > 1e-4f) {
-            float3 wi = ld / d;
-            float cos_light = -dot3(n, wi);
-            if (ml.two_sided != 0u)
-              cos_light = fabsf(cos_light);
-            if (cos_light > 0.0f) {
-              float3 vis = shadow_transmittance(P, wi, d, vstack);
-              if (luminance(vis) > 0.0f) {
-                BsdfEval b = eval_bsdf(e, wo, wi, cache);
-                float area = tri.area;
-                float pdf_area = 1.0f / fmaxf(area, 1e-12f);
-                float pdf_solid = pdf_area * d2 / cos_light;
-                float pdf_light = pdf_solid * pmf_outer * pmf_tri;
-                if (pdf_light > 0.0f) {
-                  // Per-sample emission radiance. The constant `tri.emission`
-                  // is the material's emission strength multiplier (the
-                  // Cycles Principled `Emission` socket × `Emission
-                  // Strength`). When `emission_tex` is set, sample the
-                  // texture at the barycentric → UV-interpolated coordinate
-                  // so a textured emissive surface (LED panel, CRT screen,
-                  // billboard) delivers per-pixel detail at the NEE-sampled
-                  // point — without this, all triangles of a textured
-                  // emissive mesh deliver a uniform glow regardless of
-                  // which texel they cover.
-                  float3 Le = mesh_light_emission(tri,b1,b2,-wi,d);
-                  // MIS against BSDF sampling. Power heuristic with β=2 —
-                  // matches the envmap NEE block's choice. The matching
-                  // BSDF-side branch in `trace_path` uses (1-w_light) on
-                  // emission contributions that hit mesh-light triangles.
-                  float w_light = power_heuristic(pdf_light, b.pdf);
-                  L = L + b.f * vis * Le * (w_light / pdf_light);
-                }
-              }
-            }
+    float pmf_outer;
+    int mli = sample_mesh_light(P, e.slots[0].Ns, rng.next(), pmf_outer);
+    if (mli >= 0 && pmf_outer > 0) {
+      MeshLight &ml = params.mesh_lights[mli];
+      if (ml.num_triangles > 0) {
+        int ti = cdf_search(ml.cdf, (int)ml.num_triangles, rng.next());
+        MeshLightTri &tri = ml.triangles[ti];
+        float pmf_tri = ml.cdf[ti + 1] - ml.cdf[ti];
+        vibrt_triangle::Triangle geometry = {{cycles_vector(make_f3(tri.v0)),
+                                              cycles_vector(make_f3(tri.v1)),
+                                              cycles_vector(make_f3(tri.v2))},
+                                             ml.two_sided != 0};
+        vibrt_triangle::LightSample ls = {};
+        if (pmf_tri > 0 && vibrt_triangle::triangle_light_sample<false>(
+                               &geometry, 0, 0, vibrt_cycles::make_float2(rng.next(), rng.next()),
+                               0, &ls, cycles_vector(P))) {
+          float3 wi = make_float3(ls.D.x, ls.D.y, ls.D.z);
+          float pdf_light = ls.pdf * pmf_outer * pmf_tri;
+          float3 vis = shadow_transmittance(P, wi, ls.t, vstack, e.slots[0].Ng);
+          if (pdf_light > 0 && luminance(vis) > 0) {
+            auto uv = vibrt_cycles::ray_triangle_uv(cycles_vector(P), ls.D, geometry.vertices[0],
+                                                    geometry.vertices[1], geometry.vertices[2]);
+            float3 Le = mesh_light_emission(tri, uv.x, uv.y, -wi, ls.t);
+            BsdfEval b = eval_bsdf(e, wo, wi, cache);
+            L = L + b.f * vis * Le * (power_heuristic(pdf_light, b.pdf) / pdf_light);
           }
         }
       }
@@ -506,7 +322,7 @@ static __device__ __noinline__ float3 direct_light(const MaterialEvalGroup &e, f
   if (params.world_type != 0 && params.envmap_integral > 0.0f) {
     EnvSample es = sample_envmap(rng);
     if (es.pdf > 0.0f) {
-      float3 vis = shadow_transmittance(P, es.dir, 1e20f, vstack);
+      float3 vis = shadow_transmittance(P, es.dir, 1e20f, vstack, e.slots[0].Ng);
       if (luminance(vis) > 0.0f) {
         BsdfEval b = eval_bsdf(e, wo, es.dir, cache);
         if (b.pdf > 0.0f) {
@@ -548,7 +364,7 @@ static __device__ __noinline__ float3 direct_light(const MaterialEvalGroup &e, f
       float NoL = dot3(e0.Ns, wi);
       if (NoL > 0.0f) {
         float pdf_cos = NoL * INV_PIf;
-        float3 vis = shadow_transmittance(P, wi, 1e20f, vstack);
+        float3 vis = shadow_transmittance(P, wi, 1e20f, vstack, e.slots[0].Ng);
         if (luminance(vis) > 0.0f) {
           BsdfEval b = eval_bsdf(e, wo, wi, cache);
           if (b.pdf > 0.0f) {
@@ -585,7 +401,7 @@ static __device__ __noinline__ BsdfSample sample_surface_lighting(
 // phase function depends on the angle between wi_world and the chosen
 // shadow direction. Environment NEE uses MIS against phase sampling, paired
 // with the miss-path weight. Rect lights also pair NEE with phase-sampled
-// light hits; the other explicit-light and mesh-light blocks do not.
+// light hits; mesh-light sampling also pairs with phase-sampled hits.
 static __device__ __noinline__ float3 direct_light_volume(float3 P, float3 wi_world,
                                               const Volume *vol,
                                               const VolumeStack &vstack,
@@ -690,65 +506,42 @@ static __device__ __noinline__ float3 direct_light_volume(float3 P, float3 wi_wo
       }
     }
   }
-  // Mesh lights — same two-stage CDF as the surface NEE block, contribution
-  // routed through `add` (phase function in place of BSDF eval). This block
-  // does not apply the phase-sampling MIS used by environment NEE below.
+  // Mesh lights use spatial group selection and area sampling inside a volume,
+  // with matching phase-sampled-hit MIS in the integrator.
   if (params.num_mesh_lights > 0) {
-    float u = rng.next();
-    int mli = cdf_search(params.mesh_light_cdf, params.num_mesh_lights, u);
-    MeshLight &ml = params.mesh_lights[mli];
-    float pmf_outer =
-        (params.mesh_light_cdf[mli + 1] - params.mesh_light_cdf[mli]);
-    if (pmf_outer > 0.0f && ml.num_triangles > 0) {
-      float ut = rng.next();
-      int ti = cdf_search(ml.cdf, (int)ml.num_triangles, ut);
-      MeshLightTri &tri = ml.triangles[ti];
-      float pmf_tri = ml.cdf[ti + 1] - ml.cdf[ti];
-      if (pmf_tri > 0.0f) {
-        float r1 = rng.next();
-        float r2 = rng.next();
-        float sq = sqrtf(r1);
-        float b0 = 1.0f - sq;
-        float b1 = sq * (1.0f - r2);
-        float b2 = sq * r2;
-        float3 v0 = make_f3(tri.v0);
-        float3 v1 = make_f3(tri.v1);
-        float3 v2 = make_f3(tri.v2);
-        float3 Pl = v0 * b0 + v1 * b1 + v2 * b2;
-        float3 e1 = v1 - v0;
-        float3 e2 = v2 - v0;
-        float3 ng = cross3(e1, e2);
-        float ng_len2 = dot3(ng, ng);
-        if (ng_len2 > 1e-20f) {
-          float3 n = ng * (1.0f / sqrtf(ng_len2));
-          float3 ld = Pl - P;
-          float d2 = dot3(ld, ld);
-          float d = sqrtf(d2);
-          if (d > 1e-4f) {
-            float3 wi = ld / d;
-            float cos_light = -dot3(n, wi);
-            if (ml.two_sided != 0u)
-              cos_light = fabsf(cos_light);
-            if (cos_light > 0.0f) {
-              float3 vis = shadow_transmittance(P, wi, d, vstack);
-              if (luminance(vis) > 0.0f) {
-                float area = tri.area;
-                float pdf_area = 1.0f / fmaxf(area, 1e-12f);
-                float pdf_solid = pdf_area * d2 / cos_light;
-                float pdf = pdf_solid * pmf_outer * pmf_tri;
-                if (pdf > 0.0f) {
-                  // Per-sample emission radiance — same texture-aware
-                  // path as the surface NEE block.
-                  float3 Le = mesh_light_emission(tri,b1,b2,-wi,d);
-                  add(wi, Le / pdf, vis);
-                }
-              }
-            }
+    float pmf_outer;
+    int mli = sample_mesh_light(P, make_float3(0, 0, 0), rng.next(), pmf_outer);
+    if (mli >= 0 && pmf_outer > 0) {
+      MeshLight &ml = params.mesh_lights[mli];
+      if (ml.num_triangles > 0) {
+        int ti = cdf_search(ml.cdf, (int)ml.num_triangles, rng.next());
+        MeshLightTri &tri = ml.triangles[ti];
+        float pmf_tri = ml.cdf[ti + 1] - ml.cdf[ti];
+        vibrt_triangle::Triangle geometry = {{cycles_vector(make_f3(tri.v0)),
+                                              cycles_vector(make_f3(tri.v1)),
+                                              cycles_vector(make_f3(tri.v2))},
+                                             ml.two_sided != 0};
+        vibrt_triangle::LightSample ls = {};
+        if (pmf_tri > 0 &&
+            vibrt_triangle::triangle_light_sample<true>(
+                &geometry, 0, 0, vibrt_cycles::make_float2(rng.next(), rng.next()), 0, &ls,
+                cycles_vector(P)) &&
+            (ml.two_sided || vibrt_cycles::dot(ls.Ng, -ls.D) > 0)) {
+          float3 wi = make_float3(ls.D.x, ls.D.y, ls.D.z);
+          float pdf_light = ls.pdf * pmf_outer * pmf_tri;
+          float3 vis = shadow_transmittance(P, wi, ls.t, vstack);
+          if (pdf_light > 0 && luminance(vis) > 0) {
+            auto uv = vibrt_cycles::ray_triangle_uv(cycles_vector(P), ls.D, geometry.vertices[0],
+                                                    geometry.vertices[1], geometry.vertices[2]);
+            float3 Le = mesh_light_emission(tri, uv.x, uv.y, -wi, ls.t);
+            float p = volume_phase_eval(vol, dot3(wi_world, wi));
+            add(wi, Le * (power_heuristic(pdf_light, p) / pdf_light), vis);
           }
         }
       }
     }
   }
+
   if (params.world_type != 0 && params.envmap_integral > 0.0f) {
     EnvSample es = sample_envmap(rng);
     if (es.pdf > 0.0f) {

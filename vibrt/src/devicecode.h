@@ -94,6 +94,7 @@ struct PrincipledGpu {
   // budget with the forward diffuse lobe.
   float translucent_weight;
   float hair_weight;
+  unsigned int hair_component;
   float hair_offset;
   float hair_roughness_u;
   float hair_roughness_v;
@@ -186,7 +187,7 @@ struct HitGroupData {
   float object_color[4];
   unsigned int object_index;
   unsigned int instance_id;
-  float *light_pdf; // Joint light-selection probability per unit triangle area.
+  float *light_pdf; // Conditional triangle probability per unit area within this mesh.
 };
 
 struct PointLight {
@@ -195,14 +196,8 @@ struct PointLight {
   float radius;
   float emission[3];
   unsigned int sphere;
-  // Optional IES (Illuminating Engineering Society) profile: directional
-  // intensity multiplier in [0, 1] sampled in the light's local frame.
-  // `ies_data` is a CUDA pointer to a candela table laid out as
-  // `[h * n_v + v]`, already normalised by the table's peak so each
-  // entry is in `[0, 1]`. Followed by `n_v` floats for the vertical-
-  // angle axis (degrees) and (when n_h > 1) `n_h` floats for the
-  // horizontal-angle axis. `ies_data == nullptr` means "no IES, emit
-  // isotropically" (the default for Blender Point lights).
+  // Cycles packed IES: slot offset, bit-cast H/V counts, H/V angles in
+  // radians, then peak-normalized intensities. Null means isotropic emission.
   float *ies_data;
   unsigned int ies_n_v;
   unsigned int ies_n_h;
@@ -366,19 +361,14 @@ struct LaunchParams {
   SpotLight *spot_lights;
   int num_rect_lights;
   AreaRectLight *rect_lights;
+  const void *rect_light_tree;
+  const int *rect_light_leaves;
+  const void *mesh_light_tree;
+  const int *mesh_light_leaves;
 
-  // Mesh-light NEE: a MeshLight per emissive mesh group, each with its
-  // own per-triangle CDF. `mesh_light_cdf` is the outer CDF (num+1
-  // entries) over per-light total power. Mirrors `LaunchParams` on the
-  // host side.
+  // Mesh-light groups use the spatial tree; each mesh carries a triangle CDF.
   int num_mesh_lights;
   MeshLight *mesh_lights;
-  float *mesh_light_cdf;
-  // Sum of per-mesh-light powers (area × luminance(emission) summed over
-  // every registered emissive triangle). Used by trace_path's MIS gate
-  // to compute the NEE-side pdf at a BSDF-sampler hit without needing
-  // per-triangle indexing — `pmf_outer × pmf_tri = area_t × lum_t /
-  // total_power` regardless of which mesh-light owns the triangle.
   float mesh_light_total_power;
 
   int world_type; // 0=constant, 1=single envmap, 2=mixed (two layers)

@@ -69,13 +69,22 @@ tree.links.new(checker.outputs["Color"], emission.inputs["Emission Color" if lay
 tree.links.new(emission.outputs[0], out.inputs["Surface"])
 light.data.materials.append(mat)
 
+many = "--many" in sys.argv
+if many:
+    # Distinct groups exercise every tree branch and the matching hit-side PMF.
+    for x, y in ((-3, -3), (0, -3), (3, -3), (-3, 0), (3, 0), (-3, 3), (0, 3), (3, 3)):
+        other = light.copy()
+        scene.collection.objects.link(other)
+        other.location.x += x
+        other.location.y += y
+
 camera = bpy.data.objects.new("Camera", bpy.data.cameras.new("Camera"))
 scene.collection.objects.link(camera)
 scene.camera = camera
 camera.location = (4, -6, 4)
 camera.rotation_euler = (Vector((0, 0, 0)) - camera.location).to_track_quat("-Z", "Y").to_euler()
 
-directory = ROOT / ("target/shader-lighting-layered" if layered else "target/shader-lighting")
+directory = ROOT / ("target/shader-lighting-many" if many else "target/shader-lighting-layered" if layered else "target/shader-lighting")
 directory.mkdir(parents=True, exist_ok=True)
 scene.render.filepath = str(directory / "cycles.exr")
 bpy.ops.render.render(write_still=True)
@@ -86,7 +95,7 @@ reference = reference.reshape(64, 64, 4)
 scene.render.engine = "VIBRT"
 scene.vibrt_spp = 512
 exported, blobs, textures = exporter.export_scene_to_memory(bpy.context.evaluated_depsgraph_get(), serialize=False)
-assert len(exported["mesh_lights"]) == 1
+assert len(exported["mesh_lights"]) == (9 if many else 1)
 assert any("emission" in m.get("shader_graph", {}).get("outputs", {}) for m in exported["materials"])
 actual, _ = native.render(exported, [b.view(np.uint8) for b in blobs],
                           {"spp":512, "width":64, "height":64}, texture_arrays=textures)

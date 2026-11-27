@@ -497,6 +497,11 @@ static __device__ __noinline__ MaterialEval eval_material_one(const PathVertex &
   }
   e.Ns = Ns;
   e.Ng = v.Ng;
+  if (m->hair_weight > 0.5f && !(m->shader_outputs & (1ull << 25)) && dot3(v.T, v.T) < 1e-10f) {
+    // Cycles uses dPdv and no offset for a mesh with an unlinked Hair tangent.
+    graph_tangent = v.dPdv;
+    e.hair_offset = 0;
+  }
   // If closesthit interpolated an authored tangent (hair strand axis), use
   // it as the anisotropy / hair tangent after re-orthogonalising against the
   // possibly-perturbed shading normal. Otherwise fall back to a synthetic
@@ -513,6 +518,9 @@ static __device__ __noinline__ MaterialEval eval_material_one(const PathVertex &
   } else {
     build_frame(e.Ns, e.T, e.B);
   }
+
+  if (m->hair_weight > 0.5f && dot3(graph_tangent, graph_tangent) > 1e-12f)
+    e.T = normalize3(graph_tangent);
 
   // Cycles uses a distinct roughness remapping for the standalone Glossy node.
   float aniso = fminf(fmaxf(e.anisotropy, -0.99f), 0.99f);
@@ -692,41 +700,43 @@ struct BsdfEval {
   float pdf;
 };
 
-// Kajiya-Kay hair: simplified tangent-aligned specular + "sin(T,L)" diffuse.
-// Not energy-conservative by construction — it's a classic approximation. The
-// specular uses the tilt-shifted H direction so the highlight cones forward
-// along the strand (Offset slider on Cycles' Hair BSDF). Sampling is plain
-// cosine-weighted hemisphere; MIS picks up the slack.
-static __device__ BsdfEval eval_hair(const MaterialEval &e, float3 wo,
-                                     float3 wi) {
+static __device__ vibrt_cycles::HairBsdf classic_hair(const MaterialEval &e) {
+  vibrt_cycles::HairBsdf hair = {};
+  hair.N = cycles_vector(e.Ns);
+  hair.T = cycles_vector(e.T);
+  hair.roughness1 = e.hair_roughness_u;
+  hair.roughness2 = e.hair_roughness_v;
+  hair.offset = -e.hair_offset;
+  if (e.mat->hair_component)
+    vibrt_cycles::bsdf_hair_transmission_setup(&hair);
+  else
+    vibrt_cycles::bsdf_hair_reflection_setup(&hair);
+  return hair;
+}
+#if VIBRT_CLOSURE_TYPES
+static __device__ vibrt_cycles::ToonBsdf toon_closure(const MaterialEval &e) {
+  vibrt_cycles::ToonBsdf toon = {};
+  toon.N = cycles_vector(e.Ns);
+  toon.size = e.toon_size;
+  toon.smooth = e.toon_smooth;
+  if (e.mat->closure_type == 1)
+    vibrt_cycles::bsdf_diffuse_toon_setup(&toon);
+  else
+    vibrt_cycles::bsdf_glossy_toon_setup(&toon);
+  return toon;
+}
+#endif
+static __device__ BsdfEval eval_hair(const MaterialEval &e, float3 wo, float3 wi) {
   BsdfEval r;
-  r.f = make_float3(0, 0, 0);
-  r.pdf = 0.0f;
-  float NoL = dot3(e.Ns, wi);
-  if (NoL <= 0.0f)
-    return r;
-
-  // Diffuse: peaks when light is perpendicular to the strand.
-  float TdotL = dot3(wi, e.T);
-  float sin_TL = sqrtf(fmaxf(1.0f - TdotL * TdotL, 0.0f));
-
-  // Specular: tangent-aligned cone. sin(offset) tilts the cone along T so the
-  // highlight shifts toward the tip of the strand (matches Cycles' "Offset").
-  float3 H = wo + wi;
-  float Hlen = sqrtf(fmaxf(dot3(H, H), 1e-12f));
-  H = H * (1.0f / Hlen);
-  float TdotH = dot3(H, e.T);
-  float tilt = sinf(e.hair_offset);
-  float TdotH_eff = TdotH - tilt;
-  float cone = sqrtf(fmaxf(1.0f - TdotH_eff * TdotH_eff, 0.0f));
-  float exponent = 2.0f / fmaxf(e.hair_roughness_u *
-                                    e.hair_roughness_u,
-                                1e-4f);
-  float spec = powf(fmaxf(cone, 0.0f), exponent);
-
-  r.f = (e.base_color * sin_TL + make_float3(spec, spec, spec))
-        * (INV_PIf * NoL);
-  r.pdf = NoL * INV_PIf;
+  auto hair = classic_hair(e);
+  auto *sc = reinterpret_cast<const vibrt_cycles::ShaderClosure *>(&hair);
+  auto value = e.mat->hair_component
+                   ? vibrt_cycles::bsdf_hair_transmission_eval(sc, cycles_vector(wo),
+                                                               cycles_vector(wi), &r.pdf)
+                   : vibrt_cycles::bsdf_hair_reflection_eval(sc, cycles_vector(wo),
+                                                             cycles_vector(wi), &r.pdf);
+  r.f = make_float3(value.x, value.y, value.z) * e.base_color * e.alpha_blend;
+  r.pdf *= e.alpha_blend;
   return r;
 }
 
@@ -788,12 +798,15 @@ static __device__ __noinline__ BsdfEval eval_bsdf_one(const MaterialEval &e, flo
     return r;
 #if VIBRT_CLOSURE_TYPES
   if (e.mat->closure_type) {
-    if (e.mat->closure_type <= 2 && dot3(e.Ns, wi) > 0) {
-      float3 axis = e.mat->closure_type == 1 ? e.Ns : e.Ns * (2 * NoV) - wo;
-      auto value =
-          vibrt_shader::toon_eval(dot3(axis, wi), e.toon_size, e.toon_smooth);
-      r.f = e.base_color * value.x;
-      r.pdf = value.y;
+    if (e.mat->closure_type <= 2) {
+      auto toon = toon_closure(e);
+      auto *sc = reinterpret_cast<const vibrt_cycles::ShaderClosure *>(&toon);
+      auto value = e.mat->closure_type == 1
+                       ? vibrt_cycles::bsdf_diffuse_toon_eval(sc, cycles_vector(wo),
+                                                              cycles_vector(wi), &r.pdf)
+                       : vibrt_cycles::bsdf_glossy_toon_eval(sc, cycles_vector(wo),
+                                                             cycles_vector(wi), &r.pdf);
+      r.f = e.base_color * make_float3(value.x, value.y, value.z);
     }
     return r;
   }
@@ -890,20 +903,23 @@ static __device__ __noinline__ BsdfDirectionSample sample_bsdf_direction(const M
 #if VIBRT_CLOSURE_TYPES
   if (e.mat->closure_type) {
     if (e.mat->closure_type <= 2) {
-      float angle = fminf((fminf(fmaxf(e.toon_size, 1e-5f), 1.0f) +
-                           __saturatef(e.toon_smooth)) *
-                              (0.5f * M_PIf),
-                          0.5f * M_PIf);
-      float half_sin = sinf(0.5f * angle),
-            cosine = 1 - rng.next() * (2 * half_sin * half_sin);
-      float sine = sqrtf(fmaxf(1 - cosine * cosine, 0.0f)),
-            phi = 2 * M_PIf * rng.next();
-      float3 axis = e.mat->closure_type == 1 ? e.Ns : e.Ns * (2 * NoV) - wo, T,
-             B;
-      build_frame(axis, T, B);
-      s.wi = normalize3(axis * cosine + (T * cosf(phi) + B * sinf(phi)) * sine);
-      s.valid = dot3(e.Ng, s.wi) > 0 && dot3(e.Ns, s.wi) > 0;
+      auto toon = toon_closure(e);
+      auto *sc = reinterpret_cast<const vibrt_cycles::ShaderClosure *>(&toon);
+      vibrt_cycles::float3 value = {}, direction = {};
+      float pdf;
+      auto random = vibrt_cycles::make_float2(rng.next(), rng.next());
+      int label =
+          e.mat->closure_type == 1
+              ? vibrt_cycles::bsdf_diffuse_toon_sample(sc, cycles_vector(e.Ng), cycles_vector(wo),
+                                                       random, &value, &direction, &pdf)
+              : vibrt_cycles::bsdf_glossy_toon_sample(sc, cycles_vector(e.Ng), cycles_vector(wo),
+                                                      random, &value, &direction, &pdf);
+      s.wi = make_float3(direction.x, direction.y, direction.z);
+      s.valid = label != vibrt_cycles::LABEL_NONE && pdf > 0;
       s.lobe = e.mat->closure_type == 1 ? LOBE_DIFFUSE : LOBE_GLOSSY;
+      s.sampled_value = e.base_color * make_float3(value.x, value.y, value.z);
+      s.sampled_pdf = pdf;
+      s.weighted_sample = true;
     }
     return s;
   }
@@ -926,21 +942,21 @@ static __device__ __noinline__ BsdfDirectionSample sample_bsdf_direction(const M
     return s;
   }
 
-  // Hair: cosine-weighted sample around Ns. Not optimal for the tangent
-  // cone lobe, but MIS against NEE covers for it and stratification is cheap.
   if (e.mat->hair_weight > 0.5f) {
-    float u1 = rng.next();
-    float u2 = rng.next();
-    float r = sqrtf(u1);
-    float phi = 2.0f * M_PIf * u2;
-    float3 local = make_float3(r * cosf(phi), r * sinf(phi),
-                               sqrtf(fmaxf(0.0f, 1.0f - u1)));
-    s.wi = normalize3(e.T * local.x + e.B * local.y + e.Ns * local.z);
-    s.valid = true;
-    // Hair-Kajiya is mostly a forward-cone lobe + a diffuse base; bucket
-    // it as glossy because the dominant contribution shouldn't deplete
-    // the diffuse-bounces budget that thinks of brick / paint walls.
-    s.lobe = LOBE_GLOSSY;
+    auto hair = classic_hair(e);
+    vibrt_cycles::float3 value = {}, direction = {};
+    vibrt_cycles::float2 roughness;
+    float pdf;
+    auto random = vibrt_cycles::make_float2(rng.next(), rng.next());
+    int label = vibrt_cycles::sample_classic_hair(&hair, e.mat->hair_component != 0,
+                                                  cycles_vector(e.Ng), cycles_vector(wo), random,
+                                                  &value, &direction, &pdf, &roughness);
+    s.wi = make_float3(direction.x, direction.y, direction.z);
+    s.valid = pdf > 0;
+    s.lobe = label & vibrt_cycles::LABEL_TRANSMIT ? LOBE_TRANSMISSION : LOBE_GLOSSY;
+    s.sampled_value = e.base_color * make_float3(value.x, value.y, value.z) * e.alpha_blend;
+    s.sampled_pdf = pdf * e.alpha_blend;
+    s.weighted_sample = true;
     return s;
   }
 

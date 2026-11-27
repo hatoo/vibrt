@@ -5,6 +5,20 @@ use numpy::{IntoPyArray, PyReadonlyArrayDyn};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
+#[pyfunction]
+pub fn ies_profile<'py>(py: Python<'py>, text: &str) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+    let p = vibrt_nodes::ies::parse(text).map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let result = pyo3::types::PyDict::new_bound(py);
+    result.set_item("cycles_processed", true)?;
+    result.set_item("thetas_deg", p.thetas_deg)?;
+    result.set_item("phis_deg", p.phis_deg)?;
+    result.set_item("candelas", p.candelas)?;
+    result.set_item("peak_candela", p.peak_candela)?;
+    result.set_item("peak_absolute_candela", p.peak_absolute_candela)?;
+    result.set_item("integral_norm", p.integral_norm)?;
+    Ok(result)
+}
+
 #[pyo3::pyfunction]
 pub fn sky_pixels<'py>(
     py: pyo3::Python<'py>,

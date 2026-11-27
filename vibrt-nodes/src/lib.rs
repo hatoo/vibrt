@@ -7,6 +7,8 @@
 pub mod color;
 pub mod fold;
 pub mod graph;
+pub mod ies;
+pub mod light_tree;
 pub mod shader;
 pub mod sky;
 pub mod types;

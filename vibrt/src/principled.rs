@@ -474,6 +474,7 @@ pub fn make_material_data(
         sss_anisotropy: mat.sss_anisotropy.clamp(0.0, 0.9),
         translucent_weight: mat.translucent_weight.clamp(0.0, 1.0),
         hair_weight: mat.hair_weight.clamp(0.0, 1.0),
+        hair_component: mat.hair_component.min(1),
         hair_offset: mat.hair_offset,
         hair_roughness_u: mat.hair_roughness_u.clamp(1e-3, 1.0),
         hair_roughness_v: mat.hair_roughness_v.clamp(1e-3, 1.0),

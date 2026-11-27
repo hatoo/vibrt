@@ -861,6 +861,10 @@ def _resolve_ies_table(ies_node) -> dict | None:
         )
         return None
     try:
+        from .runner import find_native_module
+        native = find_native_module()
+        if native is not None and hasattr(native, "ies_profile"):
+            return native.ies_profile(text)
         table = ies.parse_ies(text)
     except Exception as ex:
         _emit(

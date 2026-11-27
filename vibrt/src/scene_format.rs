@@ -391,6 +391,8 @@ pub struct PrincipledMaterial {
     /// `ShaderNodeBsdfHair` and MixShader'd fractions of it.
     #[serde(default)]
     pub hair_weight: f32,
+    #[serde(default)]
+    pub hair_component: u32,
     /// Radians. Tilt of the specular cone away from perpendicular to the
     /// tangent — Cycles' "Offset" slider on Hair BSDF (angular shift of the
     /// highlight along the strand).
@@ -591,6 +593,9 @@ pub struct MeshLightDesc {
 /// `candela / max(candela)`).
 #[derive(Deserialize, Clone, Debug)]
 pub struct IesProfile {
+    /// Already converted and expanded by the pinned Cycles IES parser.
+    #[serde(default)]
+    pub cycles_processed: bool,
     /// Vertical angles in degrees. Strictly increasing, in [0, 180].
     pub thetas_deg: Vec<f32>,
     /// Horizontal angles in degrees. Strictly increasing. Length 1

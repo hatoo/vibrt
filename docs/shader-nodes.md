@@ -68,10 +68,19 @@ Surface evaluation, sampling and PDFs reuse Cycles' rough Diffuse, Sheen/Velvet
 and GGX/Beckmann closures. Principled assembles sheen, coat, metal, transmission,
 specular and diffuse/SSS in Cycles order, including attenuation of emission.
 Metallic supports F82 Edge Tint and physical conductor IOR/Extinction.
-Thin-film tables use scene-linear Rec.709. The legacy Hair BSDF and colored transparency remain limitations. Standalone and
+Thin-film tables use scene-linear Rec.709. Legacy Hair reflection/transmission
+and diffuse/glossy Toon use the upstream closures. Colored transparency remains
+a limitation. Standalone and
 Principled SSS support Burley, Random Walk and Random Walk Skin. Random walks
-use Cycles coefficient/radius fits and entry sampling, with spectral free flights
-and Russian roulette (1,024-event cap); Dwivedi guiding is not implemented.
+use Cycles coefficient/radius fits and entry sampling, with spectral free flights,
+forward/backward Dwivedi guiding and Russian roulette (1,024-event cap).
+
+Map Range, Mapping and Vector Rotate call the upstream SVM functions, including
+degenerate input ranges and zero rotation axes. IES parsing and interpolation
+use Cycles for Type A/B/C profiles. Path samples use Owen-scrambled Sobol, and
+surface/shadow origins use scale-aware ray offsets. Triangle lights use Cycles'
+solid-angle/area sampling with matching hit PDFs. A spatial light tree selects
+rectangular lights and mesh-light groups; each mesh retains its triangle CDF.
 
 Image textures are sampled at hits and graph-driven emission also participates
 in mesh-light importance sampling. Named UV/color/scalar/vector attributes are exported only when requested, and
@@ -120,7 +129,7 @@ Native: **52**, Partial: **33**, Legacy: **6**, Unsupported: **3**, Outside Cycl
 | `ShaderNodeBsdfAnisotropic` | Partial | Cycles GGX, Beckmann and Multi-GGX, with standalone anisotropy remapping and generated/linked tangent. |
 | `ShaderNodeBsdfDiffuse` | Partial | Cycles Lambert and Oren-Nayar, including linked roughness, color and normal. |
 | `ShaderNodeBsdfGlass` | Partial | Cycles GGX, Beckmann and Multi-GGX dielectric reflection/transmission with thin film. |
-| `ShaderNodeBsdfHair` | Partial | Existing vibrt closure with dynamic supported color/value/normal sockets. See closure limitations below. |
+| `ShaderNodeBsdfHair` | Native | Cycles reflection/transmission closures; dynamic Color, Offset, RoughnessU/V and Tangent. Unlinked tangents follow strands or mesh dPdv. |
 | `ShaderNodeBsdfHairPrincipled` | Partial | Unmodified Cycles Chiang closure with Color/Melanin/Absorption parametrizations and strand randomization. Huang is rejected pending agreement with Cycles. |
 | `ShaderNodeBsdfMetallic` | Partial | Cycles GGX/Multi-GGX with F82 Edge Tint or physical conductor IOR/Extinction, anisotropy and thin film; Rec.709 working space. |
 | `ShaderNodeBsdfPrincipled` | Partial | Cycles numerical closures and layer ordering; dynamic tint, coat normal and thin film in addition to base/specular/coat/sheen/SSS inputs. Includes linked Diffuse Roughness; path integration remains renderer-specific. |
@@ -236,7 +245,15 @@ Native: **52**, Partial: **33**, Legacy: **6**, Unsupported: **3**, Outside Cycl
 - `scripts/test_medium_closures.py`: curved Burley SSS and five homogeneous
   volume phases compared with Cycles at 2048 samples.
 - `scripts/test_shader_lighting.py`: procedural emission illuminating a diffuse
-  receiver, compared with a 512-sample Cycles render.
+  receiver, compared with a 512-sample Cycles render. `-- --many` exercises nine
+  emitter groups and spatial-tree MIS.
+- `scripts/test_blender_reuse.py`: Hair reflection/transmission, diffuse/glossy
+  Toon and isotropic/anisotropic Random Walk compared with Cycles.
+- `cargo test -p vibrt-nodes --test reuse`: IES A/B/C and malformed data, value-node
+  edge cases, sample/evaluate PDF agreement, Sobol strata, ray offsets, Dwivedi
+  normalization and light-tree probabilities.
+- `scripts/check_device_compile.py`: CPU-only NVRTC compilation on Windows;
+  `--minimal` checks a scene without special closures.
 - `scripts/test_bsdf_mixtures.py`: nine Mix/Add energy checks against separately
   rendered components, including tilted normals, coat, glass, alpha, hair,
   translucency, nested mixtures and zero/full weights. Run through Blender
@@ -246,7 +263,8 @@ Native: **52**, Partial: **33**, Legacy: **6**, Unsupported: **3**, Outside Cycl
 
 Test artifacts are under `target/shader-nodes`, `target/shader-graphs`,
 `target/scene-nodes`, `target/extended-closures`, `target/medium-closures`,
-`target/shader-lighting` and `target/bsdf-mixtures`.
+`target/shader-lighting`, `target/shader-lighting-many`, `target/blender-reuse-render`
+and `target/bsdf-mixtures`.
 Pinned source, hashes, adaptations and licenses are documented in
 [`vibrt-nodes/third_party/cycles`](../vibrt-nodes/third_party/cycles/README.md).
 
