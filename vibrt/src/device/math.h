@@ -1,16 +1,20 @@
-// ---------- RNG (PCG) ----------
+// Owen-scrambled Sobol from the pinned Cycles source. Each event has its
+// own stream, so transparent/volume/SSS loops cannot consume a later bounce's dimensions.
 struct RNG {
-  unsigned int state;
-  __device__ RNG(unsigned int pixel, unsigned int sample, unsigned int bounce) {
-    state = (pixel * 17u + sample * 101u + bounce * 1999u) * 747796405u +
-            2891336453u;
+  unsigned int state, seed, sample, dimension;
+  vibrt_cycles::float4 values;
+  __device__ RNG(unsigned int pixel, unsigned int index, unsigned int domain)
+      : seed(vibrt_cycles::hash_uint2(pixel, domain)), sample(index) {
+    begin_event(0);
+  }
+  __device__ void begin_event(unsigned int event) {
+    state = vibrt_cycles::hash_uint2(seed, event);
+    dimension = 0;
   }
   __device__ float next() {
-    unsigned int old = state;
-    state = old * 747796405u + 2891336453u;
-    unsigned int w = ((old >> ((old >> 28u) + 4u)) ^ old) * 277803737u;
-    unsigned int r = (w >> 22u) ^ w;
-    return (r >> 9) * (1.0f / 8388608.0f);
+    if ((dimension & 3u) == 0)
+      values = vibrt_cycles::sobol_burley_sample_4D(sample, dimension >> 2, state, 0xffffffffu);
+    return values[(dimension++) & 3u];
   }
 };
 
@@ -107,4 +111,13 @@ static __device__ float3 sample_ggx_vndf_aniso(float3 v, float ax, float ay, flo
   auto h = vibrt_cycles::microfacet_ggx_sample_vndf(
       vibrt_cycles::make_float3(v.x, v.y, v.z), ax, ay, vibrt_cycles::make_float2(u, w));
   return make_float3(h.x, h.y, h.z);
+}
+
+static __forceinline__ __device__ vibrt_cycles::float3 cycles_vector(float3 v) {
+  return vibrt_cycles::make_float3(v.x, v.y, v.z);
+}
+static __forceinline__ __device__ float3 offset_surface(float3 P, float3 N, float3 D) {
+  auto shifted =
+      vibrt_cycles::ray_offset(cycles_vector(P), cycles_vector(dot3(N, D) >= 0 ? N : -N));
+  return make_float3(shifted.x, shifted.y, shifted.z);
 }

@@ -18,7 +18,8 @@ static __device__ __noinline__ void fill_surface_vertex(PathVertex *v, HitGroupD
   }
   unsigned int contexts = v->mat ? v->mat->surface_contexts : 0;
   bool bump = v->mat && v->mat->surface_bump != 0;
-  bool derivatives = bump || (contexts & ((1u << 7) | (1u << 17)));
+  bool derivatives =
+      bump || (v->mat && v->mat->hair_weight > 0.5f) || (contexts & ((1u << 7) | (1u << 17)));
   v->light_pdf = hg->light_pdf ? hg->light_pdf[prim] : 0.0f;
   bool mesh_light = hg->area_light_group >= 0 && v->light_pdf > 0.0f;
   int i0 = hg->indices[prim * 3 + 0];

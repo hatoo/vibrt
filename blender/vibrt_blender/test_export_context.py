@@ -45,6 +45,15 @@ class Image:
 
 
 class ExportContextTests(unittest.TestCase):
+    def test_legacy_hair_preserves_reflection_and_transmission(self):
+        color = types.SimpleNamespace(default_value=(0.2, 0.3, 0.4, 1), is_linked=False)
+        for component, expected in (("Reflection", 0), ("Transmission", 1)):
+            node = types.SimpleNamespace(component=component, inputs={"Color": color})
+            result = materials._from_hair(node, BinWriter(), [])
+            self.assertEqual(result["hair_component"], expected)
+            self.assertEqual(result["hair_weight"], 1)
+            self.assertEqual(result["base_color"], [0.2, 0.3, 0.4])
+
     def test_image_cache_is_owned_by_one_export(self):
         image = Image()
         first, second = ExportContext(), ExportContext()

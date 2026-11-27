@@ -444,7 +444,6 @@ impl GpuScene<'_> {
                 object_index: scene.file.objects[obj_idx].object_index,
                 instance_id: obj_idx as u32,
                 light_pdf: {
-                    let total: f32 = scene.mesh_lights.iter().map(|l| l.power).sum();
                     if let Some(light) = scene
                         .mesh_lights
                         .iter()
@@ -452,9 +451,9 @@ impl GpuScene<'_> {
                     {
                         let mut densities =
                             vec![0.0f32; scene.meshes[obj.mesh as usize].indices.len() / 3];
-                        for tri in &light.triangles {
+                        for (index, tri) in light.triangles.iter().enumerate() {
                             densities[tri.primitive as usize] =
-                                tri.sampling_luminance / total.max(1e-30);
+                                (light.cdf[index + 1] - light.cdf[index]) / tri.area.max(1e-30);
                         }
                         uploads.copy_slice(&densities)?
                     } else {
@@ -670,15 +669,69 @@ impl GpuScene<'_> {
         let d_suns = uploads.copy_slice(&scene.sun_lights)?;
         let d_spots = uploads.copy_slice(&spot_lights)?;
         let d_rects = uploads.copy_slice(&rect_lights)?;
+        use vibrt_nodes::light_tree::{build, Node};
+        let rect_nodes: Vec<_> = rect_lights
+            .iter()
+            .map(|l| {
+                let mut lower = l.corner;
+                let mut upper = l.corner;
+                for u in [0.0, l.size_u] {
+                    for v in [0.0, l.size_v] {
+                        for c in 0..3 {
+                            let p = l.corner[c] + l.u_axis[c] * u + l.v_axis[c] * v;
+                            lower[c] = lower[c].min(p);
+                            upper[c] = upper[c].max(p);
+                        }
+                    }
+                }
+                let energy =
+                    (0.2126 * l.emission[0] + 0.7152 * l.emission[1] + 0.0722 * l.emission[2])
+                        * l.size_u
+                        * l.size_v
+                        * if l.disk != 0 {
+                            std::f32::consts::FRAC_PI_4
+                        } else {
+                            1.0
+                        };
+                Node::emitter(lower, upper, energy, l.normal, l.two_sided != 0)
+            })
+            .collect();
+        let rect_tree = build(&rect_nodes);
+        let mesh_nodes: Vec<_> = scene
+            .mesh_lights
+            .iter()
+            .map(|l| {
+                let mut lower = [f32::INFINITY; 3];
+                let mut upper = [f32::NEG_INFINITY; 3];
+                for triangle in &l.triangles {
+                    for p in [triangle.v0, triangle.v1, triangle.v2] {
+                        for c in 0..3 {
+                            lower[c] = lower[c].min(p[c]);
+                            upper[c] = upper[c].max(p[c]);
+                        }
+                    }
+                }
+                if l.triangles.is_empty() {
+                    lower = [0.0; 3];
+                    upper = [0.0; 3];
+                }
+                // Mesh normals may span the sphere; use a conservative cone.
+                Node::emitter(lower, upper, l.power, [0.0, 0.0, 1.0], true)
+            })
+            .collect();
+        let mesh_tree = build(&mesh_nodes);
+        let d_rect_tree = uploads.copy_slice(&rect_tree.nodes)?;
+        let d_rect_leaves = uploads.copy_slice(&rect_tree.leaves)?;
+        let d_mesh_tree = uploads.copy_slice(&mesh_tree.nodes)?;
+        let d_mesh_leaves = uploads.copy_slice(&mesh_tree.leaves)?;
 
         // Mesh lights: convert each host triangle into the GPU `MeshLightTri`
         // POD, resolving `emission_tex_idx` to the device-side texture
         // pointer/dimensions from `tex_slots`. Then upload per-triangle
-        // table + inner CDF, copy the outer `MeshLight` array, and build
-        // the outer CDF over per-light total power.
+        // table and inner CDF. Group selection uses the spatial tree above.
         let mut mesh_lights_gpu: Vec<MeshLight> = Vec::with_capacity(scene.mesh_lights.len());
-        let mut mesh_light_outer_cdf = vec![0.0f32; scene.mesh_lights.len() + 1];
-        for (i, ml) in scene.mesh_lights.iter().enumerate() {
+        let mesh_light_total_power: f32 = scene.mesh_lights.iter().map(|l| l.power.max(0.0)).sum();
+        for ml in &scene.mesh_lights {
             let gpu_tris: Vec<MeshLightTri> = ml
                 .triangles
                 .iter()
@@ -724,24 +777,11 @@ impl GpuScene<'_> {
                 power: ml.power,
                 _pad: 0,
             });
-            mesh_light_outer_cdf[i + 1] = mesh_light_outer_cdf[i] + ml.power.max(0.0);
-        }
-        let mesh_light_total_power = *mesh_light_outer_cdf.last().unwrap_or(&0.0);
-        if mesh_light_total_power > 0.0 {
-            let inv = 1.0 / mesh_light_total_power;
-            for v in mesh_light_outer_cdf.iter_mut().skip(1) {
-                *v *= inv;
-            }
         }
         let d_mesh_lights = if mesh_lights_gpu.is_empty() {
             0
         } else {
             uploads.copy_slice(&mesh_lights_gpu)?
-        };
-        let d_mesh_light_cdf = if mesh_lights_gpu.is_empty() {
-            0
-        } else {
-            uploads.copy_slice(&mesh_light_outer_cdf)?
         };
 
         // --- World / envmap ---
@@ -847,9 +887,12 @@ impl GpuScene<'_> {
             spot_lights: d_spots,
             num_rect_lights: scene.rect_lights.len() as i32,
             rect_lights: d_rects,
+            rect_light_tree: d_rect_tree,
+            rect_light_leaves: d_rect_leaves,
+            mesh_light_tree: d_mesh_tree,
+            mesh_light_leaves: d_mesh_leaves,
             num_mesh_lights: scene.mesh_lights.len() as i32,
             mesh_lights: d_mesh_lights,
-            mesh_light_cdf: d_mesh_light_cdf,
             mesh_light_total_power,
             world_type,
             world_color,
@@ -940,14 +983,8 @@ impl HasIes for crate::gpu_types::AreaRectLight {
     }
 }
 
-/// Pack each `Some(IesProfile)` into a flat float buffer
-/// `[thetas (n_v) | phis (n_h) | normalised candelas (n_v * n_h)]`,
-/// upload to the device, and patch the matching light's IES fields
-/// to point at it. Returns the device pointers so the caller can keep
-/// the allocations alive for the lifetime of the render.
-///
-/// The packing is what `ies_lookup` in devicecode.cu reads; keep the
-/// two in sync.
+/// Expand/pack profiles in the Cycles format and patch each light pointer.
+/// UploadArena retains the buffers for the lifetime of the scene.
 fn upload_ies_buffers<L: HasIes>(
     uploads: &UploadArena,
     lights: &mut [L],
@@ -958,30 +995,17 @@ fn upload_ies_buffers<L: HasIes>(
         let Some(p) = profile else {
             continue;
         };
-        let n_v = p.thetas_deg.len();
-        let n_h = p.phis_deg.len().max(1);
-        if n_v == 0 || p.candelas.len() != n_v * p.phis_deg.len() {
-            // Malformed profile — silently skip rather than crashing
-            // mid-render. The exporter is supposed to validate; this
-            // is just defence in depth.
-            continue;
-        }
-        let peak = p.peak_candela.max(1e-6);
-        let mut buf: Vec<f32> = Vec::with_capacity(n_v + n_h + n_v * n_h);
-        buf.extend_from_slice(&p.thetas_deg);
-        // Synthesise a single phi=0 entry for radially-symmetric
-        // profiles so the GPU lookup can read the phi axis without
-        // a special case for n_h==1.
-        if p.phis_deg.is_empty() {
-            buf.push(0.0);
-        } else {
-            buf.extend_from_slice(&p.phis_deg);
-        }
-        for c in &p.candelas {
-            buf.push(c / peak);
-        }
+        let buf = vibrt_nodes::ies::pack(
+            &p.thetas_deg,
+            &p.phis_deg,
+            &p.candelas,
+            p.peak_candela,
+            p.cycles_processed,
+        )?;
+        let n_h = buf[1].to_bits();
+        let n_v = buf[2].to_bits();
         let d = uploads.copy_slice(&buf)?;
-        lights[i].set_ies(d, n_v as u32, n_h as u32);
+        lights[i].set_ies(d, n_v, n_h);
         out.push(d);
     }
     Ok(out)

@@ -111,7 +111,9 @@ static __device__ __noinline__ float3 trace_path(float3 origin, float3 dir,
 
   int camera_skip = 0;
   unsigned int volume_boundaries = 0;
+  unsigned int event = 0;
   for (unsigned int bounce = 0; bounce < params.max_depth; bounce++) {
+    rng.begin_event(++event);
     PathVertex v;
     v.hit = 0;
     unsigned int hi, lo;
@@ -132,7 +134,7 @@ static __device__ __noinline__ float3 trace_path(float3 origin, float3 dir,
     // strict t_min skips the front face but we still hit the back face
     // just past it and shade it as a dark interior. The back-face advance
     // mimics Cycles' "skip the whole hidden object" intent.
-    float ray_tmin = (bounce == 0 && camera_skip == 0) ? first_ray_tmin : 1e-4f;
+    float ray_tmin = (bounce == 0 && camera_skip == 0) ? first_ray_tmin : 0.0f;
     // Per-bounce visibility mask: primary radiance (0x01) for camera ray
     // and specular bounce chains, secondary radiance (0x04) for diffuse
     // bounces. Camera-hidden emissive instances drop their 0x01 bit so
@@ -164,10 +166,7 @@ static __device__ __noinline__ float3 trace_path(float3 origin, float3 dir,
         // Back-face hit on the camera ray: step past it and retry without
         // counting this as a bounce. Cap the retry depth so a pathological
         // all-back-faces direction can't loop forever.
-        float p_scale =
-            fmaxf(fmaxf(fabsf(v.P.x), fabsf(v.P.y)), fabsf(v.P.z));
-        float eps = fmaxf(1e-3f, p_scale * 1e-5f);
-        origin = v.P + dir * eps;
+        origin = offset_surface(v.P, v.Ng, dir);
         camera_skip++;
         bounce--;  // wraps to UINT_MAX, the for-loop's bounce++ brings it back to 0
         continue;
@@ -403,9 +402,7 @@ static __device__ __noinline__ float3 trace_path(float3 origin, float3 dir,
         volume_stack_push(vstack, v.mat->volume);
       else
         volume_stack_pop(vstack, v.mat->volume);
-      float p_scale = fmaxf(fmaxf(fabsf(v.P.x), fabsf(v.P.y)), fabsf(v.P.z));
-      float eps = fmaxf(1e-4f, p_scale * 1e-5f);
-      origin = v.P + dir * eps;
+      origin = offset_surface(v.P, v.Ng, dir);
       if (++volume_boundaries > 128) break;
       if (bounce == 0) camera_skip++;
       bounce--; // the loop increment restores the same surface bounce
@@ -423,7 +420,7 @@ static __device__ __noinline__ float3 trace_path(float3 origin, float3 dir,
     // Stack-allocated leaves of the material's binary Mix tree. Lifetime
     // covers every direct_light / sample_bsdf call that reads `e_group`.
     MaterialEval e_slots[MAX_LEAVES];
-    v.shader_seed = rng.state;
+    v.shader_seed = vibrt_cycles::hash_uint2(rng.state, rng.sample);
     v.path_depth = bounce;
     v.diffuse_depth = diffuse_bounces;
     v.glossy_depth = glossy_bounces;
@@ -510,28 +507,31 @@ static __device__ __noinline__ float3 trace_path(float3 origin, float3 dir,
                && params.mesh_light_total_power > 0.0f
                && v.prim_area > 1e-12f
                && prev_bsdf_pdf > 0.0f) {
-      // Mesh-light pdf evaluated at this hit. The joint pmf
-      // `pmf_outer × pmf_tri` reduces to `area × lum / total_power`
-      // regardless of which mesh-light owns this triangle (the
-      // per-light index cancels in the product), so we don't need to
-      // look up `mesh_light_idx` to recover the right pdf.
       float3 ld = v.P - prev_nee_position;
-      float d2 = dot3(ld, ld);
-      float lum_e = luminance(e.emission);
-      // `dir` is the incoming ray direction (origin → hit). cos_light is
-      // the angle between the surface normal and -dir. Two-sided emitters
-      // (the default for emissive meshes registered as mesh-lights —
-      // matches the NEE block above) take the absolute value.
-      float cos_light = fabsf(dot3(v.Ng, dir));
-      if (cos_light > 1e-6f) {
-        float pmf = v.prim_area * v.light_pdf;
-        float pdf_solid = d2 / fmaxf(v.prim_area * cos_light, 1e-30f);
-        float pdf_light = pdf_solid * pmf;
-        float w_bsdf = power_heuristic(prev_bsdf_pdf, pdf_light);
-        float3 e_contrib = throughput * e.emission * w_bsdf;
-        e_contrib = clamp_indirect(e_contrib, params.clamp_indirect);
-        L = L + e_contrib;
+      float distance = sqrtf(dot3(ld, ld));
+      const HitGroupData *hg = v.geometry;
+      vibrt_triangle::Triangle triangle;
+      triangle.two_sided = params.mesh_lights[v.mesh_light_idx].two_sided != 0;
+      for (int k = 0; k < 3; ++k) {
+        int index = hg->indices[3 * v.primitive + k];
+        triangle.vertices[k] =
+            cycles_vector(transform_point(hg->object_to_world, make_f3(hg->vertices + 3 * index)));
       }
+      vibrt_triangle::ShaderData sd;
+      sd.P = cycles_vector(v.P);
+      sd.Ng = cycles_vector(v.Ng);
+      sd.wi = cycles_vector(-ld / distance);
+      float pdf_solid =
+          dot3(prev_normal, prev_normal) == 0
+              ? vibrt_triangle::triangle_light_pdf_area_sampling(sd.Ng, sd.wi, distance) /
+                    v.prim_area
+              : vibrt_triangle::triangle_light_pdf(&triangle, &sd, distance);
+      float pmf = v.prim_area * v.light_pdf *
+                  mesh_light_pmf(v.mesh_light_idx, prev_nee_position, prev_normal);
+      float pdf_light = pdf_solid * pmf;
+      float w_bsdf = power_heuristic(prev_bsdf_pdf, pdf_light);
+      float3 e_contrib = clamp_indirect(throughput * e.emission * w_bsdf, params.clamp_indirect);
+      L = L + e_contrib;
     }
 
     // Select a BSSRDF independently of local reflection/transmission. Emission
@@ -615,8 +615,7 @@ static __device__ __noinline__ float3 trace_path(float3 origin, float3 dir,
         if (dot3(v.Ng, dir) < 0) volume_stack_push(vstack, v.mat->volume);
         else volume_stack_pop(vstack, v.mat->volume);
       }
-      float eps = fmaxf(1e-4f, fmaxf(fmaxf(fabsf(v.P.x), fabsf(v.P.y)),fabsf(v.P.z))*1e-5f);
-      origin = v.P + bs.wi * eps;
+      origin = offset_surface(v.P, v.Ng, bs.wi);
       dir = bs.wi;
       if (bounce == 0) camera_skip++;
       bounce--;
@@ -701,14 +700,7 @@ static __device__ __noinline__ float3 trace_path(float3 origin, float3 dir,
       }
     }
 
-    // Offset along geometric normal to reduce self-intersection. Scale with
-    // |P| so large-coordinate scenes (e.g. archviz authored in cm) don't
-    // fall below float-precision noise while the 1e-4 floor still covers
-    // unit-scale scenes.
-    float3 offset_n = dot3(bs.wi, v.Ng) > 0.0f ? v.Ng : -v.Ng;
-    float p_scale = fmaxf(fmaxf(fabsf(v.P.x), fabsf(v.P.y)), fabsf(v.P.z));
-    float eps = fmaxf(1e-4f, p_scale * 1e-5f);
-    origin = v.P + offset_n * eps;
+    origin = offset_surface(v.P, v.Ng, bs.wi);
     dir = bs.wi;
   }
   return L;
@@ -760,11 +752,8 @@ extern "C" __global__ void __raygen__rg() {
       if (v.mat == nullptr || v.mat->volume == nullptr ||
           v.mat->volume_only == 0)
         break;
-      float p_scale =
-          fmaxf(fmaxf(fabsf(v.P.x), fabsf(v.P.y)), fabsf(v.P.z));
-      float eps = fmaxf(1e-4f, p_scale * 1e-5f);
-      origin = v.P + dir0 * eps;
-      ray_tmin = 1e-4f;
+      origin = offset_surface(v.P, v.Ng, dir0);
+      ray_tmin = 0.0f;
     }
     float3 alb = make_float3(0, 0, 0);
     float3 nrm = make_float3(0, 0, 0);

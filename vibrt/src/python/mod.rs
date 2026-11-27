@@ -336,6 +336,7 @@ fn precompile_shaders<'py>(
 #[pymodule]
 fn vibrt_native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(nodes::sky_pixels, m)?)?;
+    m.add_function(wrap_pyfunction!(nodes::ies_profile, m)?)?;
     m.add_function(wrap_pyfunction!(nodes::color_pixels, m)?)?;
     m.add_function(wrap_pyfunction!(nodes::fold_color_constants, m)?)?;
     m.add_function(wrap_pyfunction!(nodes::shader_pixels, m)?)?;
