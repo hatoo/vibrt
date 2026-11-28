@@ -80,7 +80,21 @@ class HairExportTests(unittest.TestCase):
                     squared = np.dot(up, up)
                 up = up / max(float(np.sqrt(squared)), 1e-20)
                 expected[first + i] = up
-        np.testing.assert_array_equal(arrays['normals'], expected)
+        # np.dot and batched einsum can round differently across NumPy builds
+        # (including 2.4). Bound accumulated float32 error over 257 keys using
+        # an absolute tolerance: relative error is misleading near zero.
+        actual = arrays['normals']
+        self.assertTrue(np.isfinite(actual).all())
+        np.testing.assert_allclose(actual, expected, rtol=0, atol=4e-6)
+        nonzero = np.linalg.norm(expected, axis=1) > 0
+        np.testing.assert_allclose(np.linalg.norm(actual[nonzero], axis=1),
+                                   1, rtol=0, atol=3e-7)
+        np.testing.assert_allclose(
+            np.einsum('ij,ij->i', actual, arrays['tangents']),
+            0, rtol=0, atol=4e-6)
+        # Fallback strands replay the scalar path and must remain bit-exact,
+        # including float64 promotion and the all-zero degenerate strand.
+        np.testing.assert_array_equal(actual[offsets[-3]:], expected[offsets[-3]:])
 
     def test_authored_normals_are_preserved(self):
         points = np.array([[0, 0, 0], [0, 0, 1], [1, 0, 0], [1, 0, 1]], np.float32)
