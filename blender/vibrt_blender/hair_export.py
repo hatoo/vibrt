@@ -51,9 +51,11 @@ def _pack_curves(points, radii, offsets, seed=0, normals=None):
             up = np.array([1, 0, 0] if abs(axes[0, 0]) < 0.9 else [0, 1, 0], np.float32)
             for i, axis in enumerate(axes):
                 up = up - axis * np.dot(up, axis)
-                if np.dot(up, up) < 1e-12:
+                squared = np.dot(up, up)
+                if squared < 1e-12:
                     up = np.cross(axis, [0, 0, 1] if abs(axis[2]) < 0.9 else [0, 1, 0])
-                up = up / max(float(np.linalg.norm(up)), 1e-20)
+                    squared = np.dot(up, up)
+                up = up / max(float(np.sqrt(squared)), 1e-20)
                 normals[first + i] = up
     uv = np.column_stack((np.full(len(points), 0.5, np.float32), info[:, 0]))
     return dict(vertices=points, indices=indices, curve_radii=radii,
