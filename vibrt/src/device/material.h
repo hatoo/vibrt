@@ -188,8 +188,10 @@ struct MaterialEval {
   float sss_scale, sss_ior, sss_anisotropy;
   bool sss_exit;
 #endif
-#if VIBRT_CLOSURE_TYPES
+#if (VIBRT_CLOSURE_TYPES & ((1u << 1) | (1u << 2)))
   float toon_size, toon_smooth;
+#endif
+#if (VIBRT_CLOSURE_TYPES & (1u << 4))
   float3 portal_position, portal_direction;
 #endif
 #if (VIBRT_CLOSURE_TYPES & (1u << 5))
@@ -290,9 +292,11 @@ static __device__ __noinline__ MaterialEval eval_material_one(const PathVertex &
                                                   float min_alpha = 0.0f) {
   MaterialEval e;
   e.mat = m;
-#if VIBRT_CLOSURE_TYPES
+#if (VIBRT_CLOSURE_TYPES & ((1u << 1) | (1u << 2)))
   e.toon_size = 0.5f;
   e.toon_smooth = 0;
+#endif
+#if (VIBRT_CLOSURE_TYPES & (1u << 4))
   e.portal_position = v.P;
   e.portal_direction = -v.incoming;
 #endif
@@ -451,11 +455,13 @@ static __device__ __noinline__ MaterialEval eval_material_one(const PathVertex &
 #endif
     }
 #endif
-#if VIBRT_CLOSURE_TYPES && VIBRT_SHADER_OUTPUT_COUNT > 32
+#if (VIBRT_CLOSURE_TYPES & ((1u << 1) | (1u << 2))) && VIBRT_SHADER_OUTPUT_COUNT > 32
     if (mask & (1ull << 32))
       e.toon_size = out[32].x;
     if (mask & (1ull << 33))
       e.toon_smooth = out[33].x;
+#endif
+#if (VIBRT_CLOSURE_TYPES & (1u << 4)) && VIBRT_SHADER_OUTPUT_COUNT > 32
     if (mask & (1ull << 34))
       e.portal_position = make_float3(out[34].x, out[34].y, out[34].z);
     if (mask & (1ull << 35)) {
@@ -771,7 +777,7 @@ static __device__ vibrt_cycles::HairBsdf classic_hair(const MaterialEval &e) {
     vibrt_cycles::bsdf_hair_reflection_setup(&hair);
   return hair;
 }
-#if VIBRT_CLOSURE_TYPES
+#if (VIBRT_CLOSURE_TYPES & ((1u << 1) | (1u << 2)))
 static __device__ vibrt_cycles::ToonBsdf toon_closure(const MaterialEval &e) {
   vibrt_cycles::ToonBsdf toon = {};
   toon.N = cycles_vector(e.Ns);
@@ -869,6 +875,7 @@ static __device__ __noinline__ BsdfEval eval_bsdf_one(const MaterialEval &e, flo
     return r;
 #if VIBRT_CLOSURE_TYPES
   if (e.mat->closure_type) {
+#if (VIBRT_CLOSURE_TYPES & ((1u << 1) | (1u << 2)))
     if (e.mat->closure_type <= 2) {
       auto toon = toon_closure(e);
       auto *sc = reinterpret_cast<const vibrt_cycles::ShaderClosure *>(&toon);
@@ -879,6 +886,7 @@ static __device__ __noinline__ BsdfEval eval_bsdf_one(const MaterialEval &e, flo
                                                              cycles_vector(wi), &r.pdf);
       r.f = e.base_color * make_float3(value.x, value.y, value.z);
     }
+#endif
     return r;
   }
 #endif
@@ -1005,6 +1013,7 @@ static __device__ __noinline__ BsdfDirectionSample sample_bsdf_direction(const M
     return s;
 #if VIBRT_CLOSURE_TYPES
   if (e.mat->closure_type) {
+#if (VIBRT_CLOSURE_TYPES & ((1u << 1) | (1u << 2)))
     if (e.mat->closure_type <= 2) {
       auto toon = toon_closure(e);
       auto *sc = reinterpret_cast<const vibrt_cycles::ShaderClosure *>(&toon);
@@ -1024,6 +1033,7 @@ static __device__ __noinline__ BsdfDirectionSample sample_bsdf_direction(const M
       s.sampled_pdf = pdf;
       s.weighted_sample = true;
     }
+#endif
     return s;
   }
 #endif
