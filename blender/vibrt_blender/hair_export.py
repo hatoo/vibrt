@@ -47,16 +47,38 @@ def _pack_curves(points, radii, offsets, seed=0, normals=None):
         axes = np.concatenate((differences[:1], differences[:-1] + differences[1:], differences[-1:]))
         axes /= np.maximum(np.linalg.norm(axes, axis=1, keepdims=True), 1e-20)
         tangents[first:end] = axes
-        if make_normals:
-            up = np.array([1, 0, 0] if abs(axes[0, 0]) < 0.9 else [0, 1, 0], np.float32)
-            for i, axis in enumerate(axes):
-                up = up - axis * np.dot(up, axis)
-                squared = np.dot(up, up)
-                if squared < 1e-12:
-                    up = np.cross(axis, [0, 0, 1] if abs(axis[2]) < 0.9 else [0, 1, 0])
+    if make_normals:
+        # Independent strands share the same recurrence step, allowing NumPy
+        # to process them together without reordering keys within a strand.
+        sizes = np.diff(offsets)
+        for size in np.unique(sizes[sizes >= 2]):
+            firsts = offsets[:-1][sizes == size]
+            up = np.zeros((len(firsts), 3), np.float32)
+            use_x = np.abs(tangents[firsts, 0]) < 0.9
+            up[:, 0] = use_x
+            up[:, 1] = ~use_x
+            fallback = np.zeros(len(firsts), dtype=bool)
+            for i in range(size):
+                axis = tangents[firsts + i]
+                dot = np.einsum('ij,ij->i', up, axis)
+                up = up - axis * dot[:, None]
+                squared = np.einsum('ij,ij->i', up, up)
+                fallback |= squared < 1e-12
+                up = up / np.maximum(np.sqrt(squared), 1e-20)[:, None]
+                normals[firsts + i] = up
+            # The scalar cross-product fallback promotes to float64. Replay
+            # those strands to retain that dtype for all subsequent keys.
+            for first in firsts[fallback]:
+                axes = tangents[first:first + size]
+                up = np.array([1, 0, 0] if abs(axes[0, 0]) < 0.9 else [0, 1, 0], np.float32)
+                for i, axis in enumerate(axes):
+                    up = up - axis * np.dot(up, axis)
                     squared = np.dot(up, up)
-                up = up / max(float(np.sqrt(squared)), 1e-20)
-                normals[first + i] = up
+                    if squared < 1e-12:
+                        up = np.cross(axis, [0, 0, 1] if abs(axis[2]) < 0.9 else [0, 1, 0])
+                        squared = np.dot(up, up)
+                    up = up / max(float(np.sqrt(squared)), 1e-20)
+                    normals[first + i] = up
     uv = np.column_stack((np.full(len(points), 0.5, np.float32), info[:, 0]))
     return dict(vertices=points, indices=indices, curve_radii=radii,
                 tangents=tangents, normals=normals, uvs=uv), info
