@@ -177,8 +177,8 @@ struct MaterialEval {
   float3 Ng; // geometric normal (for shadow-terminator term)
   float3 T;  // rotated by tangent_rotation for anisotropy
   float3 B;
-  float specular_ior_level, anisotropy, tangent_rotation;
-  float coat_weight, coat_roughness, coat_ior;
+  float specular_ior_level;
+  float coat_weight, coat_ior;
   float sheen_weight, sheen_roughness, sss_weight, translucent_weight;
   float hair_offset, hair_roughness_u, hair_roughness_v, alpha_blend;
   float3 sheen_tint, sss_radius;
@@ -314,8 +314,11 @@ static __device__ __noinline__ MaterialEval eval_material_one(const PathVertex &
   e.ior = m->ior;
   e.transmission = m->transmission;
   e.emission = make_f3(m->emission);
-  e.specular_ior_level=m->specular_ior_level;e.anisotropy=m->anisotropy;e.tangent_rotation=m->tangent_rotation;
-  e.coat_weight=m->coat_weight;e.coat_roughness=m->coat_roughness;e.coat_ior=m->coat_ior;
+  e.specular_ior_level=m->specular_ior_level;
+  // Only the derived frame and roughness values survive material evaluation.
+  float anisotropy=m->anisotropy, tangent_rotation=m->tangent_rotation;
+  float coat_roughness=m->coat_roughness;
+  e.coat_weight=m->coat_weight;e.coat_ior=m->coat_ior;
   e.sheen_weight=m->sheen_weight;e.sheen_roughness=m->sheen_roughness;e.sheen_tint=make_f3(m->sheen_tint);
   e.sss_weight=m->sss_weight;e.sss_radius=make_f3(m->sss_radius);e.translucent_weight=m->translucent_weight;
 #if (VIBRT_CLOSURE_TYPES & (1u << 7))
@@ -383,9 +386,11 @@ static __device__ __noinline__ MaterialEval eval_material_one(const PathVertex &
   e.F = make_float3(out[I].x, out[I].y, out[I].z)
     GRAPH_COLOR(0,base_color);GRAPH_SCALAR(1,roughness);GRAPH_SCALAR(2,metallic);GRAPH_SCALAR(3,ior);
     GRAPH_SCALAR(4,transmission);GRAPH_COLOR(5,emission);if(mask&(1u<<6))e.emission=e.emission*out[6].x;
-    GRAPH_SCALAR(7,alpha_blend);GRAPH_SCALAR(8,specular_ior_level);GRAPH_SCALAR(9,anisotropy);
-    if(mask&(1u<<10))e.tangent_rotation=out[10].x*6.283185307179586f;
-    GRAPH_SCALAR(11,coat_weight);GRAPH_SCALAR(12,coat_roughness);GRAPH_SCALAR(13,coat_ior);
+    GRAPH_SCALAR(7,alpha_blend);GRAPH_SCALAR(8,specular_ior_level);
+    if(mask&(1u<<9))anisotropy=out[9].x;
+    if(mask&(1u<<10))tangent_rotation=out[10].x*6.283185307179586f;
+    GRAPH_SCALAR(11,coat_weight);GRAPH_SCALAR(13,coat_ior);
+    if(mask&(1u<<12))coat_roughness=out[12].x;
     GRAPH_SCALAR(14,sheen_weight);GRAPH_SCALAR(15,sheen_roughness);GRAPH_COLOR(16,sheen_tint);
     GRAPH_SCALAR(17,sss_weight);GRAPH_COLOR(18,sss_radius);GRAPH_SCALAR(19,translucent_weight);
     GRAPH_SCALAR(20,hair_offset);GRAPH_SCALAR(21,hair_roughness_u);GRAPH_SCALAR(22,hair_roughness_v);
@@ -567,7 +572,7 @@ static __device__ __noinline__ MaterialEval eval_material_one(const PathVertex &
     e.T = normalize3(graph_tangent);
 
   // Cycles uses a distinct roughness remapping for the standalone Glossy node.
-  float aniso = fminf(fmaxf(e.anisotropy, -0.99f), 0.99f);
+  float aniso = fminf(fmaxf(anisotropy, -0.99f), 0.99f);
   if (m->surface_model == vibrt_surface::GLOSSY || (!m->surface_model && m->pure_glossy)) {
     float aspect = 1 - fabsf(aniso);
     e.alpha_x = aniso < 0 ? e.alpha / aspect : e.alpha * aspect;
@@ -586,11 +591,11 @@ static __device__ __noinline__ MaterialEval eval_material_one(const PathVertex &
   // pool's surface into a sharper cone than the path has already
   // sampled. Same min_alpha as the main lobe — Cycles' filter_glossy
   // is a single state shared across all glossy lobes.
-  e.coat_alpha = e.coat_roughness * e.coat_roughness;
+  e.coat_alpha = coat_roughness * coat_roughness;
   if (min_alpha > e.coat_alpha)
     e.coat_alpha = min_alpha;
   // Tangent rotation around Ns.
-  float rot = e.tangent_rotation;
+  float rot = tangent_rotation;
   if (rot != 0.0f) {
     float c = cosf(rot);
     float s = sinf(rot);
