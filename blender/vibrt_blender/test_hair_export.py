@@ -54,6 +54,40 @@ class HairExportTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 hair._pack_curves([[0, 0, 0], [0, 0, 1]], radii, offsets)
 
+    def test_transported_normals_match_scalar_recurrence(self):
+        rng = np.random.default_rng(712)
+        strands = [rng.normal(size=(n, 3)).astype(np.float32)
+                   for n in (0, 1, 2, 257, 257, 11, 11)]
+        # Parallel up/tangent invokes the float64 cross-product fallback;
+        # following keys must retain that precision, independently per strand.
+        strands.extend([np.array([[0, 0, 0], [0, 0, 1], [1, 0, 0],
+                                  [1, 1, 1], [2, 1, 2]], np.float32),
+                        np.zeros((5, 3), np.float32)])
+        points = np.concatenate(strands)
+        offsets = np.r_[0, np.cumsum([len(s) for s in strands])]
+        arrays, _ = hair._pack_curves(points, np.ones(len(points)), offsets)
+        expected = np.zeros_like(points)
+        for first, end in zip(offsets[:-1], offsets[1:]):
+            if end - first < 2:
+                continue
+            axes = arrays['tangents'][first:end]
+            up = np.array([1, 0, 0] if abs(axes[0, 0]) < 0.9 else [0, 1, 0], np.float32)
+            for i, axis in enumerate(axes):
+                up = up - axis * np.dot(up, axis)
+                squared = np.dot(up, up)
+                if squared < 1e-12:
+                    up = np.cross(axis, [0, 0, 1] if abs(axis[2]) < 0.9 else [0, 1, 0])
+                    squared = np.dot(up, up)
+                up = up / max(float(np.sqrt(squared)), 1e-20)
+                expected[first + i] = up
+        np.testing.assert_array_equal(arrays['normals'], expected)
+
+    def test_authored_normals_are_preserved(self):
+        points = np.array([[0, 0, 0], [0, 0, 1], [1, 0, 0], [1, 0, 1]], np.float32)
+        normals = np.tile([0, 1, 0], (4, 1)).astype(np.float32)
+        arrays, _ = hair._pack_curves(points, np.ones(4), [0, 2, 4], normals=normals)
+        np.testing.assert_array_equal(arrays['normals'], normals)
+
 
 if __name__ == '__main__':
     unittest.main()
