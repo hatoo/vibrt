@@ -342,18 +342,7 @@ impl GpuScene<'_> {
         let mesh_bounds: Vec<_> = scene
             .meshes
             .iter()
-            .map(|mesh| {
-                let mut lo = [f32::MAX; 3];
-                let mut hi = [f32::MIN; 3];
-                for (index, vertex) in mesh.vertices.as_chunks::<3>().0.iter().enumerate() {
-                    let radius = mesh.curve_radii.get(index).copied().unwrap_or(0.0);
-                    for axis in 0..3 {
-                        lo[axis] = lo[axis].min(vertex[axis] - radius);
-                        hi[axis] = hi[axis].max(vertex[axis] + radius);
-                    }
-                }
-                (lo, hi)
-            })
+            .map(|mesh| compute_mesh_bounds(&mesh.vertices, &mesh.curve_radii))
             .collect();
         for (obj_idx, obj) in scene.objects.iter().enumerate() {
             let m = &meshes_gpu[obj.mesh as usize];
@@ -1106,5 +1095,66 @@ impl GpuScene<'_> {
                 )
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+fn reference_bounds(vertices: &[f32], curve_radii: &[f32]) -> ([f32; 3], [f32; 3]) {
+    let mut lo = [f32::MAX; 3];
+    let mut hi = [f32::MIN; 3];
+    for (index, vertex) in vertices.as_chunks::<3>().0.iter().enumerate() {
+        let radius = curve_radii.get(index).copied().unwrap_or(0.0);
+        for axis in 0..3 {
+            lo[axis] = lo[axis].min(vertex[axis] - radius);
+            hi[axis] = hi[axis].max(vertex[axis] + radius);
+        }
+    }
+    (lo, hi)
+}
+
+fn compute_mesh_bounds(vertices: &[f32], curve_radii: &[f32]) -> ([f32; 3], [f32; 3]) {
+    if !curve_radii.is_empty() {
+        let mut lo = [f32::MAX; 3];
+        let mut hi = [f32::MIN; 3];
+        for (index, vertex) in vertices.as_chunks::<3>().0.iter().enumerate() {
+            let radius = curve_radii.get(index).copied().unwrap_or(0.0);
+            for axis in 0..3 {
+                lo[axis] = lo[axis].min(vertex[axis] - radius);
+                hi[axis] = hi[axis].max(vertex[axis] + radius);
+            }
+        }
+        return (lo, hi);
+    }
+    let mut lo = [f32::MAX; 3];
+    let mut hi = [f32::MIN; 3];
+    for vertex in vertices.as_chunks::<3>().0 {
+        for axis in 0..3 {
+            // Keep signed-zero arithmetic identical to the existing path.
+            lo[axis] = lo[axis].min(vertex[axis] - 0.0);
+            hi[axis] = hi[axis].max(vertex[axis] + 0.0);
+        }
+    }
+    (lo, hi)
+}
+
+#[cfg(test)]
+mod bounds_tests {
+    use super::{compute_mesh_bounds, reference_bounds};
+
+    #[test]
+    fn specialized_bounds_preserve_bits() {
+        for vertices in [
+            vec![],
+            vec![0.0, -0.0, 0.0, -0.0, 0.0, -0.0],
+            vec![1.0, -2.0, 3.0, -4.0, 5.0, -6.0, 99.0],
+            vec![f32::NAN, f32::INFINITY, f32::NEG_INFINITY],
+        ] {
+            for radii in [vec![], vec![0.0], vec![0.5, 1.0]] {
+                let a = reference_bounds(&vertices, &radii);
+                let b = compute_mesh_bounds(&vertices, &radii);
+                assert_eq!(a.0.map(f32::to_bits), b.0.map(f32::to_bits));
+                assert_eq!(a.1.map(f32::to_bits), b.1.map(f32::to_bits));
+            }
+        }
     }
 }
